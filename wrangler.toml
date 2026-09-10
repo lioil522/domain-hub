@@ -1,0 +1,55 @@
+# NOTE: Domain-Hub 全新部署，前后端都在同一个 Worker 里，Worker 名直接叫 domain-hub。
+name = "domain-hub"
+main = "src/index.ts"
+compatibility_date = "2024-04-01"
+
+# 静态资源托管：前端产物与后端同源，同一个 Worker 发出，不再需要 Cloudflare Pages。
+#
+# Cloudflare 先按路径匹配静态资源，命中就直接发出（不进 Worker，也不计 Worker 请求数），
+# 没命中才执行脚本：
+#   run_worker_first     只有 /api/* 交给 Hono（src/index.ts 里所有路由都在这个前缀下）
+#   not_found_handling   其余未命中路径回 index.html，SPA 兜底
+#
+# ⚠️ directory 必须在 wrangler deploy / wrangler dev 之前就存在，否则报目录不存在。
+#    本地首次开发前先构建一次前端：npm --prefix frontend run build
+[assets]
+directory = "./frontend/dist"
+not_found_handling = "single-page-application"
+run_worker_first = ["/api/*"]
+
+# 绑定 D1 数据库
+[[d1_databases]]
+binding = "DB"
+database_name = "domain-hub-db"
+database_id = "change_me_to_your_d1_db_id" # 用户部署时替换为实际的 D1 ID
+
+# 定时任务：每天凌晨 2 点执行域名同步和到期检测自动续期
+[triggers]
+crons = ["0 2 * * *"]
+
+# 环境变量定义
+[vars]
+# 【强烈建议】通过 wrangler secret put 注入以下密钥（不要直接写在配置文件中）：
+#
+# AES_KEY       - AES-GCM 加密密钥，用于加密存储 API Secret 与 2FA TOTP 密钥（强烈建议配置）
+#
+# 鉴权模型说明（v2 起）：
+#   登录改为「用户名 + 密码」为主，密码经 PBKDF2 加盐哈希后存于 D1，永不明文。
+#   两步验证 (2FA / TOTP) 为设置页内的可选开关，开启后登录需额外输入 6 位动态码。
+#   首次访问系统时，在登录页自行设置管理员用户名与密码完成初始化（无内置默认密码）。
+#
+# ADMIN_TOKEN   - 【可选】应急后门令牌。配置后可在忘记密码时，用它（静态值或其对应 TOTP 动态码）
+#                 直接登录/访问 API 作为兜底找回手段；不配置则完全禁用该通道，仅认用户名密码 + 2FA。
+#
+# 以下为可选配置项：
+# ALLOWED_ORIGIN = "https://another-frontend.example.com"  # CORS 白名单，支持逗号分隔多个来源。
+#                                                         # 前后端现在同源（前端由本 Worker 直接发出），
+#                                                         # 正常部署不需要配；只有把前端另行托管到别的
+#                                                         # 域名时才需要在这里列出那个来源。
+# WEBHOOK_URL    = "https://your-webhook-notification-url" # Webhook 推送地址
+# WEBHOOK_TYPE   = "dingtalk"                              # Webhook 类型: dingtalk / feishu / wecom / custom
+#
+# 单账号/免输入初始化（可选）：
+# DEFAULT_API_KEY    = "cfsd_xxxxxxxx"                     # 部署时直接绑定默认账号 API Key
+# DEFAULT_API_SECRET = "yyyyyyyyyyyy"                      # 部署时直接绑定默认账号 API Secret
+# DEFAULT_API_ALIAS  = "默认账号"                          # 默认账号别名

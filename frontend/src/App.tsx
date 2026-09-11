@@ -116,6 +116,69 @@ interface CfExpiryEntry {
   manual?: boolean;
   /** 注册来源文本（如 Namecheap / GoDaddy / 赠送）；仅手动录入时展示 */
   source?: string;
+  /**
+   * 后端回源失败时的错误信息（如 "RDAP HTTP 403"）。
+   * 有此字段 = 没查成，而不是注册局明确答「查无此域名」；两者要区别对待：
+   * 前者值得换条路再试，后者再试多少次也是同一个答案。
+   */
+  error?: string;
+}
+
+/**
+ * RDAP 直查（浏览器侧兜底）
+ *
+ * NOTE: CentralNic / Team Internet 系注册局（.xyz / .art / .cyou / .bond 等）对
+ * Cloudflare Worker 的出口 IP 一律返回 403，后端 /api/expiry 对这些域名只能拿到
+ * {found:false, error:"RDAP HTTP 403"}，卡片永远显示「—」。但 rdap.org 的 302 与
+ * 各注册局的响应都带 Access-Control-Allow-Origin: *，且 Accept 属于 CORS 安全
+ * header（不触发预检），所以浏览器能用用户自己的 IP 直接读到同一份数据。
+ * 仅在后端明确返回 error 时才走这条路——正常情况一次都不会打。
+ */
+const RDAP_DIRECT_TIMEOUT_MS = 8000;
+
+interface RdapDirectResponse {
+  events?: Array<{ eventAction?: string; eventDate?: string }>;
+  entities?: Array<{ roles?: string[]; handle?: string; vcardArray?: [string, unknown[]] }>;
+}
+
+async function fetchExpiryDirect(domain: string): Promise<CfExpiryEntry | null> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), RDAP_DIRECT_TIMEOUT_MS);
+  try {
+    const res = await fetch(`https://rdap.org/domain/${encodeURIComponent(domain)}`, {
+      headers: { accept: "application/rdap+json" },
+      signal: ctrl.signal
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as RdapDirectResponse;
+    const eventDate = (action: string) =>
+      (data.events || []).find((e) => e.eventAction === action)?.eventDate || undefined;
+    const expires_at = eventDate("expiration");
+    const registered_at = eventDate("registration");
+    // 两个日期都没有，这条记录对卡片没价值，按查不到处理（别写入空壳条目盖掉旧值）
+    if (!expires_at && !registered_at) return null;
+    // 注册商：entities 里 roles 含 registrar 的实体，取 vcardArray 的 fn（handle 兜底）
+    let registrar: string | undefined;
+    const registrarEntity = (data.entities || []).find(
+      (e) => Array.isArray(e.roles) && e.roles.some((r) => String(r).toLowerCase() === "registrar")
+    );
+    if (registrarEntity) {
+      const vcard = registrarEntity.vcardArray;
+      if (Array.isArray(vcard) && Array.isArray(vcard[1])) {
+        const fnRow = (vcard[1] as unknown[]).find(
+          (row) => Array.isArray(row) && String(row[0]).toLowerCase() === "fn"
+        );
+        if (Array.isArray(fnRow) && fnRow[3]) registrar = String(fnRow[3]).trim();
+      }
+      if (!registrar) registrar = registrarEntity.handle || undefined;
+    }
+    return { found: true, expires_at, registered_at, registrar };
+  } catch {
+    // 浏览器侧也查不到（离线 / 超时 / 对方改了 CORS）就维持现状，不打扰用户
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // 账号接口
@@ -963,10 +1026,22 @@ export default function App() {
     return {};
   });
   // 写入 cfExpiryMap（state + localStorage 兜底缓存同步落盘）
-  const persistCfExpiryMap = (map: Record<string, CfExpiryEntry>) => {
+  //
+  // NOTE: touchTs=false 表示本次并没有真的回源（没有待查域名）。此时必须保留原有 ts，
+  // 否则每进一次 Cloudflare 页都会把 ts 刷成 now，6 小时的强制校验窗口永远到不了，
+  // 一次查询失败留下的空条目就被永久钉死在「—」。
+  const persistCfExpiryMap = (map: Record<string, CfExpiryEntry>, touchTs = true) => {
     setCfExpiryMap(map);
     try {
-      localStorage.setItem(CF_EXPIRY_LS_KEY, JSON.stringify({ ts: Date.now(), map }));
+      let ts = Date.now();
+      if (!touchTs) {
+        const raw = localStorage.getItem(CF_EXPIRY_LS_KEY);
+        if (raw) {
+          const parsed = JSON.parse(raw) as { ts?: number };
+          if (parsed && typeof parsed.ts === "number") ts = parsed.ts;
+        }
+      }
+      localStorage.setItem(CF_EXPIRY_LS_KEY, JSON.stringify({ ts, map }));
     } catch {
       // 写入失败（如隐私模式配额）不影响本次展示
     }
@@ -3876,24 +3951,57 @@ export default function App() {
           .filter((k) => isRegistrableDomain(k))
       )
     ).filter((k) => {
-      if (next[k]?.manual) return false;
-      return force || !(k in next);
+      const prev = next[k];
+      if (prev?.manual) return false;
+      if (force || !(k in next)) return true;
+      // 上次没查到的下次继续重试：否则后端一次抽风留下的空条目会永久卡在「—」
+      return !prev.found;
     });
+
+    let queried = false;
     if (targets.length > 0) {
+      queried = true;
+      // 后端回源失败的域名交给浏览器直查兜底（注册局拦的是 Worker 出口 IP，不是你的 IP）
+      let needDirect: string[] = [];
       try {
         const res = await apiFetch(`/api/expiry?domains=${encodeURIComponent(targets.join(","))}`);
         const data = await res.json();
         if (data.success && data.expiry) {
           for (const [k, v] of Object.entries(data.expiry as Record<string, CfExpiryEntry>)) {
-            if (!next[k]?.manual) next[k] = v;
+            if (next[k]?.manual) continue;
+            if (v.found) {
+              next[k] = v;
+            } else if (v.error) {
+              // 没查成（多为注册局 403 拦 CF 出口）：换浏览器再试一次。
+              // 直查出结果前保留已有的好值，别先抹成空。
+              needDirect.push(k);
+              if (!next[k]?.found) next[k] = v;
+            } else {
+              // 注册局明确答「查无此记录」——这是有效结论，照常写入
+              next[k] = v;
+            }
           }
+        } else {
+          needDirect = targets.filter((k) => !next[k]?.manual);
         }
       } catch {
-        // 到期查询失败不打扰用户，卡片显示 —
+        // 后端整体不可达时，也给浏览器直查一次机会
+        needDirect = targets.filter((k) => !next[k]?.manual);
+      }
+
+      if (needDirect.length > 0) {
+        // 限个上限，避免域名特别多时对 rdap.org 瞬间打出太多请求；这次没轮到的
+        // 下次进页面还会重试（targets 过滤已放行 found=false 的条目）
+        const direct = await Promise.all(
+          needDirect.slice(0, 25).map(async (k) => ({ k, entry: await fetchExpiryDirect(k) }))
+        );
+        for (const { k, entry } of direct) {
+          if (entry && !next[k]?.manual) next[k] = entry;
+        }
       }
     }
 
-    persistCfExpiryMap(next);
+    persistCfExpiryMap(next, queried);
   };
 
   // 进入 Cloudflare 页或 zones 更新时：同步服务端手动覆盖 + 拉取到期时间。

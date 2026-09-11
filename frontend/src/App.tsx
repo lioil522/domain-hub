@@ -66,6 +66,7 @@ import {
   CF_DNS_TYPE_OPTIONS,
   CF_DNS_TYPE_SET,
   needsDnsPriority,
+  isCfTunnelRecord,
   dnsRecordKey,
   toRelativeRecordName,
   parseDnsBatchInput,
@@ -10043,6 +10044,13 @@ export default function App() {
                                     title={`由 Cloudflare Worker「${rec.workerName}」生成，DNS 端占位为 AAAA 100::`}
                                   >
                                     Worker
+                                  </span>
+                                ) : isCfTunnelRecord(rec.type, rec.content) ? (
+                                  <span
+                                    className="text-xs font-bold text-sky-600 dark:text-sky-400 bg-sky-50 dark:bg-sky-950/60 border border-sky-200 dark:border-sky-900/60 px-2 py-0.5 rounded font-mono"
+                                    title={`Cloudflare Tunnel 公开主机名，DNS 端实际是 CNAME → ${rec.content}`}
+                                  >
+                                    隧道
                                   </span>
                                 ) : (
                                   <span className="text-xs font-bold text-indigo-600 dark:text-indigo-400 bg-indigo-50 dark:bg-indigo-950/60 px-2 py-0.5 rounded font-mono">

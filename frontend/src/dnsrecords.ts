@@ -53,6 +53,18 @@ export const CF_DNS_TYPE_SET: ReadonlySet<string> = new Set(CF_DNS_TYPE_OPTIONS.
 /** 只有 MX / SRV 需要优先级，其余类型不展示也不下发该字段 */
 export const needsDnsPriority = (type: string): boolean => type === "MX" || type === "SRV";
 
+/**
+ * 判断一条记录是不是 Cloudflare Tunnel 的公开主机名
+ *
+ * NOTE: 命名隧道在 DNS 端没有独立记录类型，一律是 CNAME →
+ * `<隧道 UUID>.cfargotunnel.com`；这个目标只在 Cloudflare 代理内部可解析，光看类型列
+ * 只能看到一个普通 CNAME，看不出它其实由隧道接管。界面据此把类型标成「隧道」。
+ * 限定 CNAME 是为了不把内容里恰好提到该域名的 TXT（如说明文本）也算进来。
+ */
+export const isCfTunnelRecord = (type: string, content: string): boolean =>
+  String(type || "").toUpperCase() === "CNAME" &&
+  /(^|\.)cfargotunnel\.com$/i.test(String(content || "").trim().replace(/\.+$/, ""));
+
 /** 批量修改需要读到的记录字段（与 App.tsx 的 DnsRecord 结构兼容） */
 export interface DnsRecordLike {
   // DNSHE 的记录 id 是数字，Cloudflare 是 32 位十六进制字符串

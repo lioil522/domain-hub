@@ -4928,10 +4928,10 @@ export default function App() {
       isDpRegistered,
       dnsheMatch,
       dpMatch,
+      entry,
       manualEntry,
       registeredText,
       expiryText,
-      registrar
     } = cfZoneDateInfo(zone);
 
     const handleCopyZone = () => {
@@ -5014,18 +5014,6 @@ export default function App() {
               {expiryText}
             </span>
           </div>
-          {/* 注册商（registrar）：手动来源优先，其次 RDAP 自动查询；查不到不显示 */}
-          {registrar && (
-            <div className="flex justify-between items-center gap-2 min-w-0">
-              <span className="text-content-muted font-medium flex-shrink-0">注册商</span>
-              <span
-                className="text-xs font-medium px-2.5 py-0.5 rounded-md bg-elevated text-content-secondary border border-border-base truncate max-w-[65%]"
-                title={manualEntry?.source ? "手动录入的注册来源（优先于自动查询）" : "注册商（RDAP 自动查询，7 天缓存）"}
-              >
-                {registrar}
-              </span>
-            </div>
-          )}
           {isDnsheRegistered && (
             <div className="flex justify-between items-center">
               <span className="text-content-muted font-medium">注册来源</span>
@@ -5059,6 +5047,18 @@ export default function App() {
                 title="手动录入，优先于自动查询（右上角编辑图标可修改）"
               >
                 {manualEntry.source || "手动录入"}
+              </span>
+            </div>
+          )}
+          {/* RDAP 自动查询的注册商作为最低优先级“注册来源”：仅当无 DNSHE/DP/手动 时展示 */}
+          {!isDnsheRegistered && !isDpRegistered && !manualEntry && entry?.registrar && (
+            <div className="flex justify-between items-center gap-2 min-w-0">
+              <span className="text-content-muted font-medium flex-shrink-0">注册来源</span>
+              <span
+                className="text-xs font-medium px-2.5 py-0.5 rounded-md bg-elevated text-content-secondary border border-border-base truncate max-w-[65%]"
+                title="注册来源（RDAP 自动查询，7 天缓存）"
+              >
+                {entry.registrar}
               </span>
             </div>
           )}

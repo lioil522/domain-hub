@@ -34,7 +34,7 @@ $targets = foreach ($relativePath in $relativeTargets) {
   }
 }
 
-Write-Host "DNSHE Manager local cleanup" -ForegroundColor Cyan
+Write-Host "Domain Hub local cleanup" -ForegroundColor Cyan
 Write-Host "Project: $projectRoot"
 Write-Host "Remote Cloudflare D1 will not be modified." -ForegroundColor Green
 Write-Host "Local D1 data under .wrangler will be permanently deleted." -ForegroundColor Yellow

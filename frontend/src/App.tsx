@@ -545,7 +545,28 @@ const DnsLineSelect: React.FC<{
 );
 
 /**
- * 主应用组件 - 提供 DNSHE 域名管理控制面板
+ * 旧版（项目更名前）本地存储键的一次性迁移
+ *
+ * NOTE: 只搬用户手填的后端地址 —— 会话 token 会因服务端前缀同步更名而失效、到期缓存
+ * 丢了下次进页面会自动重查，两者都不值得搬。搬完即删旧键，之后每次加载都是空操作。
+ */
+try {
+  const legacyBackendUrl = localStorage.getItem("DNSHE_BACKEND_URL");
+  if (legacyBackendUrl !== null) {
+    if (localStorage.getItem("DOMAIN_HUB_BACKEND_URL") === null) {
+      localStorage.setItem("DOMAIN_HUB_BACKEND_URL", legacyBackendUrl);
+    }
+    localStorage.removeItem("DNSHE_BACKEND_URL");
+  }
+  localStorage.removeItem("DNSHE_SESSION");
+  sessionStorage.removeItem("DNSHE_SESSION");
+  localStorage.removeItem("DNSHE_CF_EXPIRY_CACHE_V1");
+} catch {
+  // 隐私模式等存储不可用的场景：跳过迁移，不影响使用
+}
+
+/**
+ * 主应用组件 - 提供 Domain Hub 多服务商域名集中管理控制面板
  */
 export default function App() {
   // 当前处于的选项卡（通过 URL hash 持久化，刷新/前进后退保持所在页面）
@@ -633,7 +654,7 @@ export default function App() {
   const [loadingSettings, setLoadingSettings] = useState(false);
   // 设置页本地后端地址输入
   const [backendUrlInput, setBackendUrlInput] = useState(
-    () => localStorage.getItem("DNSHE_BACKEND_URL") || ""
+    () => localStorage.getItem("DOMAIN_HUB_BACKEND_URL") || ""
   );
   // 后端地址是否处于编辑状态（保存后收起，不常驻显示在输入框）
   const [backendUrlEditing, setBackendUrlEditing] = useState(false);
@@ -1010,7 +1031,7 @@ export default function App() {
   // 手动覆盖（manual=true）的条目同样存于此，但数据源是后端 domain_date_overrides 表
   // （随账号存储，多设备共享）：每次进入 Cloudflare 页先以服务端为准重建 manual 条目；
   // 卡片/弹窗读取与 fetchCfExpiry 合并时均以 manual 标记为准，自动查询不回写。
-  const CF_EXPIRY_LS_KEY = "DNSHE_CF_EXPIRY_CACHE_V1";
+  const CF_EXPIRY_LS_KEY = "DOMAIN_HUB_CF_EXPIRY_CACHE_V1";
   const CF_EXPIRY_FRESH_MS = 6 * 3600 * 1000;
   // CF zone 注册/到期时间：DNSHE 注册的取本地缓存，其余经后端 RDAP 查注册商（后端缓存 7 天）
   const [cfExpiryMap, setCfExpiryMap] = useState<Record<string, CfExpiryEntry>>(() => {
@@ -1229,12 +1250,12 @@ export default function App() {
   const [bankFormWords, setBankFormWords] = useState("");
 
   // 后端 Worker 地址
-  const backendUrl = localStorage.getItem("DNSHE_BACKEND_URL") || (import.meta as any).env?.VITE_API_BASE_URL || "";
+  const backendUrl = localStorage.getItem("DOMAIN_HUB_BACKEND_URL") || (import.meta as any).env?.VITE_API_BASE_URL || "";
 
   // ===== 鉴权与登录状态 =====
   // 当前会话 Token（登录成功后签发；存在即视为已登录）
   const [sessionToken, setSessionToken] = useState<string | null>(
-    () => sessionStorage.getItem("DNSHE_SESSION") || localStorage.getItem("DNSHE_SESSION")
+    () => sessionStorage.getItem("DOMAIN_HUB_SESSION") || localStorage.getItem("DOMAIN_HUB_SESSION")
   );
   // 是否已向后端查询过鉴权状态（决定登录页显示"登录"还是"首次设置"）
   const [authStatusLoaded, setAuthStatusLoaded] = useState(false);
@@ -1276,8 +1297,8 @@ export default function App() {
    */
   const apiFetch = async (url: string, options: RequestInit = {}): Promise<Response> => {
     // 从会话存储获取登录后签发的 Session Token
-    const token = sessionStorage.getItem("DNSHE_SESSION") || localStorage.getItem("DNSHE_SESSION");
-    const storedBackend = backendUrl || localStorage.getItem("DNSHE_BACKEND_URL") || (import.meta as any).env?.VITE_API_BASE_URL;
+    const token = sessionStorage.getItem("DOMAIN_HUB_SESSION") || localStorage.getItem("DOMAIN_HUB_SESSION");
+    const storedBackend = backendUrl || localStorage.getItem("DOMAIN_HUB_BACKEND_URL") || (import.meta as any).env?.VITE_API_BASE_URL;
 
     // 如果传入相对路径以 /api 开头，智能补全后端基准域名
     //
@@ -1313,8 +1334,8 @@ export default function App() {
         // 会话失效：清理凭据并回到登录页（登录/初始化/状态接口自身除外，避免误清）
         const isAuthEndpoint = url.startsWith("/api/auth/login") || url.startsWith("/api/auth/setup") || url.startsWith("/api/auth/status");
         if (!isAuthEndpoint) {
-          sessionStorage.removeItem("DNSHE_SESSION");
-          localStorage.removeItem("DNSHE_SESSION");
+          sessionStorage.removeItem("DOMAIN_HUB_SESSION");
+          localStorage.removeItem("DOMAIN_HUB_SESSION");
           setSessionToken(null);
         }
       }
@@ -1341,7 +1362,7 @@ export default function App() {
   //       子域 → 空），表现为换域名/换后端后登录一直 Failed to fetch，且只能靠清站点数据恢复。
   //       localStorage 只应保存用户在设置页显式填写的覆盖值。
   const persistSession = (token: string) => {
-    sessionStorage.setItem("DNSHE_SESSION", token);
+    sessionStorage.setItem("DOMAIN_HUB_SESSION", token);
     setSessionToken(token);
   };
 
@@ -1392,7 +1413,7 @@ export default function App() {
       console.error("Login error:", err);
       // 网络类失败最常见的成因是后端地址不对，且本地覆盖值优先级高于构建期烘焙值，
       // 故直接把当前实际使用的地址与来源写进提示，避免只看到一句 Failed to fetch。
-      const override = localStorage.getItem("DNSHE_BACKEND_URL");
+      const override = localStorage.getItem("DOMAIN_HUB_BACKEND_URL");
       const target = override || backendUrl;
       const hint = target
         ? `当前请求地址：${target}${override ? "（来自本机保存的覆盖值，优先级高于部署时写入的默认地址；如该地址已失效，清除本站点数据即可恢复默认）" : "（来自部署时写入的默认地址）"}`
@@ -1451,7 +1472,7 @@ export default function App() {
   const handleLogout = async () => {
     // 先让服务端把当前 Bearer 会话作废（token 落库的是哈希，拿到旧 token 也无法重放）
     try {
-      const token = sessionStorage.getItem("DNSHE_SESSION") || localStorage.getItem("DNSHE_SESSION");
+      const token = sessionStorage.getItem("DOMAIN_HUB_SESSION") || localStorage.getItem("DOMAIN_HUB_SESSION");
       if (token) {
         await apiFetch("/api/auth/logout", {
           method: "POST",
@@ -1462,8 +1483,8 @@ export default function App() {
       // 网络异常不影响本地登出，静默降级为仅清本地凭据
       console.warn("Logout revoke failed:", err);
     }
-    sessionStorage.removeItem("DNSHE_SESSION");
-    localStorage.removeItem("DNSHE_SESSION");
+    sessionStorage.removeItem("DOMAIN_HUB_SESSION");
+    localStorage.removeItem("DOMAIN_HUB_SESSION");
     setSessionToken(null);
     setLoginUsername("");
     setLoginPassword("");
@@ -2023,7 +2044,7 @@ export default function App() {
       await sleep(1500);
 
       // 轮询期间会话失效（登出 / 过期）就不再空转
-      if (!sessionStorage.getItem("DNSHE_SESSION") && !localStorage.getItem("DNSHE_SESSION")) return;
+      if (!sessionStorage.getItem("DOMAIN_HUB_SESSION") && !localStorage.getItem("DOMAIN_HUB_SESSION")) return;
 
       // 逐个账号单独查询，不受域名页当前账号筛选影响
       for (const id of [...pending]) {
@@ -2190,10 +2211,10 @@ export default function App() {
   const handleSaveBackendUrl = () => {
     const v = backendUrlInput.trim().replace(/\/$/, "");
     if (v) {
-      localStorage.setItem("DNSHE_BACKEND_URL", v);
+      localStorage.setItem("DOMAIN_HUB_BACKEND_URL", v);
       showToast("success", "后端地址已保存，即将刷新页面生效");
     } else {
-      localStorage.removeItem("DNSHE_BACKEND_URL");
+      localStorage.removeItem("DOMAIN_HUB_BACKEND_URL");
       showToast("info", "已清除自定义后端地址");
     }
     setBackendUrlEditing(false);
@@ -2202,7 +2223,7 @@ export default function App() {
 
   // 取消编辑，恢复已保存的值并收起输入框
   const handleCancelBackendUrl = () => {
-    setBackendUrlInput(localStorage.getItem("DNSHE_BACKEND_URL") || "");
+    setBackendUrlInput(localStorage.getItem("DOMAIN_HUB_BACKEND_URL") || "");
     setBackendUrlEditing(false);
   };
 
@@ -11169,7 +11190,7 @@ export default function App() {
                         <input
                           value={backendUrlInput}
                           onChange={(e) => setBackendUrlInput(e.target.value)}
-                          placeholder="https://dnshe-manager-backend.<子域>.workers.dev"
+                          placeholder="https://domain-hub.<子域>.workers.dev"
                           className="form-input flex-1 px-3 py-2 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
                         />
                         <button onClick={handleSaveBackendUrl} className="btn-primary px-4 py-2 rounded-lg text-sm font-semibold text-white flex items-center gap-1.5">
@@ -11197,7 +11218,7 @@ export default function App() {
                         )}
                       </div>
                       <button
-                        onClick={() => { setBackendUrlInput(localStorage.getItem("DNSHE_BACKEND_URL") || ""); setBackendUrlEditing(true); }}
+                        onClick={() => { setBackendUrlInput(localStorage.getItem("DOMAIN_HUB_BACKEND_URL") || ""); setBackendUrlEditing(true); }}
                         className="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 hover:text-indigo-800 border border-indigo-200 dark:bg-indigo-950/60 dark:hover:bg-indigo-900/60 dark:text-indigo-400 dark:hover:text-indigo-200 dark:border-indigo-900/50 px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 flex-shrink-0"
                       >
                         <Pencil className="w-3.5 h-3.5" /> {backendUrl ? "修改" : "配置"}

@@ -1,7 +1,7 @@
 {
-  "name": "dnshe-manager-backend",
+  "name": "domain-hub",
   "version": "1.0.0",
-  "description": "DNSHE Multi-Account Domain Manager Cloudflare Worker",
+  "description": "Domain Hub - multi-provider domain management panel (Cloudflare Worker & self-hosted)",
   "main": "src/index.ts",
   "scripts": {
     "clean:local": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/clean-local.ps1 -Force",

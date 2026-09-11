@@ -1,7 +1,7 @@
 # DigitalPlat Developer API 参考文档
 
 > 来源：<https://dashboard.digitalplat.org/dashboard/api/docs>（需登录后查看）
-> 整理日期：2026-09-06，供 DNSHE-Manager 接入 DigitalPlat 账号时参考。
+> 整理日期：2026-09-06，供 Domain Hub 接入 DigitalPlat 账号时参考。
 
 ## 概述
 
@@ -1386,7 +1386,7 @@ curl "https://analytics.digitalplat.org/a/app/dpa_xxxxx?event=app_open&version=1
 
 ---
 
-## 附：对接 DNSHE-Manager 的注意点
+## 附：对接 Domain Hub 的注意点
 
 - 认证模型与 Cloudflare 不同：DigitalPlat 用单一 Bearer API Key（`dp_live_` / `dp_test_`），没有 Zone 级 Token 概念，Key 即账号级权限
 - 域名列表 `GET /api/v1/domains` 直接返回 `expiry_date`，无需像 Cloudflare 那样另查 RDAP 获取到期时间

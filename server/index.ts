@@ -27,7 +27,24 @@ import { createStaticHandler } from "./static";
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || "0.0.0.0";
 const DATA_DIR = path.resolve(process.env.DATA_DIR || "./data");
-const DB_PATH = path.resolve(process.env.DB_PATH || path.join(DATA_DIR, "dnshe.db"));
+
+/**
+ * SQLite 数据库文件路径
+ *
+ * NOTE: 项目更名前这个文件叫 dnshe.db，老部署的数据卷里躺着的就是它。直接改用新名字
+ * 会让升级后的容器对着一个空库启动，表现成「账号和设置全没了」（数据其实还在盘上）。
+ * 所以：显式配了 DB_PATH 就听它的；否则优先新名字，仅当新文件不存在、旧文件存在时
+ * 才继续沿用旧的。全新部署一律落在 domain-hub.db 上。
+ */
+function resolveDbPath(): string {
+  if (process.env.DB_PATH) return path.resolve(process.env.DB_PATH);
+  const current = path.join(DATA_DIR, "domain-hub.db");
+  const legacy = path.join(DATA_DIR, "dnshe.db");
+  if (!existsSync(current) && existsSync(legacy)) return path.resolve(legacy);
+  return path.resolve(current);
+}
+
+const DB_PATH = resolveDbPath();
 const SCHEMA_FILE = path.resolve(process.env.SCHEMA_FILE || "./schema.sql");
 
 /**

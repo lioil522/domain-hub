@@ -659,7 +659,7 @@ export class DatabaseManager {
   static readonly SESSION_TTL_SECONDS = 7 * 24 * 3600;
 
   /** Session Token 前缀（鉴权中间件据此区分会话 token 与应急令牌） */
-  static readonly SESSION_PREFIX = "dnshe_sess_";
+  static readonly SESSION_PREFIX = "dh_sess_";
 
   /**
    * 签发一个新会话，返回 Session Token

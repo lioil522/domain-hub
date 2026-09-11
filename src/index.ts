@@ -390,7 +390,7 @@ function generateBase32Secret(byteLength = 20): string {
 /**
  * 构建标准 otpauth:// URI，供前端生成二维码，导入 Google / Microsoft Authenticator
  */
-function buildOtpAuthUri(secret: string, account: string, issuer = "DNSHE Manager"): string {
+function buildOtpAuthUri(secret: string, account: string, issuer = "Domain Hub"): string {
   const label = encodeURIComponent(`${issuer}:${account}`);
   const params = new URLSearchParams({
     secret,
@@ -721,7 +721,7 @@ app.use("/api/*", async (c, next) => {
 
   // 3. 全部失效。若请求带的是「非会话形状」的凭据（扫描器乱填 / 针对 ADMIN_TOKEN
   //    的静态值或 TOTP 爆破），按 IP 计数并限流，避免应急通道成为无限尝试的旁路。
-  //    正常登录拿到的会话 token 都带 dnshe_sess_ 前缀，不受此维度影响。
+  //    正常登录拿到的会话 token 都带 dh_sess_ 前缀，不受此维度影响。
   if (!token.startsWith(DatabaseManager.SESSION_PREFIX)) {
     const ipScope = `ip:${getClientIp(c)}`;
     if ((await dbManager.countLoginFailures(ipScope)) >= LOGIN_MAX_FAILURES) {
@@ -2608,7 +2608,7 @@ app.post("/api/settings/test-telegram", async (c) => {
       return c.json(errorRes("请先填写 Telegram Bot Token 与 Chat ID", "bad_request"), 400);
     }
 
-    await sendTelegramNotification(token, chatId, "🎉 DNSHE Manager 测试推送：Telegram 通知配置成功！");
+    await sendTelegramNotification(token, chatId, "🎉 Domain Hub 测试推送：Telegram 通知配置成功！");
     return c.json(successRes({ message: "测试消息已发送，请检查 Telegram" }));
   } catch (e: unknown) {
     const message = e instanceof Error ? e.message : "未知错误";
@@ -2639,7 +2639,7 @@ app.post("/api/settings/test-webhook", async (c) => {
 
     const result = await sendWebhookNotification(
       url,
-      "🎉 DNSHE Manager 测试推送：Webhook 通知配置成功！",
+      "🎉 Domain Hub 测试推送：Webhook 通知配置成功！",
       type
     );
 
@@ -2984,7 +2984,7 @@ function isRegistrableDomain(input: string): boolean {
 // rdap.org 与各注册局 RDAP 服务（Verisign 等）会拒绝不带浏览器 UA 的请求（403），
 // 而 Cloudflare Worker / Node 的 fetch 默认不发 UA。用这个 UA 伪装浏览器才能拿到数据。
 // 实测裸 UA 或纯应用名都会被 403 / 连接失败，Mozilla/5.0 前缀开头即可放行。
-const RDAP_USER_AGENT = "Mozilla/5.0 (compatible; DNSHE-Manager/1.0)";
+const RDAP_USER_AGENT = "Mozilla/5.0 (compatible; Domain-Hub/1.0)";
 
 interface RdapEvent {
   eventAction?: string;

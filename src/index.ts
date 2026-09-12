@@ -1257,8 +1257,10 @@ app.post("/api/custom-groups/:groupId/domains", async (c) => {
     if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(fullDomain)) {
       return c.json(errorRes("域名格式无效，请输入合法的完整域名（如 example.eu.org）", "bad_request"), 400);
     }
-    // 到期时间：YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS
-    if (!/^\d{4}-\d{2}-\d{2}( \d{2}:\d{2}(:\d{2})?)?$/.test(expiresAt)) {
+    // 到期时间：留空 = 永久（沿用 DNSHE/DigitalPlat 的 0000 占位语义，前端 formatDate 显示「永久」）；
+    // 填了才校验格式。注意 custom_domains.expires_at 是 NOT NULL，所以用占位串而非 NULL。
+    const isPermanent = !expiresAt;
+    if (!isPermanent && !/^\d{4}-\d{2}-\d{2}( \d{2}:\d{2}(:\d{2})?)?$/.test(expiresAt)) {
       return c.json(errorRes("到期时间格式无效，请使用 YYYY-MM-DD", "bad_request"), 400);
     }
     // 注册时间：可选（公益域名常查不到），填了才校验格式
@@ -1272,10 +1274,12 @@ app.post("/api/custom-groups/:groupId/domains", async (c) => {
       return c.json(errorRes("无效的账号 ID", "bad_request"), 400);
     }
 
-    // 归一化到期时间：纯日期补上 23:59:59，保证「到期当天」在提醒阈值内仍算未过期
-    const normalizedExpiry = /^\d{4}-\d{2}-\d{2}$/.test(expiresAt)
-      ? `${expiresAt} 23:59:59`
-      : expiresAt;
+    // 归一化到期时间：永久用 0000 占位；纯日期补上 23:59:59，保证「到期当天」在提醒阈值内仍算未过期
+    const normalizedExpiry = isPermanent
+      ? "0000-00-00 00:00:00"
+      : /^\d{4}-\d{2}-\d{2}$/.test(expiresAt)
+        ? `${expiresAt} 23:59:59`
+        : expiresAt;
 
     await dbManager.upsertCustomDomain(groupId, accountId, fullDomain, normalizedExpiry, remark, registeredAt || null);
     return c.json(successRes({ message: "域名已保存" }));

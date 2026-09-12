@@ -495,6 +495,18 @@ const splitDateValue = (value: string): { y: string; m: string; d: string } => {
 };
 
 /**
+ * 年 / 月 / 日三段 → "YYYY-MM-DD"；凑不齐完整日期时给空串。
+ * 月夹到 1-12，日夹到当月天数，两位补零。commit 与失焦补齐共用这套规则。
+ */
+const buildDateValue = (s: { y: string; m: string; d: string }): string => {
+  if (s.y.length !== 4 || !s.m || !s.d) return "";
+  const monthNum = Math.min(12, Math.max(1, Number(s.m)));
+  const maxDay = new Date(Number(s.y), monthNum, 0).getDate();
+  const dayNum = Math.min(maxDay, Math.max(1, Number(s.d)));
+  return `${s.y}-${String(monthNum).padStart(2, "0")}-${String(dayNum).padStart(2, "0")}`;
+};
+
+/**
  * 只显示当月日期的日期选择器
  *
  * 原生 <input type="date"> 的下拉面板属于浏览器 chrome，CSS 干预不到 —— Chromium
@@ -514,7 +526,11 @@ const DateField: React.FC<{
   value: string;
   onChange: (value: string) => void;
   className: string;
-}> = ({ value, onChange, className }) => {
+  /** 年份下拉的可选下界 / 上界（含）；不传时按「当年 ±」的默认范围。
+      注册时间用 [1986, 当年]，到期时间用 [当年, 2999]。 */
+  minYear?: number;
+  maxYear?: number;
+}> = ({ value, onChange, className, minYear, maxYear }) => {
   const [open, setOpen] = useState(false);
   const [viewMonth, setViewMonth] = useState(() => monthStartOf(value));
   const [panelPos, setPanelPos] = useState<{ top: number; left: number }>({ top: 0, left: 0 });
@@ -525,38 +541,51 @@ const DateField: React.FC<{
   const monthRef = useRef<HTMLInputElement | null>(null);
   const dayRef = useRef<HTMLInputElement | null>(null);
 
-  const PANEL_W = 256;
-  const PANEL_H = 300;
+  /**
+   * 三段的最新值（与 seg 状态同步写入）
+   *
+   * NOTE: 失焦补齐这类回调可能在同一次按键里、setSeg 还没重渲染时就被触发，
+   * 此时闭包里的 seg 还是按键前的旧值。凡是要读「当前三段」的地方都读这个 ref。
+   */
+  const segRef = useRef(seg);
+  const writeSeg = (next: { y: string; m: string; d: string }) => {
+    segRef.current = next;
+    setSeg(next);
+  };
+
+  const PANEL_W = 272;
+  const PANEL_H = 320;
 
   // 外部改了 value（打开弹窗时回填、面板选日期、清除）时同步三段显示。
-  // 只认完整值：value 为空串时清空三段，避免用户手输一半被这里抹掉。
+  //
+  // NOTE: 用户敲到一半时 commit 会把拼好的完整值抛给 onChange，value 随之变化又回到这里。
+  // 若「当前三段」本就构成这个 value，就别用补零后的标准形态盖回去 —— 否则刚敲的 "1"
+  // 会被刷成 "01"，接着敲的第二位被 slice(0,2) 丢掉，这正是「日」段还在跳的根因。
+  // 只在 value 真的来自外部（与当前三段不一致）时才回填。
   useEffect(() => {
-    setSeg(splitDateValue(value));
+    if (value && buildDateValue(segRef.current) === value) return;
+    writeSeg(splitDateValue(value));
   }, [value]);
 
   /**
    * 把三段拼回 "YYYY-MM-DD" 交给调用处
    *
-   * 三段都空 → 空串（未填）。凑不齐完整日期时不上报，让用户接着敲，
-   * 否则每敲一位都会往上抛一个非法值。
+   * 三段都空 → 空串（未填）。凑不齐完整日期时不上报（buildDateValue 给空串），
+   * 让用户接着敲，否则每敲一位都会往上抛一个非法值。
    */
   const commit = (next: { y: string; m: string; d: string }) => {
     if (!next.y && !next.m && !next.d) {
       if (value) onChange("");
       return;
     }
-    if (next.y.length !== 4 || !next.m || !next.d) return;
-    const monthNum = Math.min(12, Math.max(1, Number(next.m)));
-    const maxDay = new Date(Number(next.y), monthNum, 0).getDate();
-    const dayNum = Math.min(maxDay, Math.max(1, Number(next.d)));
-    const built = `${next.y}-${String(monthNum).padStart(2, "0")}-${String(dayNum).padStart(2, "0")}`;
-    if (built !== value) onChange(built);
+    const built = buildDateValue(next);
+    if (built && built !== value) onChange(built);
   };
 
   const setSegment = (key: "y" | "m" | "d", raw: string) => {
     const digits = raw.replace(/\D/g, "").slice(0, key === "y" ? 4 : 2);
-    const next = { ...seg, [key]: digits };
-    setSeg(next);
+    const next = { ...segRef.current, [key]: digits };
+    writeSeg(next);
     commit(next);
     // 年份满 4 位、月份满 2 位就自动跳到下一段，省掉手动 Tab / 点击
     if (key === "y" && digits.length === 4) monthRef.current?.select();
@@ -566,14 +595,30 @@ const DateField: React.FC<{
 
   /** 失焦时补齐并夹到合法范围：月 1-12，日不超过当月天数 */
   const normalizeSegments = () => {
-    if (!seg.y && !seg.m && !seg.d) return;
-    const y = seg.y.length === 4 ? seg.y : String(new Date().getFullYear());
-    const monthNum = seg.m ? Math.min(12, Math.max(1, Number(seg.m))) : 1;
+    const cur = segRef.current;
+    if (!cur.y && !cur.m && !cur.d) return;
+    const y = cur.y.length === 4 ? cur.y : String(new Date().getFullYear());
+    const monthNum = cur.m ? Math.min(12, Math.max(1, Number(cur.m))) : 1;
     const maxDay = new Date(Number(y), monthNum, 0).getDate();
-    const dayNum = seg.d ? Math.min(maxDay, Math.max(1, Number(seg.d))) : 1;
+    const dayNum = cur.d ? Math.min(maxDay, Math.max(1, Number(cur.d))) : 1;
     const next = { y, m: String(monthNum).padStart(2, "0"), d: String(dayNum).padStart(2, "0") };
-    setSeg(next);
+    writeSeg(next);
     commit(next);
+  };
+
+  /**
+   * 三段共用的失焦处理：只有焦点真的离开整个日期框时才补齐
+   *
+   * NOTE: 年份满 4 位后会 select() 月份段，这次组件内部的跳段同样会让年份段失焦。
+   * 早先无条件补齐，于是敲完年份立刻被「补」成 1 月 1 日：月份段带着 01 且光标停在
+   * 其后，接着敲月份会因为已满 2 位而被丢掉；补齐读到的又是本次按键前的旧三段
+   * （年份只有 3 位，被当成不完整值换成当年），输入 2027 就变成了 2026。
+   * 判断 relatedTarget（即将获得焦点的元素）在不在本组件内即可跳过这类内部跳转，
+   * 顺带也让「点日历按钮」不再触发补齐。
+   */
+  const handleSegmentBlur = (e: React.FocusEvent<HTMLInputElement>) => {
+    if (wrapRef.current?.contains(e.relatedTarget as Node | null)) return;
+    normalizeSegments();
   };
 
   /** 空段上按退格 → 退回上一段，行为对齐原生日期框 */
@@ -594,7 +639,14 @@ const DateField: React.FC<{
         left: Math.min(Math.max(8, rect.left), Math.max(8, window.innerWidth - PANEL_W - 8))
       });
     }
-    setViewMonth(monthStartOf(value));
+    // 已敲了年份但日期还不完整时，也让面板落到手输的年 / 月，而不是退回当前月
+    const cur = segRef.current;
+    if (cur.y.length === 4) {
+      const monthNum = cur.m ? Math.min(12, Math.max(1, Number(cur.m))) : 1;
+      setViewMonth(new Date(Number(cur.y), monthNum - 1, 1));
+    } else {
+      setViewMonth(monthStartOf(value));
+    }
     setOpen(true);
   };
 
@@ -633,6 +685,20 @@ const DateField: React.FC<{
   const leadingBlanks = (new Date(year, month, 1).getDay() + 6) % 7;
   const todayValue = toLocalDateValue(new Date());
 
+  /**
+   * 年份下拉的候选范围
+   *
+   * 调用处按语义传范围：注册时间 [1986, 当年]，到期时间 [当年, 2999]，都够点。
+   * 不传时退回「当年前 40 / 后 20 年」的中庸默认。再与当前查看的年份取并集：
+   * 万一手输了范围外的年份，面板仍能正确显示该年，而不是被下拉框拽回边界。
+   */
+  const yearOptions = useMemo(() => {
+    const nowYear = new Date().getFullYear();
+    const from = Math.min(minYear ?? nowYear - 40, year);
+    const to = Math.max(maxYear ?? nowYear + 20, year);
+    return Array.from({ length: to - from + 1 }, (_, i) => from + i);
+  }, [year, minYear, maxYear]);
+
   const pick = (next: string) => {
     onChange(next);
     setOpen(false);
@@ -651,7 +717,7 @@ const DateField: React.FC<{
           inputMode="numeric"
           value={seg.y}
           onChange={(e) => setSegment("y", e.target.value)}
-          onBlur={normalizeSegments}
+          onBlur={handleSegmentBlur}
           onFocus={(e) => e.currentTarget.select()}
           placeholder="年"
           aria-label="年"
@@ -665,7 +731,7 @@ const DateField: React.FC<{
           value={seg.m}
           onChange={(e) => setSegment("m", e.target.value)}
           onKeyDown={onSegmentKeyDown("m")}
-          onBlur={normalizeSegments}
+          onBlur={handleSegmentBlur}
           onFocus={(e) => e.currentTarget.select()}
           placeholder="月"
           aria-label="月"
@@ -679,7 +745,7 @@ const DateField: React.FC<{
           value={seg.d}
           onChange={(e) => setSegment("d", e.target.value)}
           onKeyDown={onSegmentKeyDown("d")}
-          onBlur={normalizeSegments}
+          onBlur={handleSegmentBlur}
           onFocus={(e) => e.currentTarget.select()}
           placeholder="日"
           aria-label="日"
@@ -702,11 +768,33 @@ const DateField: React.FC<{
           style={{ position: "fixed", top: panelPos.top, left: panelPos.left, width: PANEL_W }}
           className="z-[60] bg-elevated border border-border-base rounded-xl shadow-2xl p-3"
         >
-          <div className="flex items-center justify-between mb-2">
-            <span className="text-sm font-semibold text-content-primary">
-              {year} 年 {month + 1} 月
-            </span>
-            <div className="flex items-center gap-0.5">
+          <div className="flex items-center gap-1.5 mb-2">
+            {/* 年 / 月直接用下拉选，跨年跨月不必一下一下点翻月箭头 */}
+            <select
+              value={year}
+              onChange={(e) => setViewMonth(new Date(Number(e.target.value), month, 1))}
+              className="form-input flex-1 min-w-0 text-xs font-semibold px-1.5 py-1 rounded-md cursor-pointer"
+              aria-label="选择年份"
+            >
+              {yearOptions.map((y) => (
+                <option key={y} value={y}>
+                  {y} 年
+                </option>
+              ))}
+            </select>
+            <select
+              value={month}
+              onChange={(e) => setViewMonth(new Date(year, Number(e.target.value), 1))}
+              className="form-input flex-1 min-w-0 text-xs font-semibold px-1.5 py-1 rounded-md cursor-pointer"
+              aria-label="选择月份"
+            >
+              {Array.from({ length: 12 }, (_, i) => (
+                <option key={i} value={i}>
+                  {i + 1} 月
+                </option>
+              ))}
+            </select>
+            <div className="flex items-center gap-0.5 flex-shrink-0">
               <button
                 type="button"
                 onClick={() => setViewMonth(new Date(year, month - 1, 1))}
@@ -1975,6 +2063,13 @@ export default function App() {
     const m = String(date.getMonth() + 1).padStart(2, "0");
     const d = String(date.getDate()).padStart(2, "0");
     return `${y}/${m}/${d}`;
+  };
+
+  // 到期时间是否为「永久」：空 / 0000 占位 / 无法解析都视为永久（自定义域名以 0000 占位落库）
+  const isPermanentExpiry = (v?: string | null): boolean => {
+    const s = String(v || "").trim();
+    if (!s || s.startsWith("0000")) return true;
+    return Number.isNaN(new Date(s).getTime());
   };
 
   // 转为 <input type="date"> 所需的 YYYY-MM-DD；无法解析（“永久”/“未记录”/空）时返回空串
@@ -4096,7 +4191,10 @@ export default function App() {
     setCustomDomainModalEditing(editing || null);
     setCustomDomainFull(editing ? editing.full_domain : "");
     setCustomDomainRegistered(editing ? (editing.registered_at || "").slice(0, 10) : "");
-    setCustomDomainExpiry(editing ? (editing.expires_at || "").slice(0, 10) : "");
+    // 永久域名（0000 占位）编辑时到期段回填为空，避免把占位符当成真实日期显示
+    setCustomDomainExpiry(
+      editing && !isPermanentExpiry(editing.expires_at) ? editing.expires_at.slice(0, 10) : ""
+    );
     setCustomDomainRemark(editing ? (editing.remark || "") : "");
     setCustomDomainModalOpen(true);
   };
@@ -4112,10 +4210,7 @@ export default function App() {
       showToast("error", "请填写域名");
       return;
     }
-    if (!expiry) {
-      showToast("error", "请填写到期时间");
-      return;
-    }
+    // 到期时间留空 = 永久（后端存 0000 占位）；不再强制必填
     setCustomDomainSaving(true);
     try {
       const res = await apiFetch(`/api/custom-groups/${group.id}/domains`, {
@@ -4429,7 +4524,11 @@ export default function App() {
       ? (dnsheRegisteredStr || "0000-00-00 00:00:00")
       : (dpMatch?.created_at || entry?.registered_at);
     const registeredRaw = manualEntry?.registered_at || autoRegisteredRaw;
-    const expiryRaw = manualEntry?.expires_at || autoExpiryRaw;
+    // 到期：存过手动值但到期留空 → 用户主动标记「永久」（0000 占位，formatDate 显示「永久」），
+    // 与「没有任何手动覆盖、RDAP 也查不到」时的「—」区分开。无手动覆盖则沿用自动查询值。
+    const expiryRaw = manualEntry
+      ? (manualEntry.expires_at || "0000-00-00")
+      : autoExpiryRaw;
     // 注册商：手动来源优先，其次 RDAP 自动查到的 registrar
     const registrar = manualEntry?.source || entry?.registrar;
     return {
@@ -8535,34 +8634,58 @@ export default function App() {
                       }`}
                     >
                       {/* 账号大标题（可点击展开/收起）；收起时去掉分隔线与下边距，保持上下留白对称。
-                          展开时头部 sticky 吸顶，域名多时往下滚也能随时点它收起，不必翻回顶部 */}
-                      <button
-                        onClick={() => toggleAccountCollapse(group.accountId)}
-                        className={`w-full flex items-center justify-between transition-opacity text-left z-20 ${
+                          展开时头部 sticky 吸顶，域名多时往下滚也能随时点它收起，不必翻回顶部。
+                          NOTE: 外层用 div 而非 button —— 右侧的单账号同步按钮不能嵌在 button 内，
+                          折叠热区因此收窄为左侧标题那个 button。 */}
+                      <div
+                        className={`w-full flex items-center justify-between gap-2 z-20 ${
                           isCollapsed
-                            ? "hover:opacity-80"
+                            ? ""
                             : "sticky top-0 bg-hovered border-b border-border-base py-3"
                         }`}
                       >
-                        <h3 className="text-base md:text-lg font-bold text-content-primary flex items-center gap-2 flex-wrap min-w-0">
-                          {isCollapsed ? (
-                            <ChevronRight className="w-5 h-5 text-indigo-400 shrink-0" />
-                          ) : (
-                            <ChevronDown className="w-5 h-5 text-indigo-400 shrink-0" />
-                          )}
-                          <Key className="w-4 h-4 text-indigo-400 shrink-0" />
-                          {group.seq > 0 && (
-                            <>
-                              <span className="text-emerald-400">账号 {group.seq}</span>
-                              <span className="text-content-muted">·</span>
-                            </>
-                          )}
-                          <span className="text-indigo-700 dark:text-indigo-300 truncate max-w-full">{group.alias}</span>
-                          <span className="text-[11px] md:text-xs bg-indigo-50 text-indigo-700 border border-indigo-200 dark:bg-indigo-950/80 dark:text-indigo-300 dark:border-indigo-900/60 px-2 md:px-2.5 py-0.5 rounded-full font-normal">
-                            共 {group.domains.length} 个域名（系统默认: {defaultDomains.length} | 外部DNS: {externalDomains.length}）
-                          </span>
-                        </h3>
-                      </button>
+                        <button
+                          onClick={() => toggleAccountCollapse(group.accountId)}
+                          className={`flex-1 min-w-0 flex items-center text-left transition-opacity ${
+                            isCollapsed ? "hover:opacity-80" : ""
+                          }`}
+                        >
+                          <h3 className="text-base md:text-lg font-bold text-content-primary flex items-center gap-2 flex-wrap min-w-0">
+                            {isCollapsed ? (
+                              <ChevronRight className="w-5 h-5 text-indigo-400 shrink-0" />
+                            ) : (
+                              <ChevronDown className="w-5 h-5 text-indigo-400 shrink-0" />
+                            )}
+                            <Key className="w-4 h-4 text-indigo-400 shrink-0" />
+                            {group.seq > 0 && (
+                              <>
+                                <span className="text-emerald-400">账号 {group.seq}</span>
+                                <span className="text-content-muted">·</span>
+                              </>
+                            )}
+                            <span className="text-indigo-700 dark:text-indigo-300 truncate max-w-full">{group.alias}</span>
+                            <span className="text-[11px] md:text-xs bg-indigo-50 text-indigo-700 border border-indigo-200 dark:bg-indigo-950/80 dark:text-indigo-300 dark:border-indigo-900/60 px-2 md:px-2.5 py-0.5 rounded-full font-normal">
+                              共 {group.domains.length} 个域名（系统默认: {defaultDomains.length} | 外部DNS: {externalDomains.length}）
+                            </span>
+                          </h3>
+                        </button>
+                        {/* 单账号同步：只拉这一个账号的域名，避开全量同步的 Worker 子请求上限。
+                            seq === 0 是已解绑账号遗留的历史域名，账号已不存在，同步按钮不给出。 */}
+                        {group.seq > 0 && (
+                          <button
+                            onClick={() => handleSyncAccount(group.accountId, "dnshe")}
+                            disabled={actionLoading === `sync-account-${group.accountId}`}
+                            className="p-2 rounded-lg text-content-muted hover:text-sky-500 hover:bg-surface transition-colors disabled:opacity-50 shrink-0"
+                            title="仅同步该账号的域名"
+                          >
+                            <RefreshCw
+                              className={`w-4 h-4 ${
+                                actionLoading === `sync-account-${group.accountId}` ? "animate-spin" : ""
+                              }`}
+                            />
+                          </button>
+                        )}
+                      </div>
 
                       {/* 域名内容区（收起时隐藏） */}
                       {!isCollapsed && (
@@ -8701,27 +8824,47 @@ export default function App() {
                         isCollapsed ? "" : "space-y-4 md:space-y-6"
                       }`}
                     >
-                      <button
-                        onClick={() => cfToggleAccountCollapse(group.accountId)}
-                        className={`w-full flex items-center justify-between transition-opacity text-left z-20 ${
+                      {/* NOTE: 外层用 div 而非 button —— 右侧的单账号同步按钮不能嵌在 button 内 */}
+                      <div
+                        className={`w-full flex items-center justify-between gap-2 z-20 ${
                           isCollapsed
-                            ? "hover:opacity-80"
+                            ? ""
                             : "sticky top-0 bg-hovered border-b border-border-base py-3"
                         }`}
                       >
-                        <h3 className="text-base md:text-lg font-bold text-content-primary flex items-center gap-2 flex-wrap min-w-0">
-                          {isCollapsed ? (
-                            <ChevronRight className="w-5 h-5 text-indigo-400 shrink-0" />
-                          ) : (
-                            <ChevronDown className="w-5 h-5 text-indigo-400 shrink-0" />
-                          )}
-                          <CloudflareIcon className="w-4 h-4 shrink-0" />
-                          <span className="text-indigo-700 dark:text-indigo-300 truncate max-w-full">{group.alias}</span>
-                          <span className="text-[11px] md:text-xs bg-sky-50 text-sky-700 border border-sky-200 dark:bg-sky-950/80 dark:text-sky-300 dark:border-sky-900/60 px-2 md:px-2.5 py-0.5 rounded-full font-normal">
-                            {group.zones.length} 个 zone
-                          </span>
-                        </h3>
-                      </button>
+                        <button
+                          onClick={() => cfToggleAccountCollapse(group.accountId)}
+                          className={`flex-1 min-w-0 flex items-center text-left transition-opacity ${
+                            isCollapsed ? "hover:opacity-80" : ""
+                          }`}
+                        >
+                          <h3 className="text-base md:text-lg font-bold text-content-primary flex items-center gap-2 flex-wrap min-w-0">
+                            {isCollapsed ? (
+                              <ChevronRight className="w-5 h-5 text-indigo-400 shrink-0" />
+                            ) : (
+                              <ChevronDown className="w-5 h-5 text-indigo-400 shrink-0" />
+                            )}
+                            <CloudflareIcon className="w-4 h-4 shrink-0" />
+                            <span className="text-indigo-700 dark:text-indigo-300 truncate max-w-full">{group.alias}</span>
+                            <span className="text-[11px] md:text-xs bg-sky-50 text-sky-700 border border-sky-200 dark:bg-sky-950/80 dark:text-sky-300 dark:border-sky-900/60 px-2 md:px-2.5 py-0.5 rounded-full font-normal">
+                              {group.zones.length} 个 zone
+                            </span>
+                          </h3>
+                        </button>
+                        {/* 单账号同步：只拉这一个账号的 zones，避开全量同步的 Worker 子请求上限 */}
+                        <button
+                          onClick={() => handleSyncAccount(group.accountId, "cloudflare")}
+                          disabled={actionLoading === `sync-account-${group.accountId}`}
+                          className="p-2 rounded-lg text-content-muted hover:text-sky-500 hover:bg-surface transition-colors disabled:opacity-50 shrink-0"
+                          title="仅同步该账号的 zones"
+                        >
+                          <RefreshCw
+                            className={`w-4 h-4 ${
+                              actionLoading === `sync-account-${group.accountId}` ? "animate-spin" : ""
+                            }`}
+                          />
+                        </button>
+                      </div>
 
                       {!isCollapsed && (
                         group.zones.length === 0 ? (
@@ -8835,27 +8978,47 @@ export default function App() {
                         isCollapsed ? "" : "space-y-4 md:space-y-6"
                       }`}
                     >
-                      <button
-                        onClick={() => dpToggleAccountCollapse(group.accountId)}
-                        className={`w-full flex items-center justify-between transition-opacity text-left z-20 ${
+                      {/* NOTE: 外层用 div 而非 button —— 右侧的单账号同步按钮不能嵌在 button 内 */}
+                      <div
+                        className={`w-full flex items-center justify-between gap-2 z-20 ${
                           isCollapsed
-                            ? "hover:opacity-80"
+                            ? ""
                             : "sticky top-0 bg-hovered border-b border-border-base py-3"
                         }`}
                       >
-                        <h3 className="text-base md:text-lg font-bold text-content-primary flex items-center gap-2 flex-wrap min-w-0">
-                          {isCollapsed ? (
-                            <ChevronRight className="w-5 h-5 text-indigo-400 shrink-0" />
-                          ) : (
-                            <ChevronDown className="w-5 h-5 text-indigo-400 shrink-0" />
-                          )}
-                          <Globe className="w-4 h-4 text-sky-400 shrink-0" />
-                          <span className="text-indigo-700 dark:text-indigo-300 truncate max-w-full">{group.alias}</span>
-                          <span className="text-[11px] md:text-xs bg-sky-50 text-sky-700 border border-sky-200 dark:bg-sky-950/80 dark:text-sky-300 dark:border-sky-900/60 px-2 md:px-2.5 py-0.5 rounded-full font-normal">
-                            {group.domains.length} 个域名
-                          </span>
-                        </h3>
-                      </button>
+                        <button
+                          onClick={() => dpToggleAccountCollapse(group.accountId)}
+                          className={`flex-1 min-w-0 flex items-center text-left transition-opacity ${
+                            isCollapsed ? "hover:opacity-80" : ""
+                          }`}
+                        >
+                          <h3 className="text-base md:text-lg font-bold text-content-primary flex items-center gap-2 flex-wrap min-w-0">
+                            {isCollapsed ? (
+                              <ChevronRight className="w-5 h-5 text-indigo-400 shrink-0" />
+                            ) : (
+                              <ChevronDown className="w-5 h-5 text-indigo-400 shrink-0" />
+                            )}
+                            <Globe className="w-4 h-4 text-sky-400 shrink-0" />
+                            <span className="text-indigo-700 dark:text-indigo-300 truncate max-w-full">{group.alias}</span>
+                            <span className="text-[11px] md:text-xs bg-sky-50 text-sky-700 border border-sky-200 dark:bg-sky-950/80 dark:text-sky-300 dark:border-sky-900/60 px-2 md:px-2.5 py-0.5 rounded-full font-normal">
+                              {group.domains.length} 个域名
+                            </span>
+                          </h3>
+                        </button>
+                        {/* 单账号同步：只拉这一个账号的域名，避开全量同步的 Worker 子请求上限 */}
+                        <button
+                          onClick={() => handleSyncAccount(group.accountId, "digitalplat")}
+                          disabled={actionLoading === `sync-account-${group.accountId}`}
+                          className="p-2 rounded-lg text-content-muted hover:text-sky-500 hover:bg-surface transition-colors disabled:opacity-50 shrink-0"
+                          title="仅同步该账号的域名"
+                        >
+                          <RefreshCw
+                            className={`w-4 h-4 ${
+                              actionLoading === `sync-account-${group.accountId}` ? "animate-spin" : ""
+                            }`}
+                          />
+                        </button>
+                      </div>
 
                       {!isCollapsed && (
                         group.domains.length === 0 ? (
@@ -9028,14 +9191,17 @@ export default function App() {
                               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
                                 {group.unassignedDomains.map((dom) => {
                                   const daysLeft = dom.daysLeft;
-                                  const expired = daysLeft < 0;
-                                  const warning = !expired && daysLeft <= 30;
-                                  const badgeCls = expired
-                                    ? "bg-red-50 text-red-700 border-red-200 dark:bg-red-950/80 dark:text-red-400 dark:border-red-900/60"
-                                    : warning
-                                      ? "bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-950/80 dark:text-amber-300 dark:border-amber-900/60"
-                                      : "bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/80 dark:text-emerald-400 dark:border-emerald-900/60";
-                                  const daysText = expired ? `已过期 ${Math.ceil(-daysLeft)} 天` : `剩 ${Math.ceil(daysLeft)} 天`;
+                                  const permanent = isPermanentExpiry(dom.expires_at);
+                                  const expired = !permanent && daysLeft < 0;
+                                  const warning = !permanent && !expired && daysLeft <= 30;
+                                  const badgeCls = permanent
+                                    ? "bg-indigo-50 text-indigo-700 border-indigo-200 dark:bg-indigo-950/80 dark:text-indigo-300 dark:border-indigo-900/60"
+                                    : expired
+                                      ? "bg-red-50 text-red-700 border-red-200 dark:bg-red-950/80 dark:text-red-400 dark:border-red-900/60"
+                                      : warning
+                                        ? "bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-950/80 dark:text-amber-300 dark:border-amber-900/60"
+                                        : "bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/80 dark:text-emerald-400 dark:border-emerald-900/60";
+                                  const daysText = permanent ? "永久" : expired ? `已过期 ${Math.ceil(-daysLeft)} 天` : `剩 ${Math.ceil(daysLeft)} 天`;
                                   const hasCfZone = domainKeyCandidates(dom.full_domain).some((k) => cfZoneFullDomainSet.has(k));
                                   return (
                                     <div key={dom.id} className="bg-hovered border border-border-base rounded-lg p-3 flex flex-col gap-2">
@@ -9048,7 +9214,7 @@ export default function App() {
                                             注册: {dom.registered_at ? dom.registered_at.slice(0, 10) : "—"}
                                           </div>
                                           <div className="text-[11px] text-content-muted font-mono">
-                                            到期: {dom.expires_at.slice(0, 10)}
+                                            到期: {permanent ? "永久" : dom.expires_at.slice(0, 10)}
                                           </div>
                                         </div>
                                         <span className={`text-[11px] px-2 py-0.5 rounded-full font-semibold border flex-shrink-0 ${badgeCls}`}>
@@ -9132,14 +9298,17 @@ export default function App() {
                                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
                                   {acc.domains.map((dom) => {
                                     const daysLeft = dom.daysLeft;
-                                    const expired = daysLeft < 0;
-                                    const warning = !expired && daysLeft <= 30;
-                                    const badgeCls = expired
-                                      ? "bg-red-50 text-red-700 border-red-200 dark:bg-red-950/80 dark:text-red-400 dark:border-red-900/60"
-                                      : warning
-                                        ? "bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-950/80 dark:text-amber-300 dark:border-amber-900/60"
-                                        : "bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/80 dark:text-emerald-400 dark:border-emerald-900/60";
-                                    const daysText = expired ? `已过期 ${Math.ceil(-daysLeft)} 天` : `剩 ${Math.ceil(daysLeft)} 天`;
+                                    const permanent = isPermanentExpiry(dom.expires_at);
+                                    const expired = !permanent && daysLeft < 0;
+                                    const warning = !permanent && !expired && daysLeft <= 30;
+                                    const badgeCls = permanent
+                                      ? "bg-indigo-50 text-indigo-700 border-indigo-200 dark:bg-indigo-950/80 dark:text-indigo-300 dark:border-indigo-900/60"
+                                      : expired
+                                        ? "bg-red-50 text-red-700 border-red-200 dark:bg-red-950/80 dark:text-red-400 dark:border-red-900/60"
+                                        : warning
+                                          ? "bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-950/80 dark:text-amber-300 dark:border-amber-900/60"
+                                          : "bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/80 dark:text-emerald-400 dark:border-emerald-900/60";
+                                    const daysText = permanent ? "永久" : expired ? `已过期 ${Math.ceil(-daysLeft)} 天` : `剩 ${Math.ceil(daysLeft)} 天`;
                                     const hasCfZone = domainKeyCandidates(dom.full_domain).some((k) => cfZoneFullDomainSet.has(k));
                                     return (
                                       <div key={dom.id} className="bg-hovered border border-border-base rounded-lg p-3 flex flex-col gap-2">
@@ -9152,7 +9321,7 @@ export default function App() {
                                               注册: {dom.registered_at ? dom.registered_at.slice(0, 10) : "—"}
                                             </div>
                                             <div className="text-[11px] text-content-muted font-mono">
-                                              到期: {dom.expires_at.slice(0, 10)}
+                                              到期: {permanent ? "永久" : dom.expires_at.slice(0, 10)}
                                             </div>
                                           </div>
                                           <span className={`text-[11px] px-2 py-0.5 rounded-full font-semibold border flex-shrink-0 ${badgeCls}`}>
@@ -9426,14 +9595,18 @@ export default function App() {
                     <DateField
                       value={customDomainRegistered}
                       onChange={setCustomDomainRegistered}
+                      minYear={1986}
+                      maxYear={new Date().getFullYear()}
                       className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary"
                     />
                   </div>
                   <div>
-                    <label className="block text-xs font-semibold text-content-muted mb-1.5">到期时间</label>
+                    <label className="block text-xs font-semibold text-content-muted mb-1.5">到期时间（留空为永久）</label>
                     <DateField
                       value={customDomainExpiry}
                       onChange={setCustomDomainExpiry}
+                      minYear={new Date().getFullYear()}
+                      maxYear={2999}
                       className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary"
                     />
                   </div>
@@ -10562,14 +10735,6 @@ export default function App() {
                       </div>
                       <div className="flex items-center gap-1 flex-shrink-0">
                         <button
-                          onClick={() => handleSyncAccount(acc.id, "digitalplat")}
-                          disabled={actionLoading === `sync-account-${acc.id}`}
-                          className="p-2 hover:bg-hovered rounded-lg text-content-muted hover:text-sky-500 transition-colors disabled:opacity-50"
-                          title="同步域名"
-                        >
-                          <RefreshCw className={`w-4 h-4 ${actionLoading === `sync-account-${acc.id}` ? "animate-spin" : ""}`} />
-                        </button>
-                        <button
                           onClick={() => {
                             setDpEditingAccount(acc);
                             setDpEditAlias(acc.alias);
@@ -10625,14 +10790,6 @@ export default function App() {
                       </div>
                       <div className="flex items-center gap-1 flex-shrink-0">
                         <button
-                          onClick={() => handleSyncAccount(acc.id, "cloudflare")}
-                          disabled={actionLoading === `sync-account-${acc.id}`}
-                          className="p-2 hover:bg-hovered rounded-lg text-content-muted hover:text-sky-500 transition-colors disabled:opacity-50"
-                          title="同步域名"
-                        >
-                          <RefreshCw className={`w-4 h-4 ${actionLoading === `sync-account-${acc.id}` ? "animate-spin" : ""}`} />
-                        </button>
-                        <button
                           onClick={() => {
                             setCfEditingAccount(acc);
                             setCfEditAlias(acc.alias);
@@ -10686,14 +10843,6 @@ export default function App() {
                       </div>
 
                       <div className="flex flex-col gap-2 flex-shrink-0">
-                        <button
-                          onClick={() => handleSyncAccount(acc.id, "dnshe")}
-                          disabled={actionLoading === `sync-account-${acc.id}`}
-                          className="bg-sky-50 hover:bg-sky-100 text-sky-700 hover:text-sky-800 border border-sky-200 dark:bg-sky-950/60 dark:hover:bg-sky-900/60 dark:text-sky-400 dark:hover:text-sky-200 dark:border-sky-900/50 p-2 rounded-lg transition-all"
-                          title="同步域名"
-                        >
-                          <RefreshCw className={`w-4 h-4 ${actionLoading === `sync-account-${acc.id}` ? "animate-spin" : ""}`} />
-                        </button>
                         <button
                           onClick={() => openEditAccount(acc)}
                           disabled={actionLoading === `update-account-${acc.id}`}
@@ -13026,7 +13175,7 @@ export default function App() {
                     自动查询参考值：注册{" "}
                     {info.autoRegisteredRaw ? formatDate(info.autoRegisteredRaw, false) : "—"} · 到期{" "}
                     {info.autoExpiryRaw ? formatDate(info.autoExpiryRaw, true) : "—"}
-                    （留空则继续沿用自动值）
+                    （注册留空沿用自动值；到期留空视为「永久」）
                   </p>
                 );
               })()}
@@ -13039,16 +13188,20 @@ export default function App() {
                   <DateField
                     value={cfEditRegistered}
                     onChange={setCfEditRegistered}
+                    minYear={1986}
+                    maxYear={new Date().getFullYear()}
                     className="w-full form-input px-3 py-2 rounded-lg text-sm text-content-secondary"
                   />
                 </div>
                 <div>
                   <label className="block text-xs font-semibold text-content-secondary mb-1.5">
-                    到期时间
+                    到期时间 <span className="font-normal text-content-muted">（留空 = 永久）</span>
                   </label>
                   <DateField
                     value={cfEditExpiry}
                     onChange={setCfEditExpiry}
+                    minYear={new Date().getFullYear()}
+                    maxYear={2999}
                     className="w-full form-input px-3 py-2 rounded-lg text-sm text-content-secondary"
                   />
                 </div>

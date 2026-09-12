@@ -373,6 +373,8 @@ export async function runDailySyncAndRenewal(
           customReminderDone = true;
           const allCustomDomains = await dbManager.listAllCustomDomains();
           for (const dom of allCustomDomains) {
+            // 永久域名（0000 占位）没有到期概念，跳过提醒
+            if (!dom.expires_at || dom.expires_at.startsWith("0000")) continue;
             const expiresTime = new Date(dom.expires_at).getTime();
             if (Number.isNaN(expiresTime)) continue;
             const remainingDays = (expiresTime - Date.now()) / (1000 * 60 * 60 * 24);

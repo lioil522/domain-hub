@@ -1344,6 +1344,32 @@ app.post("/api/domains/sync", async (c) => {
   }
 });
 
+/**
+ * 2.1 单账号同步：只同步指定账号的域名，不触发全局续期/通知流程
+ *
+ * NOTE: 单账号同步的子请求数远小于全量同步，在免费计划 50 次配额下也能完成，
+ * 是规避 "Too many subrequests" 的最佳实践。复用 resyncAccountsInBackground
+ * 的逐账号深度同步逻辑（含 DNS 记录拉取与状态计算）。
+ */
+app.post("/api/accounts/:id/sync", async (c) => {
+  const dbManager = c.get("db");
+  const accountId = parseInt(c.req.param("id"), 10);
+  if (isNaN(accountId)) {
+    return c.json(errorRes("无效的账号 ID"), 400);
+  }
+  try {
+    const { provider } = await dbManager.getClientForAccount(accountId);
+    if (provider === "custom") {
+      return c.json(successRes({ message: "自定义分组无需同步（手动管理域名）" }));
+    }
+    c.executionCtx.waitUntil(resyncAccountsInBackground(dbManager, [accountId]));
+    return c.json(successRes({ message: "该账号的域名同步已在后台启动，请稍后刷新" }));
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "未知错误";
+    return c.json(errorRes(message), 500);
+  }
+});
+
 // 3. 手动续期子域名
 app.post("/api/domains/:id/renew", async (c) => {
   const dbManager = c.get("db");

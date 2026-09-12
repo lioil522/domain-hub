@@ -2774,6 +2774,36 @@ export default function App() {
     }
   };
 
+  /**
+   * 单账号同步：只拉取指定账号的域名，子请求数远小于全量同步
+   *
+   * NOTE: 同步完成后按 provider 刷新对应标签页的数据（DNSHE → fetchDomains，
+   * CF → fetchCfZones，DP → fetchDpDomains），避免用户手动刷新。
+   */
+  const handleSyncAccount = async (accountId: number, provider?: string) => {
+    const loadingKey = `sync-account-${accountId}`;
+    setActionLoading(loadingKey);
+    try {
+      const res = await apiFetch(`/api/accounts/${accountId}/sync`, { method: "POST" });
+      const data = await res.json();
+      if (data.success) {
+        showToast("success", data.message || "同步已在后台启动");
+        // 延迟刷新对应 provider 的域名列表，等待后台同步完成
+        setTimeout(() => {
+          if (provider === "cloudflare") fetchCfZones();
+          else if (provider === "digitalplat") fetchDpDomains();
+          else fetchDomains();
+        }, 3000);
+      } else {
+        showToast("error", data.message || "同步失败");
+      }
+    } catch (e) {
+      showToast("error", "发起同步请求失败");
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
   // 绑定新账号（别名可选，留空时后端自动从 API Key 解析密钥名称）
   const handleAddAccount = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -10532,6 +10562,14 @@ export default function App() {
                       </div>
                       <div className="flex items-center gap-1 flex-shrink-0">
                         <button
+                          onClick={() => handleSyncAccount(acc.id, "digitalplat")}
+                          disabled={actionLoading === `sync-account-${acc.id}`}
+                          className="p-2 hover:bg-hovered rounded-lg text-content-muted hover:text-sky-500 transition-colors disabled:opacity-50"
+                          title="同步域名"
+                        >
+                          <RefreshCw className={`w-4 h-4 ${actionLoading === `sync-account-${acc.id}` ? "animate-spin" : ""}`} />
+                        </button>
+                        <button
                           onClick={() => {
                             setDpEditingAccount(acc);
                             setDpEditAlias(acc.alias);
@@ -10587,6 +10625,14 @@ export default function App() {
                       </div>
                       <div className="flex items-center gap-1 flex-shrink-0">
                         <button
+                          onClick={() => handleSyncAccount(acc.id, "cloudflare")}
+                          disabled={actionLoading === `sync-account-${acc.id}`}
+                          className="p-2 hover:bg-hovered rounded-lg text-content-muted hover:text-sky-500 transition-colors disabled:opacity-50"
+                          title="同步域名"
+                        >
+                          <RefreshCw className={`w-4 h-4 ${actionLoading === `sync-account-${acc.id}` ? "animate-spin" : ""}`} />
+                        </button>
+                        <button
                           onClick={() => {
                             setCfEditingAccount(acc);
                             setCfEditAlias(acc.alias);
@@ -10640,6 +10686,14 @@ export default function App() {
                       </div>
 
                       <div className="flex flex-col gap-2 flex-shrink-0">
+                        <button
+                          onClick={() => handleSyncAccount(acc.id, "dnshe")}
+                          disabled={actionLoading === `sync-account-${acc.id}`}
+                          className="bg-sky-50 hover:bg-sky-100 text-sky-700 hover:text-sky-800 border border-sky-200 dark:bg-sky-950/60 dark:hover:bg-sky-900/60 dark:text-sky-400 dark:hover:text-sky-200 dark:border-sky-900/50 p-2 rounded-lg transition-all"
+                          title="同步域名"
+                        >
+                          <RefreshCw className={`w-4 h-4 ${actionLoading === `sync-account-${acc.id}` ? "animate-spin" : ""}`} />
+                        </button>
                         <button
                           onClick={() => openEditAccount(acc)}
                           disabled={actionLoading === `update-account-${acc.id}`}

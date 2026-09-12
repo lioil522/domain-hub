@@ -339,6 +339,7 @@ export class DatabaseManager {
             group_id INTEGER NOT NULL,
             account_id INTEGER,
             full_domain TEXT NOT NULL,
+            registered_at TEXT,
             expires_at TEXT NOT NULL,
             remark TEXT,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -372,6 +373,11 @@ export class DatabaseManager {
       }
       if (!accountColumnNames.has("website")) {
         migrations.push("ALTER TABLE accounts ADD COLUMN website TEXT");
+      }
+      const customDomainColumns = await this.db.prepare("PRAGMA table_info(custom_domains)").all<{ name: string }>();
+      const customDomainColumnNames = new Set((customDomainColumns.results || []).map((column) => column.name));
+      if (!customDomainColumnNames.has("registered_at")) {
+        migrations.push("ALTER TABLE custom_domains ADD COLUMN registered_at TEXT");
       }
       if (migrations.length > 0) {
         await this.db.batch(migrations.map((sql) => this.db.prepare(sql)));
@@ -1533,17 +1539,22 @@ export class DatabaseManager {
     await this.db.prepare("DELETE FROM custom_accounts WHERE id = ?").bind(id).run();
   }
 
-  /** 新增手动域名（同名 upsert，更新到期时间与备注）。accountId 为 null 表示直接挂在分组下 */
-  async upsertCustomDomain(groupId: number, accountId: number | null, fullDomain: string, expiresAt: string, remark: string): Promise<void> {
+  /**
+   * 新增手动域名（同名 upsert，更新注册/到期时间与备注）。accountId 为 null 表示直接挂在分组下
+   *
+   * registeredAt 可选：公益域名常常查不到注册时间，留空存 NULL，前端显示「—」
+   */
+  async upsertCustomDomain(groupId: number, accountId: number | null, fullDomain: string, expiresAt: string, remark: string, registeredAt?: string | null): Promise<void> {
     const now = this.getBeijingNow();
     await this.db.prepare(`
-      INSERT INTO custom_domains (group_id, account_id, full_domain, expires_at, remark, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO custom_domains (group_id, account_id, full_domain, registered_at, expires_at, remark, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(group_id, account_id, full_domain) DO UPDATE SET
+        registered_at = excluded.registered_at,
         expires_at = excluded.expires_at,
         remark = excluded.remark,
         updated_at = excluded.updated_at
-    `).bind(groupId, accountId, fullDomain, expiresAt, remark || null, now).run();
+    `).bind(groupId, accountId, fullDomain, registeredAt || null, expiresAt, remark || null, now).run();
   }
 
   /** 删除一条手动域名 */
@@ -1553,18 +1564,18 @@ export class DatabaseManager {
 
   /** 跨分组列出所有自定义域名（含分组/账号信息，供到期提醒用） */
   async listAllCustomDomains(): Promise<
-    Array<{ id: number; group_id: number; account_id: number | null; full_domain: string; expires_at: string; remark: string | null; account_name: string | null; group_alias: string }>
+    Array<{ id: number; group_id: number; account_id: number | null; full_domain: string; registered_at: string | null; expires_at: string; remark: string | null; account_name: string | null; group_alias: string }>
   > {
     const { results } = await this.db
       .prepare(`
-        SELECT d.id, d.group_id, d.account_id, d.full_domain, d.expires_at, d.remark,
+        SELECT d.id, d.group_id, d.account_id, d.full_domain, d.registered_at, d.expires_at, d.remark,
                ca.name as account_name, a.alias as group_alias
         FROM custom_domains d
         LEFT JOIN custom_accounts ca ON d.account_id = ca.id
         LEFT JOIN accounts a ON d.group_id = a.id
         ORDER BY d.expires_at ASC
       `)
-      .all<{ id: number; group_id: number; account_id: number | null; full_domain: string; expires_at: string; remark: string | null; account_name: string | null; group_alias: string }>();
+      .all<{ id: number; group_id: number; account_id: number | null; full_domain: string; registered_at: string | null; expires_at: string; remark: string | null; account_name: string | null; group_alias: string }>();
     return results || [];
   }
 

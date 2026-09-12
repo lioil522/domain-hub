@@ -33,6 +33,7 @@ import {
   Save,
   Pencil,
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
   ChevronsDownUp,
   ChevronsUpDown,
@@ -42,6 +43,7 @@ import {
   ExternalLink,
   FolderPlus,
   CalendarClock,
+  CalendarDays,
   Folder
 } from "lucide-react";
 import { toASCII, hasNonASCII, toUnicode } from "./punycode";
@@ -206,6 +208,8 @@ interface CustomDomain {
   group_id: number;
   account_id: number | null;
   full_domain: string;
+  /** 注册时间（YYYY-MM-DD，null=未填，公益域名常查不到） */
+  registered_at: string | null;
   expires_at: string;
   remark: string | null;
   updated_at: string;
@@ -467,6 +471,316 @@ const PasswordInput: React.FC<{
         {visible ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
       </button>
     </div>
+  );
+};
+
+/** 周一为一周之首（与国内日历习惯一致） */
+const WEEKDAY_LABELS = ["一", "二", "三", "四", "五", "六", "日"];
+
+/** Date → "YYYY-MM-DD"（本地时区，不经 UTC，避免跨日偏移） */
+const toLocalDateValue = (d: Date): string =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+
+/** "YYYY-MM-DD" → 所在月 1 号的 Date；空值/格式不符时落到当前月 */
+const monthStartOf = (value: string): Date => {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value.trim());
+  const now = new Date();
+  return m ? new Date(Number(m[1]), Number(m[2]) - 1, 1) : new Date(now.getFullYear(), now.getMonth(), 1);
+};
+
+/** "YYYY-MM-DD" → 年 / 月 / 日三段字符串；空值或格式不符时三段都给空串 */
+const splitDateValue = (value: string): { y: string; m: string; d: string } => {
+  const hit = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value.trim());
+  return hit ? { y: hit[1], m: hit[2], d: hit[3] } : { y: "", m: "", d: "" };
+};
+
+/**
+ * 只显示当月日期的日期选择器
+ *
+ * 原生 <input type="date"> 的下拉面板属于浏览器 chrome，CSS 干预不到 —— Chromium
+ * 会用灰色的上月末 / 下月初日期把网格补满 6 行，很容易误点到邻月的同号日期。
+ * 这里自绘面板：网格只排当月的天，首行前面的空档留白。
+ *
+ * value / onChange 仍走 "YYYY-MM-DD" 字符串，与原生 input 取值一致，调用处和
+ * 后端校验都不用改；清空时给空串。
+ *
+ * NOTE: 必须定义在 App() 外面，理由同 PasswordInput —— 写成内部组件会在每次
+ * App 重渲染时被当作新组件类型卸载重挂载，面板会自己关掉。
+ *
+ * NOTE: 面板用 position: fixed + 实测坐标，而不是 absolute。调用处的弹窗内容区
+ * 是 overflow-y-auto，absolute 面板会被它裁掉下半截。
+ */
+const DateField: React.FC<{
+  value: string;
+  onChange: (value: string) => void;
+  className: string;
+}> = ({ value, onChange, className }) => {
+  const [open, setOpen] = useState(false);
+  const [viewMonth, setViewMonth] = useState(() => monthStartOf(value));
+  const [panelPos, setPanelPos] = useState<{ top: number; left: number }>({ top: 0, left: 0 });
+  const [seg, setSeg] = useState(() => splitDateValue(value));
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  const yearRef = useRef<HTMLInputElement | null>(null);
+  const monthRef = useRef<HTMLInputElement | null>(null);
+  const dayRef = useRef<HTMLInputElement | null>(null);
+
+  const PANEL_W = 256;
+  const PANEL_H = 300;
+
+  // 外部改了 value（打开弹窗时回填、面板选日期、清除）时同步三段显示。
+  // 只认完整值：value 为空串时清空三段，避免用户手输一半被这里抹掉。
+  useEffect(() => {
+    setSeg(splitDateValue(value));
+  }, [value]);
+
+  /**
+   * 把三段拼回 "YYYY-MM-DD" 交给调用处
+   *
+   * 三段都空 → 空串（未填）。凑不齐完整日期时不上报，让用户接着敲，
+   * 否则每敲一位都会往上抛一个非法值。
+   */
+  const commit = (next: { y: string; m: string; d: string }) => {
+    if (!next.y && !next.m && !next.d) {
+      if (value) onChange("");
+      return;
+    }
+    if (next.y.length !== 4 || !next.m || !next.d) return;
+    const monthNum = Math.min(12, Math.max(1, Number(next.m)));
+    const maxDay = new Date(Number(next.y), monthNum, 0).getDate();
+    const dayNum = Math.min(maxDay, Math.max(1, Number(next.d)));
+    const built = `${next.y}-${String(monthNum).padStart(2, "0")}-${String(dayNum).padStart(2, "0")}`;
+    if (built !== value) onChange(built);
+  };
+
+  const setSegment = (key: "y" | "m" | "d", raw: string) => {
+    const digits = raw.replace(/\D/g, "").slice(0, key === "y" ? 4 : 2);
+    const next = { ...seg, [key]: digits };
+    setSeg(next);
+    commit(next);
+    // 年份满 4 位、月份满 2 位就自动跳到下一段，省掉手动 Tab / 点击
+    if (key === "y" && digits.length === 4) monthRef.current?.select();
+    // 月份首位 >= 2 只可能是个位月（2-9 月），补 0 后直接进日
+    else if (key === "m" && (digits.length === 2 || Number(digits) >= 2)) dayRef.current?.select();
+  };
+
+  /** 失焦时补齐并夹到合法范围：月 1-12，日不超过当月天数 */
+  const normalizeSegments = () => {
+    if (!seg.y && !seg.m && !seg.d) return;
+    const y = seg.y.length === 4 ? seg.y : String(new Date().getFullYear());
+    const monthNum = seg.m ? Math.min(12, Math.max(1, Number(seg.m))) : 1;
+    const maxDay = new Date(Number(y), monthNum, 0).getDate();
+    const dayNum = seg.d ? Math.min(maxDay, Math.max(1, Number(seg.d))) : 1;
+    const next = { y, m: String(monthNum).padStart(2, "0"), d: String(dayNum).padStart(2, "0") };
+    setSeg(next);
+    commit(next);
+  };
+
+  /** 空段上按退格 → 退回上一段，行为对齐原生日期框 */
+  const onSegmentKeyDown = (key: "m" | "d") => (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Backspace" && !e.currentTarget.value) {
+      e.preventDefault();
+      (key === "m" ? yearRef : monthRef).current?.select();
+    }
+  };
+
+  // 打开时把面板翻到已选日期所在月，并按输入框的位置摆放（下方空间不够则翻到上方）
+  const openPanel = () => {
+    const rect = wrapRef.current?.getBoundingClientRect();
+    if (rect) {
+      const enoughBelow = window.innerHeight - rect.bottom > PANEL_H + 8;
+      setPanelPos({
+        top: enoughBelow ? rect.bottom + 4 : Math.max(8, rect.top - PANEL_H - 4),
+        left: Math.min(Math.max(8, rect.left), Math.max(8, window.innerWidth - PANEL_W - 8))
+      });
+    }
+    setViewMonth(monthStartOf(value));
+    setOpen(true);
+  };
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (e: MouseEvent) => {
+      const target = e.target as Node;
+      if (panelRef.current?.contains(target) || wrapRef.current?.contains(target)) return;
+      setOpen(false);
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      // 只吃掉 Esc 的冒泡，别让它顺手把外层弹窗一起关了
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        setOpen(false);
+      }
+    };
+    // 坐标是开面板那一刻实测的，页面一滚就失效，直接收起来
+    const onReflow = () => setOpen(false);
+    document.addEventListener("mousedown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown, true);
+    window.addEventListener("resize", onReflow);
+    document.addEventListener("scroll", onReflow, true);
+    return () => {
+      document.removeEventListener("mousedown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown, true);
+      window.removeEventListener("resize", onReflow);
+      document.removeEventListener("scroll", onReflow, true);
+    };
+  }, [open]);
+
+  const year = viewMonth.getFullYear();
+  const month = viewMonth.getMonth();
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  // 首行留白格数：getDay() 的 0 = 周日，周一为首时要挪到末位
+  const leadingBlanks = (new Date(year, month, 1).getDay() + 6) % 7;
+  const todayValue = toLocalDateValue(new Date());
+
+  const pick = (next: string) => {
+    onChange(next);
+    setOpen(false);
+  };
+
+  // 三段共用的样式：定宽居中、去掉数字框的上下箭头、聚焦时只高亮当前段
+  const segCls =
+    "bg-transparent border-0 outline-none text-center tabular-nums p-0 focus:bg-indigo-500/15 rounded [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none";
+
+  return (
+    <>
+      <div ref={wrapRef} className={`${className} flex items-center gap-1`}>
+        <input
+          ref={yearRef}
+          type="text"
+          inputMode="numeric"
+          value={seg.y}
+          onChange={(e) => setSegment("y", e.target.value)}
+          onBlur={normalizeSegments}
+          onFocus={(e) => e.currentTarget.select()}
+          placeholder="年"
+          aria-label="年"
+          className={`${segCls} w-10`}
+        />
+        <span className="text-content-muted select-none">/</span>
+        <input
+          ref={monthRef}
+          type="text"
+          inputMode="numeric"
+          value={seg.m}
+          onChange={(e) => setSegment("m", e.target.value)}
+          onKeyDown={onSegmentKeyDown("m")}
+          onBlur={normalizeSegments}
+          onFocus={(e) => e.currentTarget.select()}
+          placeholder="月"
+          aria-label="月"
+          className={`${segCls} w-6`}
+        />
+        <span className="text-content-muted select-none">/</span>
+        <input
+          ref={dayRef}
+          type="text"
+          inputMode="numeric"
+          value={seg.d}
+          onChange={(e) => setSegment("d", e.target.value)}
+          onKeyDown={onSegmentKeyDown("d")}
+          onBlur={normalizeSegments}
+          onFocus={(e) => e.currentTarget.select()}
+          placeholder="日"
+          aria-label="日"
+          className={`${segCls} w-6`}
+        />
+        <button
+          type="button"
+          onClick={() => (open ? setOpen(false) : openPanel())}
+          className="ml-auto p-0.5 text-content-muted hover:text-content-primary rounded transition-colors flex-shrink-0"
+          title="选择日期"
+          aria-label="选择日期"
+        >
+          <CalendarDays className="w-4 h-4" />
+        </button>
+      </div>
+
+      {open && (
+        <div
+          ref={panelRef}
+          style={{ position: "fixed", top: panelPos.top, left: panelPos.left, width: PANEL_W }}
+          className="z-[60] bg-elevated border border-border-base rounded-xl shadow-2xl p-3"
+        >
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-sm font-semibold text-content-primary">
+              {year} 年 {month + 1} 月
+            </span>
+            <div className="flex items-center gap-0.5">
+              <button
+                type="button"
+                onClick={() => setViewMonth(new Date(year, month - 1, 1))}
+                className="p-1 text-content-muted hover:text-content-primary hover:bg-hovered rounded transition-colors"
+                title="上一月"
+                aria-label="上一月"
+              >
+                <ChevronLeft className="w-4 h-4" />
+              </button>
+              <button
+                type="button"
+                onClick={() => setViewMonth(new Date(year, month + 1, 1))}
+                className="p-1 text-content-muted hover:text-content-primary hover:bg-hovered rounded transition-colors"
+                title="下一月"
+                aria-label="下一月"
+              >
+                <ChevronRight className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-7 gap-0.5">
+            {WEEKDAY_LABELS.map((w) => (
+              <div key={w} className="text-[11px] text-content-muted text-center py-1">
+                {w}
+              </div>
+            ))}
+            {/* 当月 1 号之前的格子留白，不拿邻月日期补 */}
+            {Array.from({ length: leadingBlanks }, (_, i) => (
+              <div key={`blank-${i}`} />
+            ))}
+            {Array.from({ length: daysInMonth }, (_, i) => {
+              const day = i + 1;
+              const dayValue = toLocalDateValue(new Date(year, month, day));
+              const selected = dayValue === value;
+              const isToday = dayValue === todayValue;
+              return (
+                <button
+                  key={day}
+                  type="button"
+                  onClick={() => pick(dayValue)}
+                  className={`h-8 rounded-md text-xs font-medium transition-colors ${
+                    selected
+                      ? "bg-indigo-600 text-white"
+                      : isToday
+                        ? "text-indigo-600 dark:text-indigo-400 font-bold hover:bg-hovered"
+                        : "text-content-secondary hover:bg-hovered"
+                  }`}
+                >
+                  {day}
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="flex items-center justify-between mt-2 pt-2 border-t border-border-soft">
+            <button
+              type="button"
+              onClick={() => pick("")}
+              className="text-[11px] font-semibold text-content-muted hover:text-content-primary px-2 py-1 rounded hover:bg-hovered transition-colors"
+            >
+              清除
+            </button>
+            <button
+              type="button"
+              onClick={() => pick(todayValue)}
+              className="text-[11px] font-semibold text-indigo-600 dark:text-indigo-400 hover:text-indigo-500 px-2 py-1 rounded hover:bg-hovered transition-colors"
+            >
+              今天
+            </button>
+          </div>
+        </div>
+      )}
+    </>
   );
 };
 
@@ -957,6 +1271,7 @@ export default function App() {
   const [customDomainModalAccount, setCustomDomainModalAccount] = useState<CustomAccount | null>(null);
   const [customDomainModalEditing, setCustomDomainModalEditing] = useState<CustomDomain | null>(null);
   const [customDomainFull, setCustomDomainFull] = useState("");
+  const [customDomainRegistered, setCustomDomainRegistered] = useState("");
   const [customDomainExpiry, setCustomDomainExpiry] = useState("");
   const [customDomainRemark, setCustomDomainRemark] = useState("");
   const [customDomainSaving, setCustomDomainSaving] = useState(false);
@@ -3750,6 +4065,7 @@ export default function App() {
     setCustomDomainModalAccount(account);
     setCustomDomainModalEditing(editing || null);
     setCustomDomainFull(editing ? editing.full_domain : "");
+    setCustomDomainRegistered(editing ? (editing.registered_at || "").slice(0, 10) : "");
     setCustomDomainExpiry(editing ? (editing.expires_at || "").slice(0, 10) : "");
     setCustomDomainRemark(editing ? (editing.remark || "") : "");
     setCustomDomainModalOpen(true);
@@ -3775,7 +4091,13 @@ export default function App() {
       const res = await apiFetch(`/api/custom-groups/${group.id}/domains`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ full_domain: full, expires_at: expiry, remark: customDomainRemark, account_id: account ? account.id : null })
+        body: JSON.stringify({
+          full_domain: full,
+          registered_at: customDomainRegistered.trim(),
+          expires_at: expiry,
+          remark: customDomainRemark,
+          account_id: account ? account.id : null
+        })
       });
       const data = await res.json();
       if (data.success) {
@@ -8693,6 +9015,9 @@ export default function App() {
                                             {dom.full_domain}
                                           </div>
                                           <div className="text-[11px] text-content-muted mt-0.5 font-mono">
+                                            注册: {dom.registered_at ? dom.registered_at.slice(0, 10) : "—"}
+                                          </div>
+                                          <div className="text-[11px] text-content-muted font-mono">
                                             到期: {dom.expires_at.slice(0, 10)}
                                           </div>
                                         </div>
@@ -8794,6 +9119,9 @@ export default function App() {
                                               {dom.full_domain}
                                             </div>
                                             <div className="text-[11px] text-content-muted mt-0.5 font-mono">
+                                              注册: {dom.registered_at ? dom.registered_at.slice(0, 10) : "—"}
+                                            </div>
+                                            <div className="text-[11px] text-content-muted font-mono">
                                               到期: {dom.expires_at.slice(0, 10)}
                                             </div>
                                           </div>
@@ -9062,14 +9390,23 @@ export default function App() {
                     className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary font-mono"
                   />
                 </div>
-                <div>
-                  <label className="block text-xs font-semibold text-content-muted mb-1.5">到期时间</label>
-                  <input
-                    type="date"
-                    value={customDomainExpiry}
-                    onChange={(e) => setCustomDomainExpiry(e.target.value)}
-                    className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary"
-                  />
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs font-semibold text-content-muted mb-1.5">注册时间（可选）</label>
+                    <DateField
+                      value={customDomainRegistered}
+                      onChange={setCustomDomainRegistered}
+                      className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-content-muted mb-1.5">到期时间</label>
+                    <DateField
+                      value={customDomainExpiry}
+                      onChange={setCustomDomainExpiry}
+                      className="w-full form-input px-3 py-2.5 rounded-lg text-sm text-content-secondary"
+                    />
+                  </div>
                 </div>
                 <div>
                   <label className="block text-xs font-semibold text-content-muted mb-1.5">备注（可选）</label>
@@ -12645,22 +12982,20 @@ export default function App() {
                   <label className="block text-xs font-semibold text-content-secondary mb-1.5">
                     注册时间
                   </label>
-                  <input
-                    type="date"
+                  <DateField
                     value={cfEditRegistered}
-                    onChange={(e) => setCfEditRegistered(e.target.value)}
-                    className="w-full form-input px-3 py-2 rounded-lg text-sm text-content-secondary [color-scheme:light] dark:[color-scheme:dark]"
+                    onChange={setCfEditRegistered}
+                    className="w-full form-input px-3 py-2 rounded-lg text-sm text-content-secondary"
                   />
                 </div>
                 <div>
                   <label className="block text-xs font-semibold text-content-secondary mb-1.5">
                     到期时间
                   </label>
-                  <input
-                    type="date"
+                  <DateField
                     value={cfEditExpiry}
-                    onChange={(e) => setCfEditExpiry(e.target.value)}
-                    className="w-full form-input px-3 py-2 rounded-lg text-sm text-content-secondary [color-scheme:light] dark:[color-scheme:dark]"
+                    onChange={setCfEditExpiry}
+                    className="w-full form-input px-3 py-2 rounded-lg text-sm text-content-secondary"
                   />
                 </div>
               </div>

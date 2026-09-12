@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS custom_domains (
     group_id INTEGER NOT NULL,            -- 归属的服务商分组（accounts.id，始终有值）
     account_id INTEGER,                   -- 可选：归属的账号（custom_accounts.id，NULL=直接挂在分组下）
     full_domain TEXT NOT NULL,            -- 完整域名（小写）
+    registered_at TEXT,                   -- 注册时间 (YYYY-MM-DD，NULL=未填)
     expires_at TEXT NOT NULL,             -- 到期时间 (YYYY-MM-DD HH:MM:SS)
     remark TEXT,                          -- 备注
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,

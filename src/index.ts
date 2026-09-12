@@ -1128,13 +1128,16 @@ app.post("/api/custom-groups/batch", async (c) => {
           const domains = Array.isArray(acc?.domains) ? acc.domains : [];
           for (const d of domains) {
             const fullDomain = String(d?.full_domain || "").trim().toLowerCase().replace(/\.$/, "");
+            const registeredAt = String(d?.registered_at || "").trim();
             const expiresAt = String(d?.expires_at || "").trim();
             const remark = String(d?.remark || "").trim();
             if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(fullDomain)) continue;
             if (!/^\d{4}-\d{2}-\d{2}( \d{2}:\d{2}(:\d{2})?)?$/.test(expiresAt)) continue;
             const normalizedExpiry = /^\d{4}-\d{2}-\d{2}$/.test(expiresAt) ? `${expiresAt} 23:59:59` : expiresAt;
+            // 注册时间可选：格式不对就当没填，不影响这条域名入库
+            const validRegistered = /^\d{4}-\d{2}-\d{2}( \d{2}:\d{2}(:\d{2})?)?$/.test(registeredAt) ? registeredAt : null;
             if (accountId > 0) {
-              await dbManager.upsertCustomDomain(group.id, accountId, fullDomain, normalizedExpiry, remark.slice(0, 200));
+              await dbManager.upsertCustomDomain(group.id, accountId, fullDomain, normalizedExpiry, remark.slice(0, 200), validRegistered);
               domainCount++;
             }
           }
@@ -1222,7 +1225,7 @@ app.get("/api/custom-groups/:groupId/domains", async (c) => {
     const all = await dbManager.listAllCustomDomains();
     const filtered = all.filter((d) => d.group_id === groupId).map((d) => ({
       id: d.id, group_id: d.group_id, account_id: d.account_id, full_domain: d.full_domain,
-      expires_at: d.expires_at, remark: d.remark
+      registered_at: d.registered_at, expires_at: d.expires_at, remark: d.remark
     }));
     return c.json(successRes({ domains: filtered }));
   } catch (e: unknown) {
@@ -1242,6 +1245,7 @@ app.post("/api/custom-groups/:groupId/domains", async (c) => {
   try {
     const body = await c.req.json().catch(() => null);
     const fullDomain = String(body?.full_domain || "").trim().toLowerCase().replace(/\.$/, "");
+    const registeredAt = String(body?.registered_at || "").trim();
     const expiresAt = String(body?.expires_at || "").trim();
     const remark = String(body?.remark || "").trim();
     const accountIdRaw = body?.account_id;
@@ -1257,6 +1261,10 @@ app.post("/api/custom-groups/:groupId/domains", async (c) => {
     if (!/^\d{4}-\d{2}-\d{2}( \d{2}:\d{2}(:\d{2})?)?$/.test(expiresAt)) {
       return c.json(errorRes("到期时间格式无效，请使用 YYYY-MM-DD", "bad_request"), 400);
     }
+    // 注册时间：可选（公益域名常查不到），填了才校验格式
+    if (registeredAt && !/^\d{4}-\d{2}-\d{2}( \d{2}:\d{2}(:\d{2})?)?$/.test(registeredAt)) {
+      return c.json(errorRes("注册时间格式无效，请使用 YYYY-MM-DD", "bad_request"), 400);
+    }
     if (remark.length > 200) {
       return c.json(errorRes("备注过长（最多 200 字）", "bad_request"), 400);
     }
@@ -1269,7 +1277,7 @@ app.post("/api/custom-groups/:groupId/domains", async (c) => {
       ? `${expiresAt} 23:59:59`
       : expiresAt;
 
-    await dbManager.upsertCustomDomain(groupId, accountId, fullDomain, normalizedExpiry, remark);
+    await dbManager.upsertCustomDomain(groupId, accountId, fullDomain, normalizedExpiry, remark, registeredAt || null);
     return c.json(successRes({ message: "域名已保存" }));
   } catch (e: unknown) {
     const message = e instanceof Error ? e.message : "未知错误";

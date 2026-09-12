@@ -23,6 +23,12 @@ binding = "DB"
 database_name = "domain-hub-db"
 database_id = "change_me_to_your_d1_db_id" # 用户部署时替换为实际的 D1 ID
 
+# 子请求限制：默认 50 次/调用（免费计划硬限无法提升）。付费计划可通过此配置提升，
+# 多账号同步场景下的 API 调用（CF listZones 分页 + DNSHE 拉 DNS 记录 + D1 写入）
+# 很容易超出默认上限，建议付费用户按实际账号数调高。免费计划忽略此配置不会报错。
+[limits]
+subrequests = 1000
+
 # 定时任务：每天凌晨 2 点执行域名同步和到期检测自动续期
 [triggers]
 crons = ["0 2 * * *"]

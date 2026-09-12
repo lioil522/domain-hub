@@ -167,6 +167,43 @@ export async function sendTelegramNotification(botToken: string, chatId: string,
   }
 }
 
+/**
+ * 分批并发执行 —— 控制同时发出的 fetch() 数量以避免触发 Worker 子请求限制
+ *
+ * NOTE: Cloudflare Worker 每次调用有子请求配额（Free 50 / Paid 默认 10000），
+ * 如果用 Promise.all 对上百个域名同时发 listDnsRecords，一批就可能打满配额。
+ * 这里把任务数组切成每批 batchSize 个串行执行，每批内部并发，批间串行，
+ * 在不显著降低性能的前提下控制峰值子请求数。
+ */
+async function batchedPromiseAll<T>(
+  items: T[],
+  fn: (item: T) => Promise<T>,
+  batchSize: number = 5
+): Promise<T[]> {
+  const results: T[] = [];
+  for (let i = 0; i < items.length; i += batchSize) {
+    const batch = items.slice(i, i + batchSize);
+    const batchResults = await Promise.all(batch.map(fn));
+    results.push(...batchResults);
+  }
+  return results;
+}
+
+/**
+ * 判断错误是否为 Worker 子请求配额耗尽
+ *
+ * NOTE: Cloudflare 在超出 subrequests 限制时抛出的错误消息为
+ * "Too many subrequests by single Worker invocation"，
+ * 一旦触发，同一次调用内的后续 fetch() 全部会失败，
+ * 因此需要提前中止而非继续重试。
+ */
+function isSubrequestLimitError(error: unknown): boolean {
+  if (error instanceof Error) {
+    return error.message.includes("Too many subrequests");
+  }
+  return false;
+}
+
 // NOTE: 使用 DNSHEClient 的类型签名来定义分页拉取接口
 interface SubdomainClient {
   listSubdomains(page: number, perPage: number): Promise<{
@@ -363,18 +400,23 @@ export async function runDailySyncAndRenewal(
       // 2. 分页拉取该账户在 DNSHE 系统的全部域名
       const subdomains = await fetchAllSubdomainsFromClient(client);
       
-      // 3. 并发获取每个子域名的 DNS 记录，自动计算真实状态（已委派 / 已解析 / 未解析）
-      const subdomainsWithDnsInfo = await Promise.all(
-        subdomains.map(async (sub) => {
+      // 3. 分批并发获取每个子域名的 DNS 记录，自动计算真实状态（已委派 / 已解析 / 未解析）
+      //    使用 batchedPromiseAll 控制每批最多 5 个并发请求，避免触发 Worker 子请求限制。
+      const subdomainsWithDnsInfo = await batchedPromiseAll(
+        subdomains,
+        async (sub) => {
           try {
             const recordsRes = await client.listDnsRecords(sub.id);
             const records = recordsRes.records || [];
             return { ...sub, ...computeDnsState(records) };
           } catch (e) {
+            // 子请求配额耗尽时直接向上抛出，由外层 catch 统一处理并中止后续账号同步
+            if (isSubrequestLimitError(e)) throw e;
             // 上游临时失败时不带 dns_state_known，缓存中已识别出的三态与托管商保持不变。
             return { ...sub };
           }
-        })
+        },
+        5
       );
 
       // 4. 同步到本地 cache
@@ -433,6 +475,16 @@ export async function runDailySyncAndRenewal(
       const message = e instanceof Error ? e.message : "未知错误";
       const stack = e instanceof Error ? (e.stack || message) : message;
       await dbManager.writeLog("error", "sync", `同步账号 [${acc.alias}] 的域名数据失败：${message}`, stack);
+      // 子请求配额耗尽后同一次 Worker 调用内的所有后续 fetch() 均会失败，
+      // 继续遍历剩余账号只会产生一连串相同错误。提前中止并记录提示日志。
+      if (isSubrequestLimitError(e)) {
+        await dbManager.writeLog(
+          "warning",
+          "sync",
+          "检测到 Worker 子请求配额已耗尽，跳过剩余账号同步。如频繁出现，请在 wrangler.toml [limits] 中提升 subrequests 上限（需 Workers 付费计划）或减少绑定的账号数量"
+        );
+        break;
+      }
     }
   }
 

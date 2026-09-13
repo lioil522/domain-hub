@@ -9635,9 +9635,9 @@ export default function App() {
                 </button>
                 <button
                   onClick={handleSaveCustomDomain}
-                  disabled={customDomainSaving || !customDomainFull.trim() || !customDomainExpiry.trim()}
+                  disabled={customDomainSaving || !customDomainFull.trim()}
                   className={`text-xs font-semibold px-4 py-2 rounded-lg flex items-center gap-1.5 transition-all ${
-                    !customDomainSaving && customDomainFull.trim() && customDomainExpiry.trim()
+                    !customDomainSaving && customDomainFull.trim()
                       ? "bg-emerald-600 hover:bg-emerald-500 text-white cursor-pointer shadow-lg shadow-emerald-500/20"
                       : "bg-elevated text-content-muted opacity-50 cursor-not-allowed"
                   }`}

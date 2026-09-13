@@ -1132,8 +1132,14 @@ app.post("/api/custom-groups/batch", async (c) => {
             const expiresAt = String(d?.expires_at || "").trim();
             const remark = String(d?.remark || "").trim();
             if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(fullDomain)) continue;
-            if (!/^\d{4}-\d{2}-\d{2}( \d{2}:\d{2}(:\d{2})?)?$/.test(expiresAt)) continue;
-            const normalizedExpiry = /^\d{4}-\d{2}-\d{2}$/.test(expiresAt) ? `${expiresAt} 23:59:59` : expiresAt;
+            // 到期时间留空 = 永久（与单条录入一致，用 0000 占位落库）；填了但格式不对才跳过这条
+            const isPermanent = !expiresAt;
+            if (!isPermanent && !/^\d{4}-\d{2}-\d{2}( \d{2}:\d{2}(:\d{2})?)?$/.test(expiresAt)) continue;
+            const normalizedExpiry = isPermanent
+              ? "0000-00-00 00:00:00"
+              : /^\d{4}-\d{2}-\d{2}$/.test(expiresAt)
+                ? `${expiresAt} 23:59:59`
+                : expiresAt;
             // 注册时间可选：格式不对就当没填，不影响这条域名入库
             const validRegistered = /^\d{4}-\d{2}-\d{2}( \d{2}:\d{2}(:\d{2})?)?$/.test(registeredAt) ? registeredAt : null;
             if (accountId > 0) {

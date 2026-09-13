@@ -13,6 +13,8 @@ Domain Hub（域汇）是一款**多服务商域名集中管理面板**：原生
 
 - **多账号管理** — 支持绑定多个 DNSHE API Key，跨账号统一管理域名资产
 - **Cloudflare 管理** — 独立标签页绑定 Cloudflare 账号（API Token，绑定时在线校验、别名自动取账号名），自动同步 zones 列表；支持 Cloudflare 全部 21 种记录类型的增删改与批量操作、橙色云代理开关、控制台深链；域名页对已委派且已绑定的域名一键跳转定位
+- **DigitalPlat 管理** — 独立标签页绑定 DigitalPlat 账号（API Key），同步域名资产与解析记录
+- **自定义服务商** — 为没有 API 的社区公益域名（eu.org、pp.ua 等）建「分组 → 账号 → 域名」三层结构手动录入，到期时间留空即为永久；到期前照常走通知渠道提醒
 - **域名资产看板** — 一览所有域名的状态、到期时间、DNS 托管商等信息
 - **DNS 解析管理** — 在面板内直接增删改 DNS 记录（A / AAAA / CNAME / MX / TXT 等）
 - **自动续期** — 每日定时扫描即将到期的域名并自动续期，无人值守
@@ -43,6 +45,7 @@ graph TD
             B3["src/cron.ts — 定时任务"]
             B4["src/dnshe.ts — API 客户端"]
             B5["src/cloudflare.ts — CF API 客户端"]
+            B6["src/digitalplat.ts — DP API 客户端"]
         end
 
         A1 -->|API 调用| B1
@@ -61,7 +64,7 @@ graph TD
     end
 
     subgraph 上游 API
-        C3["DNSHE REST API / Cloudflare API v4"]
+        C3["DNSHE REST API / Cloudflare API v4 / DigitalPlat API"]
     end
 ```
 
@@ -217,6 +220,7 @@ Domain-Hub/
 │   ├── cron.ts                 #   定时任务（域名同步、自动续期、通知推送）
 │   ├── dnshe.ts                #   DNSHE API 客户端
 │   ├── cloudflare.ts           #   Cloudflare API v4 客户端（zone 与解析记录）
+│   ├── digitalplat.ts          #   DigitalPlat API 客户端
 │   ├── dns-provider.ts         #   DNS 托管商识别
 │   └── punycode.ts             #   国际化域名编码
 │
@@ -303,10 +307,14 @@ npm run start:node
 
 | 表名 | 用途 |
 |------|------|
-| `accounts` | API 账号（别名、API Key、加密后的 API Secret） |
+| `accounts` | API 账号（别名、API Key、加密后的 API Secret）；自定义服务商的「分组」也存在这里，`provider = 'custom'` |
 | `domains_cache` | 域名缓存（状态、到期时间、DNS 托管商、续期记录） |
 | `logs` | 系统运行日志（同步、续期、鉴权、操作等分类） |
+| `settings` | 面板配置（续期阈值、通知渠道等） |
 | `cache` | API 上游响应缓存（防止频繁调用被判定滥用） |
+| `domain_date_overrides` | 手动录入的注册 / 到期时间与注册来源（RDAP 查不到的域名） |
+| `custom_accounts` | 自定义服务商分组下的账号（仅名称，无凭据） |
+| `custom_domains` | 自定义服务商手动录入的域名（注册 / 到期时间、备注） |
 
 ---
 
@@ -355,6 +363,12 @@ Docker 的 `registry-mirrors` 只代理 Docker Hub，对 `ghcr.io` 无效。
 ### 忘记管理员密码怎么办？
 
 如果配置了 `ADMIN_TOKEN` 环境变量，可以使用它作为兜底登录方式。如果未配置，需要删除数据库中的管理员数据重新初始化。
+
+### 自定义服务商分组是做什么的？
+
+给没有 API 的社区公益域名（eu.org、pp.ua、nn.kg 等）留的手动录入位。结构是「分组 → 账号 → 域名」三层：分组通常对应一个服务商，账号对应你在该服务商那边的注册账号，域名手动填注册 / 到期时间与备注。域名也可以不挂账号、直接挂在分组下。
+
+这类分组没有上游，不参与域名同步、配额统计与自动续期，只做到期提醒 —— 阈值复用「自动续期天数」配置，触发时和其它域名一样走通知渠道。到期时间留空表示永久，这类域名不会产生提醒。若该域名恰好托管在已绑定的 Cloudflare 账号下，卡片上会出现跳转按钮。
 
 ### 自动续期会处理 Cloudflare 的域名吗？
 

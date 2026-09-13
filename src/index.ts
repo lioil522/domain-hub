@@ -1164,6 +1164,30 @@ app.post("/api/custom-groups/batch", async (c) => {
   }
 });
 
+// 一次拉齐所有自定义分组的账号与域名（前端首屏用）
+//
+// NOTE: 前端原先按分组逐个打 accounts + domains 两个接口，分组数一多就是十几次串行往返，
+// 首屏要等好几秒。这里两张表各一次全量查询返回，请求数与分组数无关。
+app.get("/api/custom-groups/overview", async (c) => {
+  const dbManager = c.get("db");
+  try {
+    const [accounts, domains] = await Promise.all([
+      dbManager.listAllCustomAccounts(),
+      dbManager.listAllCustomDomains()
+    ]);
+    return c.json(successRes({
+      accounts,
+      domains: domains.map((d) => ({
+        id: d.id, group_id: d.group_id, account_id: d.account_id, full_domain: d.full_domain,
+        registered_at: d.registered_at, expires_at: d.expires_at, remark: d.remark
+      }))
+    }));
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "未知错误";
+    return c.json(errorRes(message), 500);
+  }
+});
+
 // 列出某个分组下的所有账号
 app.get("/api/custom-groups/:groupId/accounts", async (c) => {
   const dbManager = c.get("db");

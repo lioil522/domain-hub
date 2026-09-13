@@ -1330,10 +1330,39 @@ export default function App() {
   // ===== 自定义服务商（无 API，三层结构：分组 → 账号 → 域名） =====
   // 当前选中的分组筛选（"all" 或分组 id 字符串）
   const [customGroupFilter, setCustomGroupFilter] = useState<string>("all");
+
+  /**
+   * 账号 / 域名的本地兜底缓存
+   *
+   * 手动录入的数据以「天」为单位变化，首屏没必要空着等网络：先把上次的结果秒显出来，
+   * 后台再拉最新覆盖。写不进去（隐私模式等）就当没有缓存，不影响功能。
+   */
+  const CUSTOM_CACHE_LS_KEY = "DOMAIN_HUB_CUSTOM_CACHE_V1";
+  const readCustomCache = (): { accounts: CustomAccount[]; domains: CustomDomain[] } => {
+    try {
+      const raw = localStorage.getItem(CUSTOM_CACHE_LS_KEY);
+      if (!raw) return { accounts: [], domains: [] };
+      const parsed = JSON.parse(raw) as { accounts?: CustomAccount[]; domains?: CustomDomain[] };
+      return {
+        accounts: Array.isArray(parsed.accounts) ? parsed.accounts : [],
+        domains: Array.isArray(parsed.domains) ? parsed.domains : []
+      };
+    } catch {
+      return { accounts: [], domains: [] };
+    }
+  };
+  const persistCustomCache = (accounts: CustomAccount[], domains: CustomDomain[]) => {
+    try {
+      localStorage.setItem(CUSTOM_CACHE_LS_KEY, JSON.stringify({ ts: Date.now(), accounts, domains }));
+    } catch {
+      // 存储不可用：仅本次会话内有数据
+    }
+  };
+
   // 账号数据（按 group_id 归组）
-  const [customAccounts, setCustomAccounts] = useState<CustomAccount[]>([]);
+  const [customAccounts, setCustomAccounts] = useState<CustomAccount[]>(() => readCustomCache().accounts);
   // 手动域名数据（按 account_id 归组）
-  const [customDomains, setCustomDomains] = useState<CustomDomain[]>([]);
+  const [customDomains, setCustomDomains] = useState<CustomDomain[]>(() => readCustomCache().domains);
   const [loadingCustomDomains, setLoadingCustomDomains] = useState(false);
   // 分组折叠状态（key = 分组 account id；独立持久化键，刷新 / 重开浏览器后保持上次布局）
   const [customCollapsedGroups, setCustomCollapsedGroups] = useState<Set<number>>(() => {
@@ -3960,41 +3989,26 @@ export default function App() {
     [accounts]
   );
 
-  // 拉取所有自定义分组的账号与域名（进入页或数据变化时）
+  /**
+   * 拉取所有自定义分组的账号与域名
+   *
+   * NOTE: 手动域名全在本地 D1，一次总览接口就能拉齐（见后端 /api/custom-groups/overview）。
+   * 早先是「/api/accounts + 每个分组各两个接口」的串行循环，分组一多首屏要等好几秒。
+   * 结果同时写入 localStorage，下次进页面先秒显缓存再后台刷新。
+   */
   const fetchCustomDomains = async () => {
     setLoadingCustomDomains(true);
     try {
-      // 先从后端拿最新分组列表（避免依赖闭包里的 accounts 时序）
-      const accRes = await apiFetch("/api/accounts");
-      const accData = await accRes.json();
-      const groups: Account[] = accData.success ? (accData.accounts || []) : [];
-      const customGroups = groups.filter((a) => a.provider === "custom");
-
-      const allAccounts: CustomAccount[] = [];
-      const allDomains: CustomDomain[] = [];
-      for (const g of customGroups) {
-        try {
-          // 拉分组下的账号
-          const accListRes = await apiFetch(`/api/custom-groups/${g.id}/accounts`);
-          const accListData = await accListRes.json();
-          const groupAccounts: CustomAccount[] = accListData.success && Array.isArray(accListData.accounts) ? accListData.accounts : [];
-          allAccounts.push(...groupAccounts);
-          // 拉分组下所有域名（含直接挂在分组下 + 各账号下的）
-          try {
-            const domRes = await apiFetch(`/api/custom-groups/${g.id}/domains`);
-            const domData = await domRes.json();
-            if (domData.success && Array.isArray(domData.domains)) {
-              allDomains.push(...(domData.domains as CustomDomain[]));
-            }
-          } catch {
-            // 单个分组域名拉取失败不影响其它
-          }
-        } catch {
-          // 单个分组拉取失败不影响其它分组
-        }
-      }
-      setCustomAccounts(allAccounts);
-      setCustomDomains(allDomains);
+      const res = await apiFetch("/api/custom-groups/overview");
+      const data = await res.json();
+      if (!data.success) return;
+      const accounts: CustomAccount[] = Array.isArray(data.accounts) ? data.accounts : [];
+      const domains: CustomDomain[] = Array.isArray(data.domains) ? data.domains : [];
+      setCustomAccounts(accounts);
+      setCustomDomains(domains);
+      persistCustomCache(accounts, domains);
+    } catch {
+      // 网络异常：保留当前（可能来自缓存的）数据，不清空列表
     } finally {
       setLoadingCustomDomains(false);
     }
@@ -4002,23 +4016,22 @@ export default function App() {
 
   // 手动域名按「分组 → 账号」归组（含到期天数计算）；account_id 为空的域名直接挂在分组下
   const groupedCustomDomains = useMemo(() => {
-    const groups: Array<{
+    type DomainWithDays = CustomDomain & { daysLeft: number };
+    type AccountWithDomains = CustomAccount & { domains: DomainWithDays[] };
+    type CustomGroup = {
       groupId: number;
       alias: string;
       website: string | null;
-      unassignedDomains: Array<CustomDomain & { daysLeft: number }>;
-      accounts: Array<CustomAccount & { domains: Array<CustomDomain & { daysLeft: number }> }>;
-    }> = [];
-    const groupById = new Map<number, {
-      groupId: number;
-      alias: string;
-      website: string | null;
-      unassignedDomains: Array<CustomDomain & { daysLeft: number }>;
-      accounts: Array<CustomAccount & { domains: Array<CustomDomain & { daysLeft: number }> }>;
-    }>();
-    const accountById = new Map<number, CustomAccount & { domains: Array<CustomDomain & { daysLeft: number }> }>();
+      unassignedDomains: DomainWithDays[];
+      accounts: AccountWithDomains[];
+      /** 分组下域名总数（各账号 + 未归属账号），分组头部徽标用 */
+      domainCount: number;
+    };
+    const groups: CustomGroup[] = [];
+    const groupById = new Map<number, CustomGroup>();
+    const accountById = new Map<number, AccountWithDomains>();
 
-    const toDaysLeft = (d: CustomDomain): CustomDomain & { daysLeft: number } => {
+    const toDaysLeft = (d: CustomDomain): DomainWithDays => {
       const expiresTime = new Date(d.expires_at).getTime();
       const daysLeft = Number.isNaN(expiresTime) ? 0 : (expiresTime - Date.now()) / (1000 * 60 * 60 * 24);
       return { ...d, daysLeft };
@@ -4026,12 +4039,13 @@ export default function App() {
 
     customGroupList.forEach((g) => {
       if (customGroupFilter !== "all" && String(g.id) !== customGroupFilter) return;
-      const group = {
+      const group: CustomGroup = {
         groupId: g.id,
         alias: g.alias,
         website: g.website || null,
-        unassignedDomains: [] as Array<CustomDomain & { daysLeft: number }>,
-        accounts: [] as Array<CustomAccount & { domains: Array<CustomDomain & { daysLeft: number }> }>
+        unassignedDomains: [],
+        accounts: [],
+        domainCount: 0
       };
       groupById.set(g.id, group);
       groups.push(group);
@@ -4039,7 +4053,7 @@ export default function App() {
     customAccounts.forEach((a) => {
       const group = groupById.get(a.group_id);
       if (!group) return;
-      const acc = { ...a, domains: [] as Array<CustomDomain & { daysLeft: number }> };
+      const acc: AccountWithDomains = { ...a, domains: [] };
       accountById.set(a.id, acc);
       group.accounts.push(acc);
     });
@@ -4047,12 +4061,16 @@ export default function App() {
       if (d.account_id == null) {
         // 直接挂在分组下
         const group = groupById.get(d.group_id);
-        if (group) group.unassignedDomains.push(toDaysLeft(d));
+        if (!group) return;
+        group.unassignedDomains.push(toDaysLeft(d));
+        group.domainCount++;
         return;
       }
       const acc = accountById.get(d.account_id);
       if (!acc) return;
       acc.domains.push(toDaysLeft(d));
+      const group = groupById.get(acc.group_id);
+      if (group) group.domainCount++;
     });
     return groups;
   }, [customGroupList, customAccounts, customDomains, customGroupFilter]);
@@ -9195,6 +9213,10 @@ export default function App() {
                           )}
                           <span className="text-[11px] md:text-xs bg-emerald-50 text-emerald-700 border border-emerald-200 dark:bg-emerald-950/80 dark:text-emerald-300 dark:border-emerald-900/60 px-2 md:px-2.5 py-0.5 rounded-full font-normal flex-shrink-0">
                             {group.accounts.length} 个账号
+                          </span>
+                          {/* 域名总数（含未归属账号的）：只看账号数会让「0 个账号但有域名」的分组像是空的 */}
+                          <span className="text-[11px] md:text-xs bg-indigo-50 text-indigo-700 border border-indigo-200 dark:bg-indigo-950/80 dark:text-indigo-300 dark:border-indigo-900/60 px-2 md:px-2.5 py-0.5 rounded-full font-normal flex-shrink-0">
+                            {group.domainCount} 个域名
                           </span>
                         </button>
                         <div className="flex items-center gap-1.5 flex-shrink-0">

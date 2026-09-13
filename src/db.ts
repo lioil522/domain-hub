@@ -1519,6 +1519,21 @@ export class DatabaseManager {
     return results || [];
   }
 
+  /**
+   * 跨分组列出所有账号（配合 listAllCustomDomains 供「一次拉齐」的总览接口用）
+   *
+   * 前端原先按分组逐个请求 accounts + domains（1 + 2N 次串行往返），分组一多首屏就要等几秒；
+   * 两张表各一次全量查询即可，分组数不再影响请求数。
+   */
+  async listAllCustomAccounts(): Promise<
+    Array<{ id: number; group_id: number; name: string; updated_at: string }>
+  > {
+    const { results } = await this.db
+      .prepare("SELECT id, group_id, name, updated_at FROM custom_accounts ORDER BY group_id ASC, id ASC")
+      .all<{ id: number; group_id: number; name: string; updated_at: string }>();
+    return results || [];
+  }
+
   /** 新增账号（同名 upsert 更新） */
   async upsertCustomAccount(groupId: number, name: string): Promise<number> {
     const now = this.getBeijingNow();

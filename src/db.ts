@@ -1546,6 +1546,32 @@ export class DatabaseManager {
    */
   async upsertCustomDomain(groupId: number, accountId: number | null, fullDomain: string, expiresAt: string, remark: string, registeredAt?: string | null): Promise<void> {
     const now = this.getBeijingNow();
+
+    // NOTE: SQLite 的 UNIQUE 把每个 NULL 视作互不相同，所以 account_id 为空（域名直接挂在
+    // 分组下）时 ON CONFLICT(group_id, account_id, full_domain) 永远不会命中 —— 每次保存都
+    // 插一条新行，界面上就出现同名域名的多张卡片。这类行先按 IS NULL 查一次再决定更新/插入。
+    if (accountId === null) {
+      const existing = await this.db
+        .prepare("SELECT id FROM custom_domains WHERE group_id = ? AND account_id IS NULL AND full_domain = ?")
+        .bind(groupId, fullDomain)
+        .first<{ id: number }>();
+      if (existing?.id) {
+        await this.db
+          .prepare("UPDATE custom_domains SET registered_at = ?, expires_at = ?, remark = ?, updated_at = ? WHERE id = ?")
+          .bind(registeredAt || null, expiresAt, remark || null, now, existing.id)
+          .run();
+        return;
+      }
+      await this.db
+        .prepare(`
+          INSERT INTO custom_domains (group_id, account_id, full_domain, registered_at, expires_at, remark, updated_at)
+          VALUES (?, NULL, ?, ?, ?, ?, ?)
+        `)
+        .bind(groupId, fullDomain, registeredAt || null, expiresAt, remark || null, now)
+        .run();
+      return;
+    }
+
     await this.db.prepare(`
       INSERT INTO custom_domains (group_id, account_id, full_domain, registered_at, expires_at, remark, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -1555,6 +1581,36 @@ export class DatabaseManager {
         remark = excluded.remark,
         updated_at = excluded.updated_at
     `).bind(groupId, accountId, fullDomain, registeredAt || null, expiresAt, remark || null, now).run();
+  }
+
+  /**
+   * 按行 id 更新一条手动域名（编辑弹窗用，支持改域名本身）
+   *
+   * 走 id 而不是「域名 upsert」，改名时才不会留下旧行；返回 false 表示这条 id 不在该分组下。
+   */
+  async updateCustomDomainById(
+    id: number,
+    groupId: number,
+    fullDomain: string,
+    expiresAt: string,
+    remark: string,
+    registeredAt?: string | null
+  ): Promise<boolean> {
+    const now = this.getBeijingNow();
+    const row = await this.db
+      .prepare("SELECT id FROM custom_domains WHERE id = ? AND group_id = ?")
+      .bind(id, groupId)
+      .first<{ id: number }>();
+    if (!row?.id) return false;
+    await this.db
+      .prepare(`
+        UPDATE custom_domains
+        SET full_domain = ?, registered_at = ?, expires_at = ?, remark = ?, updated_at = ?
+        WHERE id = ?
+      `)
+      .bind(fullDomain, registeredAt || null, expiresAt, remark || null, now, id)
+      .run();
+    return true;
   }
 
   /** 删除一条手动域名 */

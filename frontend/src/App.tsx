@@ -1335,8 +1335,26 @@ export default function App() {
   // 手动域名数据（按 account_id 归组）
   const [customDomains, setCustomDomains] = useState<CustomDomain[]>([]);
   const [loadingCustomDomains, setLoadingCustomDomains] = useState(false);
-  // 分组折叠状态（key = 分组 account id）
-  const [customCollapsedGroups, setCustomCollapsedGroups] = useState<Set<number>>(new Set());
+  // 分组折叠状态（key = 分组 account id；独立持久化键，刷新 / 重开浏览器后保持上次布局）
+  const [customCollapsedGroups, setCustomCollapsedGroups] = useState<Set<number>>(() => {
+    try {
+      const raw = localStorage.getItem("DOMAIN_HUB_CUSTOM_COLLAPSED_GROUPS");
+      const parsed = raw ? JSON.parse(raw) : [];
+      return new Set(Array.isArray(parsed) ? parsed : []);
+    } catch {
+      return new Set();
+    }
+  });
+
+  // 折叠状态落盘
+  const persistCustomCollapsed = (next: Set<number>) => {
+    setCustomCollapsedGroups(next);
+    try {
+      localStorage.setItem("DOMAIN_HUB_CUSTOM_COLLAPSED_GROUPS", JSON.stringify([...next]));
+    } catch {
+      // 隐私模式等存储不可用：只保留本次会话的折叠状态
+    }
+  };
   // 新建分组弹窗
   const [customNewGroupOpen, setCustomNewGroupOpen] = useState(false);
   const [customNewGroupAlias, setCustomNewGroupAlias] = useState("");
@@ -4217,6 +4235,8 @@ export default function App() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          // 编辑时带上行 id，后端按 id 原地更新（改域名不会留旧行，未挂账号的域名也不会重复插入）
+          id: customDomainModalEditing ? customDomainModalEditing.id : undefined,
           full_domain: full,
           registered_at: customDomainRegistered.trim(),
           expires_at: expiry,
@@ -4280,12 +4300,20 @@ export default function App() {
 
   // 分组折叠
   const customToggleGroupCollapse = (groupId: number) => {
-    setCustomCollapsedGroups((prev) => {
-      const next = new Set(prev);
-      if (next.has(groupId)) next.delete(groupId);
-      else next.add(groupId);
-      return next;
-    });
+    const next = new Set(customCollapsedGroups);
+    if (next.has(groupId)) next.delete(groupId);
+    else next.add(groupId);
+    persistCustomCollapsed(next);
+  };
+
+  // 展开/收起全部分组（与其它标签页的 toggleAllAccounts 同构：
+  // 存在收起的分组 → 全部展开；否则全部收起）
+  const customToggleAllGroups = () => {
+    if (customCollapsedGroups.size > 0) {
+      persistCustomCollapsed(new Set());
+    } else {
+      persistCustomCollapsed(new Set(groupedCustomDomains.map((g) => g.groupId)));
+    }
   };
 
   // CF zones 按账号分组。选择特定账号时只生成该账号的分组（其余隐藏，与域名列表页
@@ -9078,6 +9106,24 @@ export default function App() {
                   <RefreshCw className={`w-3.5 h-3.5 ${loadingCustomDomains ? "animate-spin" : ""}`} />
                   刷新
                 </button>
+                {groupedCustomDomains.length > 0 && (
+                  <button
+                    onClick={customToggleAllGroups}
+                    className="px-3 py-2 sm:py-1.5 text-xs font-semibold text-content-secondary hover:text-content-primary bg-elevated hover:bg-hovered border border-border-base rounded-lg transition-all flex items-center gap-1.5 whitespace-nowrap"
+                  >
+                    {customCollapsedGroups.size > 0 ? (
+                      <>
+                        <ChevronsUpDown className="w-3.5 h-3.5" />
+                        展开全部
+                      </>
+                    ) : (
+                      <>
+                        <ChevronsDownUp className="w-3.5 h-3.5" />
+                        收起全部
+                      </>
+                    )}
+                  </button>
+                )}
                 <button
                   onClick={() => setCustomNewGroupOpen(true)}
                   className="px-4 py-2 sm:py-1.5 text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white border border-emerald-500 shadow-lg shadow-emerald-900/30 rounded-lg transition-all flex items-center gap-1.5 whitespace-nowrap"

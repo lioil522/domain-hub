@@ -1258,6 +1258,9 @@ app.post("/api/custom-groups/:groupId/domains", async (c) => {
     const accountId = accountIdRaw === undefined || accountIdRaw === null || accountIdRaw === ""
       ? null
       : Number(accountIdRaw);
+    // 编辑已有域名时前端带上行 id：按 id 原地更新，改域名也不会留下旧行、更不会多插一条
+    const idRaw = body?.id;
+    const editId = idRaw === undefined || idRaw === null || idRaw === "" ? null : Number(idRaw);
 
     // 域名合法性：主机名形态（含点、无空格、ASCII）
     if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(fullDomain)) {
@@ -1279,6 +1282,9 @@ app.post("/api/custom-groups/:groupId/domains", async (c) => {
     if (accountId !== null && (!Number.isInteger(accountId) || accountId <= 0)) {
       return c.json(errorRes("无效的账号 ID", "bad_request"), 400);
     }
+    if (editId !== null && (!Number.isInteger(editId) || editId <= 0)) {
+      return c.json(errorRes("无效的域名 ID", "bad_request"), 400);
+    }
 
     // 归一化到期时间：永久用 0000 占位；纯日期补上 23:59:59，保证「到期当天」在提醒阈值内仍算未过期
     const normalizedExpiry = isPermanent
@@ -1286,6 +1292,14 @@ app.post("/api/custom-groups/:groupId/domains", async (c) => {
       : /^\d{4}-\d{2}-\d{2}$/.test(expiresAt)
         ? `${expiresAt} 23:59:59`
         : expiresAt;
+
+    if (editId !== null) {
+      const updated = await dbManager.updateCustomDomainById(editId, groupId, fullDomain, normalizedExpiry, remark, registeredAt || null);
+      if (!updated) {
+        return c.json(errorRes("要修改的域名不存在（可能已被删除）", "not_found"), 404);
+      }
+      return c.json(successRes({ message: "域名已保存" }));
+    }
 
     await dbManager.upsertCustomDomain(groupId, accountId, fullDomain, normalizedExpiry, remark, registeredAt || null);
     return c.json(successRes({ message: "域名已保存" }));

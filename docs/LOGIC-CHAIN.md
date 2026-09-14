@@ -520,13 +520,27 @@ import.meta.env.VITE_API_BASE_URL        ← 构建期烘焙
 
 | 接口 | 粒度 | 前端入口 | 日志措辞 |
 |---|---|---|---|
-| `POST /api/domains/sync` | **全量**（所有账号 + 续期 + 通知） | DNSHE 域名页「同步所有账号」 | 定时任务那套措辞 |
-| `POST /api/providers/:provider/sync` | **单服务商**（该 provider 全部账号） | CF 页 / DP 页的同步按钮 | `手动同步：…` |
+| `POST /api/domains/sync` | **全量**（所有账号 + 续期 + 通知） | **概览页**「同步所有账号」 | 定时任务那套措辞 |
+| `POST /api/providers/:provider/sync` | **单服务商**（该 provider 全部账号） | DNSHE 页 / CF 页 / DP 页的「同步域名」 | `手动同步：…` |
 | `POST /api/accounts/:id/sync` | **单账号** | 账号行的同步图标 | `手动同步：…` |
+
+**三个服务商页的按钮文案统一是「同步域名」**，且都走 provider 级接口 —— 页面属于哪个服务商，就只同步哪个。DNSHE 页原先掛的是全量入口（文案「同步所有账号」），在 DNSHE 页点一下会连带把 CF / DP 也回源一遍；现已改为 `/api/providers/dnshe/sync`，全量入口独占概览页。
 
 **`/api/providers/:provider/sync` 是后补的**。在此之前 CF 页与 DP 页的同步按钮都调 `/api/domains/sync`（全量），与按钮所在页面的语义不符 —— 用户在 CF 页点同步却连带同步了 DNSHE / DP，且在免费计划下更容易撞 50 次子请求上限。`provider` 走白名单校验（`dnshe` / `cloudflare` / `digitalplat`），`custom` 明确返回「无需同步」而非静默成功。
 
 **⚠️ 后台同步必须写 `writeLog`**：`resyncAccountsInBackground` 原先只有 `console.log`，而 console 在 Workers 里进的是实时日志（wrangler tail / 仪表盘），**不落 D1 的 `logs` 表** —— 结果是面板日志页看不到任何手动同步痕迹，用户以为没跑。cron 那条路径每步都有 `writeLog`，所以只有定时任务有日志。这个差异是缺陷，已修。
+
+### 6.3.2 概览「到期统计」的唯一可信数据源是 `cfExpiryMap`
+
+概览的「已过期」计数与「到期预警」列表**不能直接读 `d.expires_at`**：
+
+- **Cloudflare zone 没有任何到期字段** —— 有效期登记在注册商处，CF API 不返回；早先代码把 CF 一律当「永久未过期」（`record(z.full_domain, false)`）。
+- **DNSHE 对部分域名返回空串** —— 上游本身就没有这个值。
+- 真正查到的到期时间只存在于 **`cfExpiryMap`**（RDAP 自动查询结果 + 用户手动录入的 `domain_date_overrides`），按注册域缓存 7 天。
+
+因此前端抽出 `resolveExpiry()` 复用 `cfZoneDateInfo` 的优先级链：**手动覆盖 > DNSHE 上游 > DigitalPlat 上游 > RDAP 自动查询**；统计与预警共用同一张去重表。
+
+**另一个隐形坑**：`dashboardStats` 的 `useMemo` 依赖数组原先**漏了 `cfExpiryMap`** —— 即便取值链修对了，RDAP 异步查完也不会触发重算，界面仍显示 0。改统计口径时务必同步检查依赖数组。
 
 ### 6.4 跨源搜索与跳转
 

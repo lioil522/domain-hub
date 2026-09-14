@@ -6,6 +6,15 @@ import { DigitalPlatClient } from "./digitalplat";
 export type AccountProvider = "dnshe" | "cloudflare" | "digitalplat" | "custom";
 
 /**
+ * 数据导入/导出的快照格式版本
+ *
+ * NOTE: 导入时要求**严格相等**。备份格式一旦变更（增删列、改语义），旧文件必须被明确
+ * 拒绝而不是「尽力而为地导入」—— 静默地按新格式解读旧数据，是数据损坏最难排查的一类。
+ * 改格式时把这个数字加一，并在导入侧补上迁移分支。
+ */
+export const DATA_EXPORT_VERSION = 1;
+
+/**
  * 归一化自动解析出的 Cloudflare 账号别名
  *
  * NOTE: Cloudflare 给个人账号生成的默认名是「<邮箱>'s Account」，后缀是界面噪音，
@@ -1852,5 +1861,180 @@ export class DatabaseManager {
       .prepare("DELETE FROM domain_date_overrides WHERE account_id = ? AND full_domain = ?")
       .bind(accountId, fullDomain)
       .run();
+  }
+
+  // ===== 数据导入 / 导出（备份与迁移） =====
+
+  /**
+   * 导出全部**业务数据**为可移植快照
+   *
+   * 范围刻意限定在 5 张业务表：accounts / domains_cache / custom_accounts /
+   * custom_domains / domain_date_overrides。三张表**故意不导出**：
+   *   - settings：内含 2FA 密钥、密码哈希、sess_ 会话行。导出它等于把「导出一份备份」
+   *     变成「导出一份可登录的凭据」，与「导出需 2FA」的初衷直接冲突；
+   *   - logs：纯运行历史，体积大且无恢复价值（恢复日志反而会污染新环境的排障线索）；
+   *   - cache：上游响应的临时缓存，过期即失效，恢复它没有意义。
+   *
+   * NOTE: accounts 里的 api_key / api_secret 是**加密后的密文**（AES-GCM，密钥来自
+   * AES_KEY 环境变量），导出的是密文本身。这意味着：跨环境导入时目标环境必须使用
+   * **同一个 AES_KEY**，否则解密失败、账号凭据不可用。这是刻意的设计 —— 密文脱离
+   * 密钥无法还原，比解密后明文导出安全得多。
+   */
+  async exportAllData(): Promise<{
+    version: number;
+    exported_at: string;
+    counts: Record<string, number>;
+    data: Record<string, unknown[]>;
+  }> {
+    const TABLES = [
+      "accounts",
+      "domains_cache",
+      "custom_accounts",
+      "custom_domains",
+      "domain_date_overrides",
+    ] as const;
+
+    const data: Record<string, unknown[]> = {};
+    const counts: Record<string, number> = {};
+
+    for (const table of TABLES) {
+      // 表名来自上面的白名单常量，不是用户输入，无注入风险
+      const { results } = await this.db
+        .prepare(`SELECT * FROM ${table}`)
+        .all<Record<string, unknown>>();
+      data[table] = results || [];
+      counts[table] = (results || []).length;
+    }
+
+    return {
+      version: DATA_EXPORT_VERSION,
+      exported_at: new Date().toISOString(),
+      counts,
+      data,
+    };
+  }
+
+  /**
+   * 导入业务数据快照（**合并 upsert 语义**：同主键覆盖、不存在则新增，绝不删除现有行）
+   *
+   * WHY 不做「完全替换」：导入是恢复/迁移手段，用备份覆盖现场会顺手抹掉备份之后新增的
+   * 数据，且误操作不可逆。合并语义下反复导入是幂等的，代价只是「备份里没有的行不会被清掉」
+   * —— 对迁移场景足够，且失败可以重试。
+   *
+   * NOTE 写入顺序必须遵循外键依赖：accounts → custom_accounts → custom_domains /
+   * domains_cache / domain_date_overrides。custom_accounts 依赖 accounts(group_id)，
+   * custom_domains 同时依赖 accounts(group_id) 与 custom_accounts(account_id)，
+   * domains_cache 与 domain_date_overrides 依赖 accounts。顺序错了会直接撞外键约束。
+   *
+   * NOTE 整批走 db.batch()：D1 的 batch 是原子的，任何一条失败整批回滚，
+   * 不会留下「导了一半」的中间态。
+   *
+   * ⚠️ 已知限制：导入**不校验** domains_cache.account_id 指向的账号是否存在。
+   * 若备份里的 domains_cache 引用了 accounts 里没有的 account_id（例如导出后被删的
+   * 账号），外键约束会让**整批**导入失败。这是刻意的 fail-closed —— 宁可整体拒绝，
+   * 也不要静默写入一批悬空的孤儿域名行（那会让面板出现点不开的域名卡片）。
+   */
+  async importAllData(snapshot: {
+    version?: number;
+    data?: Record<string, unknown[]>;
+  }): Promise<{ imported: Record<string, number> }> {
+    const version = Number(snapshot?.version);
+    if (!Number.isFinite(version) || version !== DATA_EXPORT_VERSION) {
+      throw new Error(
+        `备份文件版本不支持（期望 ${DATA_EXPORT_VERSION}，实际 ${snapshot?.version ?? "缺失"}）`
+      );
+    }
+    const src = snapshot?.data;
+    if (!src || typeof src !== "object") {
+      throw new Error("备份文件缺少 data 字段");
+    }
+
+    const imported: Record<string, number> = {};
+
+    // 各表的列白名单与 upsert 语句：列名硬编码，避免备份文件里夹带列名做 SQL 注入
+    const PLAN: Array<{ table: string; columns: string[]; conflict: string[] }> = [
+      {
+        table: "accounts",
+        columns: ["id", "alias", "api_key", "api_secret", "provider", "website", "created_at"],
+        conflict: ["id"],
+      },
+      {
+        table: "custom_accounts",
+        columns: ["id", "group_id", "name", "updated_at"],
+        conflict: ["id"],
+      },
+      {
+        table: "custom_domains",
+        columns: [
+          "id", "group_id", "account_id", "full_domain",
+          "registered_at", "expires_at", "remark", "updated_at",
+        ],
+        conflict: ["id"],
+      },
+      {
+        table: "domains_cache",
+        columns: [
+          "id", "account_id", "subdomain", "rootdomain", "full_domain", "status",
+          "created_at", "expires_at", "last_renewed_at", "has_dns", "dns_provider",
+          "provider_account_id", "remote_id", "updated_at",
+        ],
+        conflict: ["id"],
+      },
+      {
+        table: "domain_date_overrides",
+        columns: ["id", "account_id", "full_domain", "registered_at", "expires_at", "source", "updated_at"],
+        conflict: ["id"],
+      },
+    ];
+
+    const statements: Array<ReturnType<D1Database["prepare"]>> = [];
+    const planned: Array<{ table: string; count: number }> = [];
+
+    for (const step of PLAN) {
+      const rows = Array.isArray(src[step.table]) ? (src[step.table] as unknown[]) : [];
+      if (rows.length === 0) {
+        imported[step.table] = 0;
+        continue;
+      }
+      const colList = step.columns.join(", ");
+      const placeholders = step.columns.map(() => "?").join(", ");
+      const updates = step.columns
+        .filter((c) => !step.conflict.includes(c))
+        .map((c) => `${c} = excluded.${c}`)
+        .join(", ");
+      const sql = `INSERT INTO ${step.table} (${colList}) VALUES (${placeholders})
+        ON CONFLICT(${step.conflict.join(", ")}) DO UPDATE SET ${updates}`;
+
+      for (const raw of rows) {
+        if (!raw || typeof raw !== "object") continue;
+        const row = raw as Record<string, unknown>;
+        const binds = step.columns.map((c) => {
+          const v = row[c];
+          // D1 只接受 string / number / null / ArrayBuffer，undefined 会报错
+          if (v === undefined || v === null) return null;
+          if (typeof v === "number" || typeof v === "string") return v;
+          if (typeof v === "boolean") return v ? 1 : 0;
+          return String(v);
+        });
+        statements.push(this.db.prepare(sql).bind(...binds));
+        planned.push({ table: step.table, count: 1 });
+      }
+      imported[step.table] = rows.length;
+    }
+
+    if (statements.length > 0) {
+      // ⚠️ D1 的 batch 上限（单次调用语句数）远小于这里可能出现的行数，
+      // 且 batch 是原子的 —— 分块会破坏「全成功或全回滚」语义。
+      // 因此这里限制单次导入的语句总数，超限直接拒绝并提示分批。
+      const MAX_STATEMENTS = 500;
+      if (statements.length > MAX_STATEMENTS) {
+        throw new Error(
+          `本次导入需要写入 ${statements.length} 行，超过单次上限 ${MAX_STATEMENTS} 行。请分批导出/导入。`
+        );
+      }
+      await this.db.batch(statements);
+    }
+
+    return { imported };
   }
 }

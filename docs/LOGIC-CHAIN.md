@@ -570,6 +570,53 @@ push main / 手动触发
 
 ---
 
+## 8.4 业务数据导入 / 导出（面板内自助备份）
+
+面向"换部署环境"和"定期备份"两类场景，在**设置页**提供自助导出/导入，不依赖 wrangler 或容器卷。
+
+### 接口
+
+| 方法 | 路径 | 2FA | 说明 |
+|---|---|---|---|
+| `POST` | `/api/data/export` | **强制** | 未开 2FA 直接 403，不降级 |
+| `POST` | `/api/data/import` | 已开才验 | 兼容未开 2FA 的旧环境 |
+
+**2FA 走请求体字段，不走 query**——query 会进访问日志、Referer 和浏览器历史。
+
+### 导出范围（`DATA_EXPORT_VERSION = 1`）
+
+只导 **5 张业务表**：`accounts`、`domains_cache`、`custom_accounts`、`custom_domains`、`domain_date_overrides`。
+
+**刻意排除**：
+
+| 表 | 原因 |
+|---|---|
+| `settings` | 混装 2FA 密钥、密码哈希、`sess_*` 会话——导出去等于把整套凭据复制一份 |
+| `logs` | 纯运行痕迹，无迁移价值，且体量大 |
+| `cache` | 可重建（RDAP / DNS 记录缓存），且带 TTL，导过去反而制造过期数据 |
+
+**因此备份文件不等于完整灾备**——恢复环境仍需 `AES_KEY`，否则 `accounts.api_key`（AES-GCM 密文）解不开。这一点与 §8.1 的密钥纪律是同一件事。
+
+### 导入语义：合并 upsert
+
+按外键顺序 `accounts → custom_accounts → custom_domains / domains_cache / domain_date_overrides` 逐表 upsert，冲突键为 `id`：
+
+- **只增改，绝不 DELETE** —— 导入不会清空目标环境已有数据
+- **幂等** —— 同一份文件重复导入不会产生重复行
+- **全批原子** —— 走 `db.batch()`，任一语句失败整批回滚，不留半截数据
+- **版本校验** —— `version` 不匹配直接抛错，**不静默降级**（避免把 v1 结构塞进 v2 表）
+- **单次上限 500 行** —— 超了报错要求分批，防止单请求打爆 D1 的执行预算
+- **列名硬编码白名单**，值统一 `bind` —— 备份文件内容不可信，不拼 SQL
+
+### 2FA 校验复用限流
+
+`dataOpScope(c)` = `dataop:<客户端IP>`，与登录失败计数共用同一套 `countLoginFailures` / `recordLoginFailure` / `clearLoginFailures`：
+
+- 同一 IP 连续 5 次错码 → 锁 15 分钟（`LOGIN_MAX_FAILURES` / `LOGIN_LOCK_WINDOW_SECONDS`）
+- **防止把导出接口当成 TOTP 爆破入口**——这是强制 2FA 必须配限流的原因，否则 6 位码可以无限试
+
+---
+
 ## 9. 关键约定与已知陷阱（维护必读）
 
 ### 约定
@@ -581,6 +628,7 @@ push main / 手动触发
 5. **`custom` provider 的 client 是占位对象**，调用方必须先分流。
 6. **新增接口必须走 `successRes` / `errorRes`**，否则前端取值失配。
 7. **cron 表达式是 UTC**，`"0 2 * * *"` = 北京时间 10:00。
+8. **备份文件不含 `settings`**——跨环境恢复必须自备 `AES_KEY`，否则业务数据里的密文全部解不开。
 
 ### 已知陷阱
 
@@ -593,6 +641,7 @@ push main / 手动触发
 | 前端后端地址冻进 localStorage | 改构建期变量不生效 | 设置页清除覆盖值 |
 | `AES_KEY` 丢失 | API Secret / 2FA 密钥全部解不开 | **必须和数据库一起备份** |
 | 账号顺序遍历无预算分配 | 后面账号长期饿死 | 未修复，见 §4.2 改进方向 |
+| 备份文件当完整灾备用 | 换环境后密文全解不开 | 备份**不含** `settings`，`AES_KEY` 必须另外保管 |
 
 ### 待办 / 改进方向
 

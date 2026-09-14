@@ -44,7 +44,9 @@ import {
   FolderPlus,
   CalendarClock,
   CalendarDays,
-  Folder
+  Folder,
+  DatabaseBackup,
+  Upload
 } from "lucide-react";
 import { toASCII, hasNonASCII, toUnicode } from "./punycode";
 import {
@@ -1745,6 +1747,12 @@ export default function App() {
   const [twoFaEnableToken, setTwoFaEnableToken] = useState("");
   // 关闭 2FA 时的动态码确认
   const [twoFaDisableToken, setTwoFaDisableToken] = useState("");
+  // 数据导入/导出：二次验证弹窗（导出强制 2FA；导入在已开启 2FA 时也需验证）
+  const [dataOpOpen, setDataOpOpen] = useState(false);
+  const [dataOpMode, setDataOpMode] = useState<"export" | "import">("export");
+  const [dataOpToken, setDataOpToken] = useState("");
+  // 已选中的备份文件（导入用），同时保留原始文本以便提交
+  const [importSnapshot, setImportSnapshot] = useState<{ name: string; text: string } | null>(null);
 
   /**
    * 统一 API 请求封装 — 自动注入 Authorization 头部与后端 Worker 基准域名
@@ -2075,6 +2083,128 @@ export default function App() {
       }
     } catch (e) {
       showToast("error", "关闭 2FA 请求失败");
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  // ===== 数据导入 / 导出 =====
+
+  /** 把导出的快照以文件形式落盘 */
+  const downloadSnapshot = (snapshot: unknown) => {
+    const json = JSON.stringify(snapshot, null, 2);
+    const blob = new Blob([json], { type: "application/json;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `domain-hub-backup-${stamp}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    // NOTE: revoke 必须延后。同步 revoke 会在部分浏览器上让下载直接拿到空文件
+    // （点击的下载动作还没开始读 blob，URL 就已经失效）。
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  };
+
+  /** 执行导出（需 2FA 动态码） */
+  const handleExportData = async () => {
+    if (accountInfo.two_fa_enabled && !dataOpToken.trim()) {
+      showToast("error", "请输入身份验证器上的 6 位动态码");
+      return;
+    }
+    setActionLoading("data-export");
+    try {
+      const res = await apiFetch("/api/data/export", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: dataOpToken.trim() }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        downloadSnapshot({
+          version: data.version,
+          exported_at: data.exported_at,
+          counts: data.counts,
+          data: data.data,
+        });
+        const c = data.counts || {};
+        showToast(
+          "success",
+          `导出成功：账号 ${c.accounts ?? 0} 个 / 域名缓存 ${c.domains_cache ?? 0} 条 / 自定义域名 ${c.custom_domains ?? 0} 条`
+        );
+        setDataOpOpen(false);
+        setDataOpToken("");
+      } else {
+        // 后端 2FA 相关错误码单独提示，避免用户以为是自己密码错了
+        showToast("error", data.message || "导出失败");
+      }
+    } catch (e) {
+      showToast("error", "导出请求失败，请检查网络");
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  /** 读取用户选中的备份文件 */
+  const handlePickSnapshotFile = async (file: File | null) => {
+    if (!file) {
+      setImportSnapshot(null);
+      return;
+    }
+    if (file.size > 20 * 1024 * 1024) {
+      showToast("error", "备份文件过大（上限 20MB）");
+      setImportSnapshot(null);
+      return;
+    }
+    try {
+      const text = await file.text();
+      // 本地先解析一次：格式不对就别浪费一次往返，也让用户早看到问题
+      const parsed = JSON.parse(text);
+      if (!parsed || typeof parsed !== "object" || !parsed.data) {
+        showToast("error", "该文件不是有效的备份（缺少 data 字段）");
+        setImportSnapshot(null);
+        return;
+      }
+      setImportSnapshot({ name: file.name, text });
+    } catch {
+      showToast("error", "文件不是合法 JSON，无法解析");
+      setImportSnapshot(null);
+    }
+  };
+
+  /** 执行导入（合并 upsert） */
+  const handleImportData = async () => {
+    if (!importSnapshot) {
+      showToast("error", "请先选择备份文件");
+      return;
+    }
+    if (accountInfo.two_fa_enabled && !dataOpToken.trim()) {
+      showToast("error", "请输入身份验证器上的 6 位动态码");
+      return;
+    }
+    setActionLoading("data-import");
+    try {
+      const snapshot = JSON.parse(importSnapshot.text);
+      const res = await apiFetch("/api/data/import", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: dataOpToken.trim(), snapshot }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        showToast("success", data.message || "导入完成");
+        setDataOpOpen(false);
+        setDataOpToken("");
+        setImportSnapshot(null);
+        // 数据变了，刷新各页面的列表
+        void fetchDomains();
+        void fetchAccountInfo();
+      } else {
+        showToast("error", data.message || "导入失败");
+      }
+    } catch (e) {
+      showToast("error", "导入请求失败，请检查网络");
     } finally {
       setActionLoading(null);
     }
@@ -12262,6 +12392,51 @@ export default function App() {
                     <Save className="w-4 h-4" /> 保存全部设置
                   </button>
                 </div>
+
+                {/* 数据备份：导出需要 2FA（未配置 2FA 时禁用导出） */}
+                <div className="bg-surface border border-border-base rounded-2xl p-4 sm:p-5 space-y-4">
+                  <h3 className="font-bold text-content-primary flex items-center gap-2">
+                    <DatabaseBackup className="w-4 h-4 text-sky-400" /> 数据备份与迁移
+                  </h3>
+                  <p className="text-xs text-content-muted leading-relaxed">
+                    导出账号、域名缓存、自定义分组与日期覆盖等<b>业务数据</b>为 JSON 快照。
+                    不含登录凭据、2FA 密钥、运行日志与临时缓存。
+                  </p>
+
+                  {/* 2FA 未开启时的阻断提示 —— 后端也会强制拒绝，这里只是提前告知 */}
+                  {!accountInfo.two_fa_enabled && (
+                    <div className="bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-900/50 rounded-xl p-3 flex items-start gap-2">
+                      <AlertTriangle className="w-4 h-4 text-amber-500 flex-shrink-0 mt-0.5" />
+                      <div className="text-xs text-amber-800 dark:text-amber-300 leading-relaxed">
+                        <b>导出功能需要先开启两步验证（2FA）。</b>
+                        导出等于把全部账号凭据与域名数据一次性打包带走，仅凭登录会话不足以保护。
+                        请在上方「账户安全」中开启 2FA 后再导出。
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      onClick={() => { setDataOpToken(""); setDataOpMode("export"); setDataOpOpen(true); }}
+                      disabled={!accountInfo.two_fa_enabled}
+                      title={accountInfo.two_fa_enabled ? "导出全部业务数据" : "需先开启两步验证（2FA）"}
+                      className="bg-elevated hover:bg-hovered text-content-secondary border border-border-base px-4 py-2 rounded-lg text-sm font-semibold flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
+                    >
+                      <Download className="w-4 h-4 text-sky-400" /> 导出数据
+                    </button>
+                    <button
+                      onClick={() => { setDataOpToken(""); setDataOpMode("import"); setDataOpOpen(true); }}
+                      className="bg-elevated hover:bg-hovered text-content-secondary border border-border-base px-4 py-2 rounded-lg text-sm font-semibold flex items-center gap-1.5"
+                    >
+                      <Upload className="w-4 h-4 text-emerald-400" /> 导入数据
+                    </button>
+                  </div>
+
+                  <p className="text-[11px] text-content-muted leading-relaxed">
+                    导入为<b>合并模式</b>：同 ID 覆盖、新 ID 新增，<b>不会删除</b>任何现有数据，可安全重复导入。
+                    跨环境迁移时目标环境需使用同一个 <span className="font-mono">AES_KEY</span>，否则加密的 API 凭据无法解密。
+                  </p>
+                </div>
               </>
             )}
           </div>
@@ -13202,6 +13377,122 @@ export default function App() {
                   <Trash2 className="w-3.5 h-3.5" />
                 )}
                 确认删除
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 数据导入 / 导出二次验证弹窗 —— 导出必须通过 2FA；导入在已开启 2FA 时同样需要 */}
+      {dataOpOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/80 backdrop-blur-md">
+          <div className="bg-surface border border-border-base w-full max-w-md rounded-2xl overflow-hidden flex flex-col shadow-2xl">
+            <div className="bg-elevated px-4 sm:px-6 py-4 flex items-center justify-between gap-2 border-b border-border-base flex-shrink-0">
+              <div className="min-w-0">
+                <h3 className="text-base sm:text-lg font-bold text-content-primary flex items-center gap-2">
+                  {dataOpMode === "export"
+                    ? <Download className="text-sky-400 w-5 h-5 flex-shrink-0" />
+                    : <Upload className="text-emerald-400 w-5 h-5 flex-shrink-0" />}
+                  <span className="truncate">{dataOpMode === "export" ? "导出数据" : "导入数据"}</span>
+                </h3>
+                <p className="text-xs text-content-muted mt-0.5">
+                  {dataOpMode === "export" ? "全量业务数据 JSON 快照" : "合并模式，不会删除现有数据"}
+                </p>
+              </div>
+              <button
+                onClick={() => { setDataOpOpen(false); setDataOpToken(""); setImportSnapshot(null); }}
+                className="text-content-muted hover:text-content-primary transition-colors flex-shrink-0"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-4 sm:p-6 space-y-4 overflow-y-auto">
+              {/* 导入：选择备份文件 */}
+              {dataOpMode === "import" && (
+                <div className="space-y-2">
+                  <label className="text-xs text-content-muted font-medium block">选择备份文件（.json）</label>
+                  <input
+                    type="file"
+                    accept="application/json,.json"
+                    onChange={(e) => { handlePickSnapshotFile(e.target.files?.[0] || null); }}
+                    className="w-full text-xs text-content-muted file:mr-3 file:px-3 file:py-1.5 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-elevated file:text-content-secondary hover:file:bg-hovered cursor-pointer"
+                  />
+                  {importSnapshot && (
+                    <div className="text-[11px] text-emerald-600 dark:text-emerald-400 flex items-center gap-1.5">
+                      <CheckCircle2 className="w-3.5 h-3.5 flex-shrink-0" />
+                      <span className="truncate font-mono">{importSnapshot.name}</span>
+                    </div>
+                  )}
+                  <p className="text-[11px] text-content-muted leading-relaxed">
+                    同 ID 的行会被备份中的值<b>覆盖</b>，新 ID 追加，现有数据不受影响。
+                  </p>
+                </div>
+              )}
+
+              {/* 2FA 验证区 */}
+              {accountInfo.two_fa_enabled ? (
+                <div className="space-y-2 pt-3 border-t border-border-soft">
+                  <label className="text-xs text-content-primary font-semibold flex items-center gap-1.5">
+                    <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" /> 两步验证动态码
+                  </label>
+                  <input
+                    autoFocus
+                    type="text"
+                    inputMode="numeric"
+                    maxLength={6}
+                    value={dataOpToken}
+                    onChange={(e) => setDataOpToken(e.target.value.replace(/\D/g, ""))}
+                    onKeyDown={(e) => { if (e.key === "Enter") dataOpMode === "export" ? handleExportData() : handleImportData(); }}
+                    placeholder="身份验证器上的 6 位动态码"
+                    className="w-full bg-elevated border border-border-base rounded-lg px-3 py-2 text-sm font-mono tracking-widest text-center text-content-primary focus:outline-none focus:border-indigo-500 placeholder:text-content-muted placeholder:tracking-normal"
+                  />
+                  <p className="text-[11px] text-content-muted">
+                    连续输错 5 次将锁定 15 分钟。
+                  </p>
+                </div>
+              ) : (
+                <div className="bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-900/50 rounded-xl p-3 flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 text-amber-500 flex-shrink-0 mt-0.5" />
+                  <div className="text-xs text-amber-800 dark:text-amber-300 leading-relaxed">
+                    {dataOpMode === "export" ? (
+                      <>
+                        <b>未开启两步验证，无法导出。</b>
+                        请先在「设置 → 账户安全」开启 2FA，以保护导出的完整业务数据。
+                      </>
+                    ) : (
+                      <>未开启两步验证，导入将仅凭登录会话执行。建议开启 2FA 以保护此操作。</>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="bg-elevated px-4 sm:px-6 py-3 flex justify-end gap-2 border-t border-border-base flex-shrink-0">
+              <button
+                onClick={() => { setDataOpOpen(false); setDataOpToken(""); setImportSnapshot(null); }}
+                className="bg-surface hover:bg-hovered text-content-secondary border border-border-base px-4 py-2 rounded-lg text-sm"
+              >
+                取消
+              </button>
+              <button
+                onClick={dataOpMode === "export" ? handleExportData : handleImportData}
+                disabled={
+                  actionLoading === "data-export" ||
+                  actionLoading === "data-import" ||
+                  (dataOpMode === "export" && !accountInfo.two_fa_enabled) ||
+                  (dataOpMode === "import" && !importSnapshot)
+                }
+                className="btn-primary px-4 py-2 rounded-lg text-sm font-semibold text-white flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {actionLoading === "data-export" || actionLoading === "data-import" ? (
+                  <RefreshCw className="w-4 h-4 animate-spin" />
+                ) : dataOpMode === "export" ? (
+                  <Download className="w-4 h-4" />
+                ) : (
+                  <Upload className="w-4 h-4" />
+                )}
+                {dataOpMode === "export" ? "验证并导出" : "验证并导入"}
               </button>
             </div>
           </div>

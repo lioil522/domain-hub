@@ -15,7 +15,7 @@
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 
-import { DatabaseManager } from "../src/db";
+import { DatabaseManager, DATA_EXPORT_VERSION } from "../src/db";
 import type { UpstreamSubdomain } from "../src/db";
 import { createD1FromSqlite } from "./d1-sqlite";
 
@@ -348,6 +348,151 @@ await it("getRdapExpiryCacheBatch() 批量读 RDAP 到期缓存（只认 found +
 
   // 空数组不应发起查询
   assert.equal((await dbm.getRdapExpiryCacheBatch([])).size, 0);
+});
+
+await it("exportAllData() 只导出业务表，且不泄漏 settings/cache/logs", async () => {
+  const snap = await dbm.exportAllData();
+  assert.equal(snap.version, DATA_EXPORT_VERSION);
+  assert.ok(snap.exported_at, "应带导出时间戳");
+
+  const tables = Object.keys(snap.data).sort();
+  assert.deepEqual(
+    tables,
+    ["accounts", "custom_accounts", "custom_domains", "domain_date_overrides", "domains_cache"],
+    "导出范围应恰好是 5 张业务表"
+  );
+  // 这三张必须**不在**导出里：settings 含 2FA 密钥与密码哈希，cache 是临时缓存，logs 是运行历史
+  for (const forbidden of ["settings", "cache", "logs"]) {
+    assert.equal(tables.includes(forbidden), false, `不应导出 ${forbidden} 表`);
+  }
+  // counts 与实际行数一致
+  for (const t of tables) {
+    assert.equal(snap.counts[t], (snap.data[t] as unknown[]).length, `${t} 的 counts 不符`);
+  }
+  assert.ok((snap.data.accounts as unknown[]).length > 0, "应有账号数据");
+});
+
+await it("importAllData() 合并 upsert：新增 + 覆盖，且不删除现有行", async () => {
+  const target = freshDb();
+  await target.dbm.ensureTables();
+
+  // 目标库先放一个「备份里没有」的账号，验证导入不会把它删掉
+  await target.d1
+    .prepare("INSERT INTO accounts (id, alias, api_key, api_secret) VALUES (?, ?, ?, ?)")
+    .bind(900, "本地独有账号", "cfsd_local_only", "plain:c2VjcmV0")
+    .run();
+
+  // 备份：1 号账号（覆盖目标库同名 id）+ 901 号账号（目标库没有，应新增）
+  const snapshot = {
+    version: DATA_EXPORT_VERSION,
+    data: {
+      accounts: [
+        { id: 1, alias: "改过的别名", api_key: "k1", api_secret: "s1", provider: "dnshe", website: null, created_at: "2026-01-01 00:00:00" },
+        { id: 901, alias: "备份新增账号", api_key: "k901", api_secret: "s901", provider: "dnshe", website: null, created_at: "2026-01-01 00:00:00" },
+      ],
+      domains_cache: [
+        { id: 7001, account_id: 901, subdomain: "a", rootdomain: "cn.mt", full_domain: "a.cn.mt", status: "已解析", created_at: "2026-01-01 00:00:00", expires_at: "2027-01-01 00:00:00", last_renewed_at: null, has_dns: 1, dns_provider: "system", provider_account_id: null, remote_id: null, updated_at: "2026-01-01 00:00:00" },
+      ],
+      domain_date_overrides: [
+        { id: 1, account_id: 901, full_domain: "a.cn.mt", registered_at: "2020-01-01", expires_at: "2027-01-01", source: "手动", updated_at: "2026-01-01 00:00:00" },
+      ],
+    },
+  };
+
+  const { imported } = await target.dbm.importAllData(snapshot);
+  assert.equal(imported.accounts, 2);
+  assert.equal(imported.domains_cache, 1);
+  assert.equal(imported.custom_domains, 0, "备份里没有的表应报 0");
+
+  const accounts = await target.dbm.getAccounts();
+  assert.equal(accounts.find((a) => a.id === 1)?.alias, "改过的别名", "同 id 应被覆盖");
+  assert.ok(accounts.some((a) => a.id === 901), "备份里的新账号应被插入");
+  assert.ok(accounts.some((a) => a.id === 900), "本地独有账号绝不能被删掉（合并语义）");
+  assert.equal((await target.dbm.getDomainById(7001))?.full_domain, "a.cn.mt");
+  assert.equal((await target.dbm.getDateOverrides()).length, 1);
+
+  target.sqlite.close();
+});
+
+await it("importAllData() 反复导入幂等（同 id 不会重复插入）", async () => {
+  const target = freshDb();
+  await target.dbm.ensureTables();
+  const snapshot = {
+    version: DATA_EXPORT_VERSION,
+    data: {
+      accounts: [{ id: 1, alias: "A", api_key: "k1", api_secret: "s1", provider: "dnshe", website: null, created_at: "2026-01-01 00:00:00" }],
+    },
+  };
+  await target.dbm.importAllData(snapshot);
+  await target.dbm.importAllData(snapshot);
+  const accounts = await target.dbm.getAccounts();
+  assert.equal(accounts.filter((a) => a.id === 1).length, 1, "同 id 反复导入不应产生重复行");
+  target.sqlite.close();
+});
+
+await it("importAllData() 版本不匹配 / 结构非法时拒绝（不静默降级）", async () => {
+  const target = freshDb();
+  await target.dbm.ensureTables();
+
+  await assert.rejects(
+    () => target.dbm.importAllData({ version: 999, data: {} }),
+    /版本不支持/,
+    "版本不符必须明确拒绝"
+  );
+  await assert.rejects(
+    () => target.dbm.importAllData({ version: DATA_EXPORT_VERSION }),
+    /缺少 data 字段/
+  );
+  // 拒绝之后库里不该留下任何痕迹
+  assert.equal((await target.dbm.getAccounts()).length, 0);
+  target.sqlite.close();
+});
+
+await it("importAllData() 外键悬空时整批回滚（不留半截数据）", async () => {
+  const target = freshDb();
+  await target.dbm.ensureTables();
+  // domains_cache 指向不存在的 account_id，外键约束必须让整批失败
+  await assert.rejects(() =>
+    target.dbm.importAllData({
+      version: DATA_EXPORT_VERSION,
+      data: {
+        accounts: [{ id: 1, alias: "A", api_key: "k1", api_secret: "s1", provider: "dnshe", website: null, created_at: "2026-01-01 00:00:00" }],
+        domains_cache: [{ id: 7001, account_id: 12345, subdomain: "a", rootdomain: "cn.mt", full_domain: "a.cn.mt", status: "已解析", created_at: "2026-01-01 00:00:00", expires_at: "2027-01-01 00:00:00", last_renewed_at: null, has_dns: 1, dns_provider: "system", provider_account_id: null, remote_id: null, updated_at: "2026-01-01 00:00:00" }],
+      },
+    })
+  );
+  assert.equal(
+    (await target.dbm.getAccounts()).length,
+    0,
+    "batch 必须原子回滚 —— 账号也不该被写进去"
+  );
+  target.sqlite.close();
+});
+
+await it("export → import 往返一致（同库自洽）", async () => {
+  // freshDb() 起手是空库，domains_cache / domain_date_overrides 都有 account_id 外键，
+  // 必须先把账号建出来（否则 syncAccountDomains 会撞 FOREIGN KEY constraint failed）
+  const src = freshDb();
+  await src.dbm.ensureTables();
+  await src.d1
+    .prepare("INSERT INTO accounts (id, alias, api_key, api_secret) VALUES (?, ?, ?, ?)")
+    .bind(1, "往返测试账号", "cfsd_rt_key", "plain:c2VjcmV0")
+    .run();
+  await src.dbm.syncAccountDomains(1, [sub(3001, "roundtrip")]);
+  await src.dbm.upsertDateOverride(1, "roundtrip.cn.mt", { expires_at: "2028-08-08" });
+  const snapshot = await src.dbm.exportAllData();
+
+  const dst = freshDb();
+  await dst.dbm.ensureTables();
+  await dst.dbm.importAllData(snapshot);
+
+  assert.equal((await dst.dbm.getAccounts()).length, (await src.dbm.getAccounts()).length);
+  assert.equal((await dst.dbm.getDomains()).length, (await src.dbm.getDomains()).length);
+  assert.equal((await dst.dbm.getDomainById(3001))?.full_domain, "roundtrip.cn.mt");
+  assert.equal((await dst.dbm.getDateOverrides())[0]?.expires_at, "2028-08-08");
+
+  src.sqlite.close();
+  dst.sqlite.close();
 });
 
 await it("日志写入与按分类过滤", async () => {

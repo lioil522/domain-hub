@@ -1854,6 +1854,151 @@ app.delete("/api/domains/:id/date-override", async (c) => {
   }
 });
 
+// ===== 数据导入 / 导出 =====
+//
+// 安全模型：这两个接口是「把整个面板的业务数据一次性搬走 / 覆盖」的操作，敏感度远高于
+// 普通的 CRUD。仅靠登录会话不够 —— 会话 token 一旦泄漏（XSS、共享设备、浏览器同步），
+// 攻击者就能直接拖走全部账号与域名数据。
+//
+// 因此导出**强制二次验证 2FA**，且「未配置 2FA」时直接拒绝（而不是降级为只验密码）：
+// 这正是需求「不配置 2FA 无法导出」的落点 —— 把「配置 2FA」变成使用导出功能的**前置条件**，
+// 而不是给用户一个「反正也能导」的旁路。
+
+/** 导出/导入的 2FA 校验失败计数作用域（与登录失败分开计，避免互相污染锁定时长） */
+function dataOpScope(c: Context<{ Bindings: Bindings; Variables: Variables }>): string {
+  return `dataop:${getClientIp(c)}`;
+}
+
+/**
+ * 校验数据操作（导出/导入）的 2FA 门禁
+ *
+ * 返回值：null = 通过；否则返回应当直接回给客户端的错误响应。
+ *
+ * NOTE 为什么失败要**计限流**：6 位 TOTP 只有 100 万种取值，若允许不限速地反复猜，
+ * 一个拿到会话的攻击者完全可以在 30 秒有效窗口内暴力枚举。复用登录那套 IP 维度计数，
+ * 连续失败 5 次锁 15 分钟。
+ */
+async function checkDataOpTotp(
+  c: Context<{ Bindings: Bindings; Variables: Variables }>,
+  dbManager: DatabaseManager,
+  token: string,
+  requireConfigured: boolean
+): Promise<Response | null> {
+  const cfg = await dbManager.getAuthConfig();
+  const ipScope = dataOpScope(c);
+
+  // 未配置 2FA：导出直接拒绝（需求要求），导入则放行（用户选择「开 2FA 则验证」）
+  if (!cfg.twoFaEnabled || !cfg.twoFaSecret) {
+    if (requireConfigured) {
+      return c.json(
+        errorRes(
+          "出于安全考虑，导出功能要求先开启两步验证（2FA）。请前往「设置 → 账户安全」开启后再试。",
+          "2fa_required"
+        ),
+        403
+      );
+    }
+    return null;
+  }
+
+  if ((await dbManager.countLoginFailures(ipScope)) >= LOGIN_MAX_FAILURES) {
+    return c.json(errorRes(LOGIN_LOCKED_MESSAGE, "too_many_attempts"), 429);
+  }
+
+  const code = String(token || "").trim();
+  if (!code) {
+    return c.json(
+      errorRes("请输入身份验证器上的 6 位动态验证码以继续", "need_2fa"),
+      401
+    );
+  }
+
+  const valid = await verifyTOTP(code, cfg.twoFaSecret);
+  if (!valid) {
+    await dbManager.recordLoginFailure(ipScope, LOGIN_LOCK_WINDOW_SECONDS);
+    await dbManager.writeLog("warning", "auth", "数据导出/导入的动态码校验失败");
+    return c.json(errorRes("动态验证码错误或已过期", "invalid_2fa"), 401);
+  }
+
+  // 校验成功：清掉该作用域的失败计数，避免几次手误累积到锁定
+  try {
+    await dbManager.clearLoginFailures(ipScope);
+  } catch {}
+
+  return null;
+}
+
+/**
+ * B1. 导出全部业务数据（JSON 快照）
+ *
+ * 2FA 以**请求体字段**而非 query 参数传入：query 会进访问日志、浏览器历史与 Referer，
+ * 一次性口令虽然 30 秒即失效，但没有理由让它出现在这些地方。
+ */
+app.post("/api/data/export", async (c) => {
+  const dbManager = c.get("db");
+  try {
+    const body = await c.req.json().catch(() => ({}));
+
+    const denied = await checkDataOpTotp(c, dbManager, String(body?.token || ""), true);
+    if (denied) return denied;
+
+    const snapshot = await dbManager.exportAllData();
+    await dbManager.writeLog(
+      "success",
+      "operation",
+      `已导出业务数据（账号 ${snapshot.counts.accounts || 0} 个 / 域名缓存 ${snapshot.counts.domains_cache || 0} 条 / 自定义域名 ${snapshot.counts.custom_domains || 0} 条）`
+    );
+
+    return c.json(successRes(snapshot));
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "导出失败";
+    await dbManager.writeLog("error", "operation", `数据导出失败：${message}`);
+    return c.json(errorRes(message), 500);
+  }
+});
+
+/**
+ * B2. 导入业务数据（合并 upsert，不删除现有行）
+ */
+app.post("/api/data/import", async (c) => {
+  const dbManager = c.get("db");
+  try {
+    const body = await c.req.json().catch(() => null);
+    if (!body || typeof body !== "object") {
+      return c.json(errorRes("请求体格式无效", "bad_request"), 400);
+    }
+
+    const denied = await checkDataOpTotp(c, dbManager, String((body as Record<string, unknown>).token || ""), false);
+    if (denied) return denied;
+
+    const snapshot = (body as Record<string, unknown>).snapshot;
+    if (!snapshot || typeof snapshot !== "object") {
+      return c.json(errorRes("缺少 snapshot 字段", "bad_request"), 400);
+    }
+
+    const { imported } = await dbManager.importAllData(
+      snapshot as { version?: number; data?: Record<string, unknown[]> }
+    );
+
+    const summary = Object.entries(imported)
+      .filter(([, n]) => n > 0)
+      .map(([t, n]) => `${t} ${n} 条`)
+      .join(" / ");
+    await dbManager.writeLog("success", "operation", `已导入业务数据：${summary || "无数据"}`);
+
+    return c.json(
+      successRes({
+        imported,
+        message: `导入完成（合并模式，未删除任何现有数据）：${summary || "备份中无数据"}`,
+      })
+    );
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "导入失败";
+    await dbManager.writeLog("error", "operation", `数据导入失败：${message}`);
+    return c.json(errorRes(message), 400);
+  }
+});
+
 // 4. 获取子域名下所有的 DNS 解析记录 (代理接口)
 app.get("/api/domains/:id/dns", async (c) => {
   const dbManager = c.get("db");

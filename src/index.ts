@@ -1,14 +1,19 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { cors } from "hono/cors";
-import { DatabaseManager, timingSafeEqual, QUOTA_CACHE_KEY } from "./db";
+import { DatabaseManager, timingSafeEqual, QUOTA_CACHE_KEY, RDAP_CACHE_PREFIX } from "./db";
 import type { DBDomain } from "./db";
 import { DNSHEClient } from "./dnshe";
 import type { CreateDnsRecordParams, UpdateDnsRecordParams } from "./dnshe";
 import { CloudflareClient, mapZoneToUpstream } from "./cloudflare";
+import type { CfZoneInfo } from "./cloudflare";
 import { DigitalPlatClient, mapDomainToUpstream } from "./digitalplat";
 import { runDailySyncAndRenewal, fetchAllSubdomainsFromClient, sendTelegramNotification, sendWebhookNotification } from "./cron";
 import type { WebhookType } from "./cron";
+// NOTE: 同一模块既要把 isRegistrableDomain 转出给外部（见下方 export ... from），
+// 又要在本文件内直接调用它 —— `export { x } from` 只做转出、不建立本地绑定，
+// 所以必须再显式导入一次，否则本文件内的调用点会报 TS2304。
+import { isRegistrableDomain } from "./punycode";
 import { computeDnsState, detectDnsProvider } from "./dns-provider";
 import type { DnsState } from "./dns-provider";
 import { toASCII } from "./punycode";
@@ -48,7 +53,16 @@ type Bindings = {
 // 上游删掉的 zone 会由 syncAccountDomains 的差集清理逻辑移除，包括 0 个 zone 的情况。
 // zone → 上游行 的映射复用 cloudflare.ts 的 mapZoneToUpstream。
 async function syncCloudflareZones(dbManager: DatabaseManager, accountId: number, client: CloudflareClient): Promise<number> {
-  const zones = await client.listZones();
+  // NOTE: 手动/绑定后的深度同步走「一页一页续拉到拉完」的循环，不做单次调用的页数预算
+  // 限制 —— 这里由用户显式触发且只针对一个账号，拉全才有意义（唯一一次的差集删除也靠
+  // 这里的完整列表）。若中途子请求耗尽，抛错上抛，已落库的分片仍然保留。
+  const zones: CfZoneInfo[] = [];
+  for (let page = 1; page <= 50; ) {
+    const res = await client.listZones({ startPage: page, maxPages: 1 });
+    zones.push(...res.zones);
+    if (!res.hasMore) break;
+    page = res.nextPage;
+  }
   await dbManager.syncAccountDomains(accountId, zones.map(mapZoneToUpstream));
   return zones.length;
 }
@@ -2652,16 +2666,23 @@ app.post("/api/settings", async (c) => {
   try {
     const body = await c.req.json().catch(() => ({}));
     // 允许写入的配置键
+    //
+    // NOTE: dns_records_cache_mode 控制【腿二】解析记录缓存策略，取值 "scheduled"（默认，
+    // 定时任务只读缓存省子请求）/ "always"（定时任务也全额回源）。非法值直接落回
+    // "scheduled" —— 定时任务里是按「 != "always"」判断的，别让脏值把默认行为改掉。
     const allowedKeys = [
       "webhook_url", "webhook_type", "tg_token", "tg_chat_id",
-      "renew_threshold_days", "auto_renew"
+      "renew_threshold_days", "auto_renew", "dns_records_cache_mode"
     ];
     // 敏感字段：若值为空或仍是打码值（以 **** 开头），则跳过不覆盖
     const sensitiveKeys = ["tg_token", "webhook_url"];
 
     for (const key of allowedKeys) {
       if (!(key in body)) continue;
-      const val = String(body[key] ?? "");
+      let val = String(body[key] ?? "");
+      if (key === "dns_records_cache_mode") {
+        val = val === "always" ? "always" : "scheduled";
+      }
       if (sensitiveKeys.includes(key)) {
         if (val === "" || val.startsWith("****")) continue; // 不覆盖已有敏感值
       }
@@ -3025,43 +3046,24 @@ app.get("/api/dns/ns", async (c) => {
  * 查询失败（结果带 error 字段）不落缓存、下次重试；键前缀带版本号，改判读逻辑时
  * 换号即可让旧版本留下的脏缓存整批失效（早期版本曾把 403 等失败结果也写进缓存）。
  */
-const RDAP_CACHE_KEY_PREFIX = "rdap:4:";
+const RDAP_CACHE_KEY_PREFIX = RDAP_CACHE_PREFIX;
 const RDAP_CACHE_TTL = 7 * 24 * 3600;
 
 // 常见的「多段公共后缀」（public suffix）。RDAP 注册局只登记「注册域」，二级/三级子域
 // （foo.example.com）在注册局 RDAP 里查不到（404）。子域直接不查（跳过），避免把注册域
 // 的日期错误套到子域上；命中下表则注册域 = 最后三段（如 a.b.co.uk → b.co.uk），
 // 否则注册域 = 最后两段（a.com）。表只覆盖最常见二级公共后缀，无需引入完整 PSL 依赖。
-const MULTI_PART_PUBLIC_SUFFIXES = new Set([
-  "co.uk", "org.uk", "me.uk", "ltd.uk", "plc.uk", "net.uk", "sch.uk", "ac.uk", "gov.uk",
-  "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn",
-  "com.au", "net.au", "org.au", "edu.au", "gov.au",
-  "com.br", "net.br", "org.br",
-  "co.jp", "ne.jp", "or.jp", "ac.jp", "go.jp",
-  "co.nz", "net.nz", "org.nz",
-  "co.in", "net.in", "org.in", "firm.in", "gen.in", "ind.in",
-  "com.mx", "org.mx",
-  "co.za", "org.za",
-  "com.ar", "net.ar", "org.ar",
-  "com.tr", "net.tr", "org.tr",
-  "com.hk", "net.hk", "org.hk",
-  "com.tw", "net.tw", "org.tw",
-  "com.sg", "net.sg", "org.sg",
-  "com.my", "net.my", "org.my",
-  "co.kr", "ne.kr", "or.kr", "re.kr",
-  "com.ru", "net.ru", "org.ru"
-]);
+//
+// NOTE: 该表与 isRegistrableDomain 的判定实现同属一体，已一起挪到 punycode.ts。
 
-/** 判断是否为「注册域」（而非子域）。非注册域返回 false，RDAP 查询直接跳过。 */
-function isRegistrableDomain(input: string): boolean {
-  const host = String(input || "").trim().toLowerCase().replace(/\.$/, "");
-  if (!host) return false;
-  const labels = host.split(".").filter(Boolean);
-  if (labels.length < 2) return false; // 单段（如 localhost）不可注册
-  const last2 = labels.slice(-2).join(".");
-  // 多段公共后缀：注册域应有 ≥3 段（如 b.co.uk）；单段后缀：注册域应恰好 2 段（如 a.com）
-  return MULTI_PART_PUBLIC_SUFFIXES.has(last2) ? labels.length === 3 : labels.length === 2;
-}
+/**
+ * 判断是否为「注册域」（而非子域）。非注册域返回 false，RDAP 查询直接跳过。
+ *
+ * NOTE: 实现已挪到零依赖的 punycode.ts —— cron.ts（定时任务的 CF 到期提醒）也要用它，
+ * 若从 index.ts 导入会形成 index → cron → index 的循环依赖。这里原样转出，
+ * 保持既有调用点与外部导入路径不变。
+ */
+export { isRegistrableDomain } from "./punycode";
 
 // rdap.org 与各注册局 RDAP 服务（Verisign 等）会拒绝不带浏览器 UA 的请求（403），
 // 而 Cloudflare Worker / Node 的 fetch 默认不发 UA。用这个 UA 伪装浏览器才能拿到数据。

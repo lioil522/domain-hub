@@ -61,6 +61,20 @@ export interface CfTokenVerifyInfo {
   status: string;
 }
 
+/**
+ * listZones 的分页结果
+ *
+ * NOTE: hasMore 是「上游还有没拉完的页」的**统计事实**（本页满员即有下一页），
+ * 而 nextPage 是续拉游标。调用方必须把 hasMore 当作「上游结论是否完整」的唯一依据 ——
+ * 只有 hasMore=false 才能让 syncAccountDomains 执行差集删除。
+ */
+export interface ZonePage {
+  zones: CfZoneInfo[];
+  /** 下一次续拉应请求的页码（本页满员时指向下一页） */
+  nextPage: number;
+  hasMore: boolean;
+}
+
 /** Cloudflare 账号信息（listAccounts 返回） */
 export interface CfAccountInfo {
   id: string;
@@ -293,17 +307,35 @@ export class CloudflareClient {
 
   /**
    * 分页列出账号下全部 zone
+   *
+   * @param opts.startPage 起始页码（默认 1）。配合 maxPages 用于「跨多次 Worker 调用
+   *        断点续拉」—— 上一次调用在子请求配额耗尽前拉到第 N 页，下一次直接从 N 续拉。
+   * @param opts.maxPages  本次调用最多拉取的页数（默认 50，即拉全）。设为 1 即
+   *        「只探一页」，用于在不了解规模时先探明是否还有后续页。
+   *
+   * NOTE: 返回值带 hasMore —— 调用方据此区分「已拉全」与「配额用尽被迫中断」，
+   * 前者才能让 syncAccountDomains 做差集删除（否则会把没拉到的 zone 误删）。
    */
-  async listZones(): Promise<CfZoneInfo[]> {
+  async listZones(opts: { startPage?: number; maxPages?: number } = {}): Promise<ZonePage> {
+    const startPage = Math.max(1, Math.floor(opts.startPage ?? 1) || 1);
+    const maxPages = Math.max(1, Math.floor(opts.maxPages ?? 50) || 1);
+    const perPage = 50;
     const zones: CfZoneInfo[] = [];
-    let page = 1;
-    while (page <= 50) {
-      const results = await this.request<CfZoneInfo[]>("GET", "/zones", { page, per_page: 50 });
+    let page = startPage;
+    let hasMore = false;
+
+    for (let fetched = 0; fetched < maxPages; fetched++, page++) {
+      const results = await this.request<CfZoneInfo[]>("GET", "/zones", { page, per_page: perPage });
       zones.push(...(results || []));
-      if (!results || results.length < 50) break;
-      page++;
+      if (!results || results.length < perPage) {
+        hasMore = false;
+        break;
+      }
+      // 本页满员 —— 可能还有下一页；若已达本次页数上限则标记续拉
+      hasMore = true;
     }
-    return zones;
+
+    return { zones, nextPage: page, hasMore };
   }
 
   /**

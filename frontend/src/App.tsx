@@ -1044,6 +1044,8 @@ export default function App() {
     tg_chat_id: string;
     renew_threshold_days: string;
     auto_renew: string;
+    /// 定时任务的解析记录缓存策略："scheduled"=只读缓存（默认，省子请求）/ "always"=每次全额回源
+    dns_records_cache_mode: string;
   }
   const [settings, setSettings] = useState<AppSettings>({
     webhook_url: "",
@@ -1052,6 +1054,7 @@ export default function App() {
     tg_chat_id: "",
     renew_threshold_days: "90",
     auto_renew: "1",
+    dns_records_cache_mode: "scheduled",
   });
   const [settingsConfigured, setSettingsConfigured] = useState<{ tg_token: boolean; webhook_url: boolean }>({ tg_token: false, webhook_url: false });
   const [loadingSettings, setLoadingSettings] = useState(false);
@@ -2591,6 +2594,7 @@ export default function App() {
         tg_chat_id: settings.tg_chat_id,
         renew_threshold_days: settings.renew_threshold_days,
         auto_renew: settings.auto_renew,
+        dns_records_cache_mode: settings.dns_records_cache_mode,
       };
       if (settings.tg_token && !settings.tg_token.startsWith("****")) payload.tg_token = settings.tg_token;
       if (settings.webhook_url && !settings.webhook_url.startsWith("****")) payload.webhook_url = settings.webhook_url;
@@ -12041,6 +12045,18 @@ export default function App() {
                       onChange={(e) => setSettings((s) => ({ ...s, renew_threshold_days: e.target.value }))}
                       className="form-input w-full px-3 py-2 rounded-lg text-sm text-content-primary"
                     />
+                  </div>
+                  <div className="pt-2 border-t border-border-soft flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="text-sm font-semibold text-content-primary">定时同步复用解析记录缓存</div>
+                      <div className="text-xs text-content-muted mt-0.5">关闭后定时任务每次都全额回源拉取每个域名的解析记录，子请求开销大（免费计划 50 次配额下容易超限）；手动同步始终全额回源</div>
+                    </div>
+                    <button
+                      onClick={() => setSettings((s) => ({ ...s, dns_records_cache_mode: s.dns_records_cache_mode === "scheduled" ? "always" : "scheduled" }))}
+                      className={`w-12 h-6 rounded-full transition-all relative flex-shrink-0 ${settings.dns_records_cache_mode === "scheduled" ? "bg-indigo-600" : "bg-elevated border border-border-base"}`}
+                    >
+                      <span className={`absolute top-0.5 w-5 h-5 rounded-full bg-white transition-all ${settings.dns_records_cache_mode === "scheduled" ? "left-6" : "left-0.5"}`} />
+                    </button>
                   </div>
                 </div>
 

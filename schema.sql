@@ -45,6 +45,14 @@ CREATE TABLE IF NOT EXISTS cache (
     expires_at INTEGER NOT NULL           -- 绝对过期时间 (epoch 秒)
 );
 
+-- 4.1 应用配置键值表（登录凭据哈希、2FA 密钥、通知渠道配置、续期阈值、
+--     dns_records_cache_mode 等，以及 sess_ 前缀的登录会话行）
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
 -- 创建索引以加速跨账号域名搜索和定时扫描
 CREATE INDEX IF NOT EXISTS idx_domains_account ON domains_cache(account_id);
 CREATE INDEX IF NOT EXISTS idx_domains_expires ON domains_cache(expires_at);

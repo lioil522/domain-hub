@@ -1,9 +1,12 @@
 import { DatabaseManager } from "./db";
 import type { SubdomainInfo } from "./dnshe";
+import type { UpstreamSubdomain } from "./db";
 import { DNSHEClient } from "./dnshe";
 import { CloudflareClient, mapZoneToUpstream } from "./cloudflare";
+import type { CfZoneInfo } from "./cloudflare";
 import { DigitalPlatClient, mapDomainToUpstream } from "./digitalplat";
 import { computeDnsState } from "./dns-provider";
+import { isRegistrableDomain } from "./punycode";
 
 /**
  * Webhook 通知类型定义
@@ -204,6 +207,180 @@ function isSubrequestLimitError(error: unknown): boolean {
   return false;
 }
 
+/**
+ * Cloudflare zone 列表分片拉取的调参
+ *
+ * 背景：免费计划每次 Worker 调用只有 50 次子请求，且 [limits] 配置项对免费计划无效
+ * （写了也不生效，只能用付费计划）。所以「靠提升上限解决」这条路对免费用户不通，
+ * 必须把单次调用的上游请求数压下来。
+ *
+ * 策略：不预估账号规模，先「探一页」——需要时再继续拉下一页，直到本次配额用完。
+ * CF_ZONE_PROBE_PAGES = 1 表示每轮只请求一页（50 条）；一轮能完成说明 zone 数 ≤ 50，
+ * 单次调用只花 1 次子请求就拿到权威全量。只有真的超大账号才会进入多轮续拉路径。
+ */
+const CF_ZONE_PROBE_PAGES = 1;
+
+/**
+ * 单个 Cloudflare 账号在**一次定时任务**里的页数预算。
+ *
+ * 取值偏保守：本轮剩余页数会交给后面的 DNSHE / DigitalPlat 账号用（它们的
+ * fetchAllSubdomainsFromClient 是按账号拉一次的固定开销）。宁可让同一个 CF 账号分
+ * 两次 cron 拉完，也不要一次吃光配额、把排在后面的账号全饿死 —— 那正是当前报错的成因。
+ */
+const CF_ZONE_ROUNDS_PER_RUN = 3;
+
+/** 续拉游标的缓存 TTL（3 天）。定时任务每天一次，留足重试余量后自然过期重头来。 */
+const CF_ZONE_CURSOR_TTL = 3 * 24 * 3600;
+
+/**
+ * Cloudflare 域名到期提醒的 RDAP 缓存查询预算（单次定时任务内的硬上限）
+ *
+ * NOTE: 只读缓存、不主动回源，所以正常情况下这个预算**一次都用不到**（预算只用于
+ * 「有多少个域名值得去查缓存」这一层计数，不产生上游请求）。设上限是因为查缓存本身
+ * 也要走 D1（每条 SQL 都算子请求）：不给上限的话，zone 数一多，光查缓存就能把
+ * 免费计划的 50 次配额吃光 —— 那就把「省配额」的优化变成了新的配额黑洞。
+ *
+ * 取值 100 的用意：付费计划下只占 1% 配额；免费计划下也只有账号规模极端膨胀时才会摸到。
+ * 超出预算的域名本轮直接不提醒（下轮还有机会），滚动覆盖而不是硬失败。
+ */
+const CF_EXPIRY_BUDGET = 100;
+
+/**
+ * 解析记录缓存策略的配置键（写入 settings 表，取值 "scheduled" | "always"）
+ *
+ * - "scheduled"（默认，推荐）：**定时任务只读缓存**，不逐域名拉 dns_records；
+ *   缓存没命中的域名回源补拉并把记录写回缓存。手动同步（面板按钮 / 绑定后后台同步）
+ *   一律全量回源，保证用户主动点的时候拿到的是最新真相。
+ * - "always"：保留旧行为，定时任务也逐域名回源（子请求开销大，仅在域名极少时可选）。
+ *
+ * WHY 要让定时任务放过缓存命中项：DNSHE 的三态（已委派/已解析/未解析）在两次同步之间
+ * 极少变化，而每个域名 1 次 dns_records 是免费计划 50 次配额的最大头（实测 36 次）。
+ * 首轮同步把记录写进 api_cache:dns:<id> 之后，后续定时任务命中缓存即可零上游调用，
+ * 且缓存里的记录是当初 computeDnsState 的同一份输入，三态结果与回源完全等价。
+ */
+export const DNS_RECORDS_CACHE_MODE_KEY = "dns_records_cache_mode";
+
+/** 某个 Cloudflare 账号的 zone 列表续拉游标在 cache 表中的 key */
+function cfZoneCursorKey(accountId: number): string {
+  return `cf_zone_cursor:${accountId}`;
+}
+
+/**
+ * 收集本面板管理的 Cloudflare zone 全集（zone 名 → 归属账号名 + zone id），
+ * 供 DNSHE 同步时做快路径判断。
+ *
+ * WHY: DNSHE 每同步一个域名都要花 1 次子请求拉 dns_records 才能推出三态，域名一多就
+ * 会把免费计划的 50 次配额吃光。但其中一部分域名其实已经委派到我们**自己绑定的**
+ * Cloudflare 账号 —— 这类域名的三态是确定且恒定的（已委派 / Cloudflare），不需要靠
+ * 上游解析记录推导；而它的归属账号名与 zone id 这一张表里本来就有，连子请求都不用花。
+ *
+ * 判据用的是 DNSHE.full_domain ⟷ CF zone.name —— 实测确认 CF zone 的 name 就是完整
+ * 域名（子域名 zone 亦然），与 DNSHE 的 full_domain 是同一口径。
+ *
+ * NOTE: 一律直接用库里的行，不遍历账号列表 —— 这样判据不受「账号遍历顺序」影响，
+ * 也不会因为某个 CF 账号排在 DNSHE 账号之后而漏判。
+ * NOTE: 拉取失败（表不存在 / 查询报错）时返回空集合，调用方退化为「全部按老路拉记录」，
+ * 只损失优化收益，不会让同步出错。
+ * NOTE: CF zone 行的 account_alias 是 JOIN accounts 出来的**真实账号名**（与 DNSHE 行
+ * 那个「装根域名」的语义不同），可以直接给用户看。
+ */
+async function collectManagedCfZones(
+  dbManager: DatabaseManager
+): Promise<Map<string, { alias: string; zoneId: string }>> {
+  const zones = new Map<string, { alias: string; zoneId: string }>();
+  try {
+    const cfRows = await dbManager.getDomains("", "", undefined, "cloudflare");
+    for (const row of cfRows) {
+      const name = String(row.full_domain || "").trim().toLowerCase();
+      if (!name) continue;
+      // 同一 zone 名理论上只存在于一个 CF 账号下；真撞名时保留先遇到的（账号归属本就唯一）
+      if (!zones.has(name)) {
+        zones.set(name, {
+          alias: String(row.account_alias || `账号 ${row.account_id}`),
+          zoneId: String(row.remote_id || ""),
+        });
+      }
+    }
+  } catch (e) {
+    console.error("collectManagedCfZones failed, fallback to full dns_records fetch:", e);
+  }
+  return zones;
+}
+
+/**
+ * 为「已确认委派到本面板某个 CF 账号」的域名解析出真实归属账号名与 zone id。
+ *
+ * WHY 不能直接采信 mapZoneToUpstream 写进 rows 的那个 alias：mapZoneToUpstream 走的是
+ * 通用 DNSHE 语义，`account_alias` 字段装的是**根域名**（比如 `ddns.ge`），不是 CF
+ * 账号别名。要给出「托管在 [某账号]」这种用户能对得上的提示，必须按 host 反查真正的
+ * CF zone 行。
+ *
+ * NOTE: 正常情况下这条路**一次子请求都不会发** —— collectManagedCfZones 已经在库里
+ * 找到了该 host 对应的 CF zone 行（含真实账号名与 zone id）。只有当那个 CF 账号
+ * 尚未同步过、库里没有它的 zone 行时，才退化为回源反查（逐页串行、命中即停）。
+ */
+async function resolveCfZoneOwner(
+  dbManager: DatabaseManager,
+  accountId: number,
+  host: string,
+  cachedZoneCursor?: WeakMap<CloudflareClient, number>
+): Promise<{ alias: string; zoneId: string } | null> {
+  try {
+    const { client, alias } = await dbManager.getClientForAccount(accountId);
+    if (!(client instanceof CloudflareClient)) return null;
+
+    // 同一轮同步里多个待反查域名共用同一个 CF 账号：缓存已翻过的页数，避免每个域名
+    // 都从第 1 页重扫一遍。
+    let page = cachedZoneCursor?.get(client) ?? 1;
+    for (let guard = 0; guard < 50; guard++) {
+      const res = await client.listZones({ startPage: page, maxPages: 1 });
+      const hit = res.zones.find((z) => String(z.name || "").trim().toLowerCase() === host);
+      if (hit) {
+        cachedZoneCursor?.set(client, page);
+        return { alias, zoneId: String(hit.id || "") };
+      }
+      if (!res.hasMore) break;
+      page = res.nextPage;
+      cachedZoneCursor?.set(client, page);
+    }
+    return null;
+  } catch (e) {
+    console.error(`resolveCfZoneOwner failed for ${host}:`, e);
+    return null;
+  }
+}
+
+/** zone 列表续拉游标 */
+interface CfZoneCursor {
+  /** 下一次续拉要请求的页码（1 表示从头开始核对） */
+  startPage: number;
+  /** 本账号在游标周期内已同步过的 zone 数量（用于完成时汇报总数） */
+  syncedBefore: number;
+}
+
+/**
+ * 读取 Cloudflare zone 列表续拉游标
+ *
+ * NOTE: 读失败/解析失败一律退回「从头开始」，绝不因为缓存脏数据让同步卡死；
+ * 游标为空的字符串（拉完时写入的归零标记）同样退回默认值。
+ */
+async function readCfZoneCursor(dbManager: DatabaseManager, key: string): Promise<CfZoneCursor> {
+  const fallback: CfZoneCursor = { startPage: 1, syncedBefore: 0 };
+  try {
+    const raw = await dbManager.getCache(key);
+    if (!raw) return fallback;
+    const parsed = JSON.parse(raw) as Partial<CfZoneCursor>;
+    const startPage = Number(parsed?.startPage);
+    const syncedBefore = Number(parsed?.syncedBefore);
+    return {
+      startPage: Number.isFinite(startPage) && startPage >= 1 ? Math.floor(startPage) : 1,
+      syncedBefore: Number.isFinite(syncedBefore) && syncedBefore > 0 ? Math.floor(syncedBefore) : 0
+    };
+  } catch {
+    return fallback;
+  }
+}
+
 // NOTE: 使用 DNSHEClient 的类型签名来定义分页拉取接口
 interface SubdomainClient {
   listSubdomains(page: number, perPage: number): Promise<{
@@ -277,6 +454,10 @@ export async function runDailySyncAndRenewal(
   const tgToken = appCfg["tg_token"] || "";
   const tgChatId = appCfg["tg_chat_id"] || "";
 
+  // 【腿二】定时任务是否只读解析记录缓存（默认开启；手动同步永远全额回源）
+  // 配置项缺失时按 "scheduled" 处理 —— 默认走省配额的那条路。
+  const dnsCacheOnlyOnScheduled = isScheduled && appCfg[DNS_RECORDS_CACHE_MODE_KEY] !== "always";
+
   let accounts: Array<{ id: number; alias: string }> = [];
   try {
     accounts = await dbManager.getAccounts();
@@ -296,6 +477,8 @@ export async function runDailySyncAndRenewal(
   let customReminderDone = false;
   // DigitalPlat 域名到期提醒：同样只在遇到第一个 DP 账号时统一处理一次（跨账号查全量 DP 域名）
   let dpReminderDone = false;
+  // Cloudflare zone 到期提醒：同样跨账号统一处理一次（域名跨多个 CF 账号）
+  let cfReminderDone = false;
 
   for (const acc of accounts) {
     try {
@@ -304,13 +487,126 @@ export async function runDailySyncAndRenewal(
 
       // 1.5 Cloudflare 账号：只同步 zone 列表。zone 的有效期由注册商管理，
       //     不存在 DNSHE 式续期，直接跳过续期扫描。
+      //
+      // NOTE: 这里刻意不像其它提供商那样「一次调用拉全」。Cloudflare zone 列表是唯一
+      // 会随账号规模线性增长、且量大到能单独打满子请求配额的资源（/zones 分页每页 50 条，
+      // 一个 300 zone 的账号光列表就要 6 次子请求；再叠加 DNSHE 账号逐个域名拉
+      // dns_records，免费计划 50 次配额极易在 CF「超大账号」这一环就耗尽，
+      // 报错 "Too many subrequests by single Worker invocation"，后面的账号全部同步失败）。
+      // 改为按页配额分片：每次调用最多拉 CF_ZONE_ROUNDS_PER_RUN 页，未拉完就把游标写进
+      // cache，下次定时任务接着拉；已拉到的分片先落库，只增不删（见 upsertAccountDomains）。
+      // 只有拉完最后一页（hasMore=false）的那次调用才走 syncAccountDomains 做差集清理。
       if (provider === "cloudflare") {
         if (!(client instanceof CloudflareClient)) {
           throw new Error("Cloudflare 账号客户端异常");
         }
-        const zones = await client.listZones();
-        await dbManager.syncAccountDomains(acc.id, zones.map(mapZoneToUpstream));
-        totalSynced += zones.length;
+
+        // 1.5.1 zone 到期提醒（跨账号统一处理一次）
+        //
+        // WHY 单独一段：CF zone 对象里**没有到期字段**（有效期登记在注册商处），所以
+        // 这条提醒的上游是「注册局 RDAP」，而不是 Cloudflare API 本身。数据源两级：
+        //   ① domain_date_overrides 表 —— 用户手动录入，零子请求，优先级最高
+        //      （子域 zone 在 RDAP 里必然 404，只能靠手动录入，这是它的主要用途）；
+        //   ② cache 表的 rdap:4:<domain> —— 前端打开 Cloudflare 页时查询并落缓存的结果。
+        //
+        // ⚠️ 这里**不主动回源**（只读上面的缓存）。CF 域名数按 zone 计，线上规模可达
+        // 几十上百，逐个回源会把免费计划的 50 次配额直接打满 —— 而 DNSHE 的解析记录
+        // 拉取还要用同一份配额。代价是「用户没打开过 Cloudflare 页的注册域本轮不提醒」，
+        // 换来的是 cron 的额外上游请求恒为 0。手动录入的域名不受此限制。
+        if (!cfReminderDone) {
+          cfReminderDone = true;
+          try {
+            const cfZones = await dbManager.getDomains("", "", undefined, "cloudflare");
+            if (cfZones.length > 0) {
+              const accountIds = Array.from(new Set(cfZones.map((z) => z.account_id)));
+
+              // 批量读手动覆盖 + 批量读 RDAP 缓存：各是一次 D1 往返，不逐域名查
+              const manualByAccount = await dbManager.getDateOverridesByAccountIds(accountIds);
+              const registrableHosts: string[] = [];
+              const seenHost = new Set<string>();
+              for (const z of cfZones) {
+                const host = String(z.full_domain || "").trim().toLowerCase();
+                if (!host || seenHost.has(host)) continue;
+                seenHost.add(host);
+                // RDAP 注册局只登记「注册域」，子域查不到也没必要占预算
+                if (isRegistrableDomain(host)) registrableHosts.push(host);
+              }
+              // 预算封顶：超出的域名本轮不查缓存、不提醒（下轮还有机会），避免 D1 往返失控
+              const inBudget = registrableHosts.slice(0, CF_EXPIRY_BUDGET);
+              const rdapCache = await dbManager.getRdapExpiryCacheBatch(inBudget);
+              if (registrableHosts.length > inBudget.length) {
+                await dbManager.writeLog(
+                  "info",
+                  "renew",
+                  `Cloudflare 域名到期检查：待查缓存的注册域 ${registrableHosts.length} 个超出单轮预算 ${CF_EXPIRY_BUDGET}，本轮只检查前 ${inBudget.length} 个，其余下一轮继续`
+                );
+              }
+
+              for (const z of cfZones) {
+                const fullDomain = String(z.full_domain || "").trim();
+                if (!fullDomain) continue;
+                const host = fullDomain.toLowerCase();
+                // 优先级：手动录入 > RDAP 缓存。两者都没有 → 无到期信息，跳过
+                // （绝不能当成「不过期」处理，否则查不到的 zone 会被静默认定为安全）
+                const expiresAt =
+                  manualByAccount.get(z.account_id)?.get(host) ||
+                  rdapCache.get(host) ||
+                  "";
+                if (!expiresAt || expiresAt.startsWith("0000")) continue;
+                const expiresTime = new Date(expiresAt).getTime();
+                if (Number.isNaN(expiresTime)) continue;
+                const remainingDays = (expiresTime - Date.now()) / (1000 * 60 * 60 * 24);
+                // 剩余有效期不足阈值（含已过期）时提醒；阈值与 DP / 自定义分组共用 renew_threshold_days
+                if (remainingDays <= renewThresholdDays) {
+                  const alias = z.account_alias || `账号 ${z.account_id}`;
+                  const src = manualByAccount.get(z.account_id)?.get(host) ? "手动录入" : "RDAP";
+                  const msg = remainingDays < 0
+                    ? `域名 [${fullDomain}]（Cloudflare / ${alias}）已过期 ${Math.ceil(-remainingDays)} 天，请及时续费`
+                    : `域名 [${fullDomain}]（Cloudflare / ${alias}）将于 ${Math.ceil(remainingDays)} 天后到期`;
+                  await dbManager.writeLog("warning", "renew", `${msg}（到期时间来源：${src}）`);
+                  expiryReminderLogs.push(`⚠️ ${msg}`);
+                }
+              }
+            }
+          } catch (e: unknown) {
+            // 到期提醒是同步任务的附加项，绝不能因为它失败而中断 zone 列表同步
+            const message = e instanceof Error ? e.message : "未知错误";
+            await dbManager.writeLog("error", "renew", `Cloudflare 域名到期检查失败：${message}`);
+          }
+        }
+
+        const cursorKey = cfZoneCursorKey(acc.id);
+        const cursor = await readCfZoneCursor(dbManager, cursorKey);
+
+        let zones: CfZoneInfo[] = [];
+        for (let page = cursor.startPage, round = 0; round < CF_ZONE_ROUNDS_PER_RUN; round++) {
+          const res = await client.listZones({ startPage: page, maxPages: CF_ZONE_PROBE_PAGES });
+          zones = zones.concat(res.zones);
+          if (!res.hasMore) {
+            // 上游列表已拉完 —— 这是权威全量，可以安全地做差集删除（清理上游已删的 zone）
+            const total = cursor.syncedBefore + zones.length;
+            await dbManager.syncAccountDomains(acc.id, zones.map(mapZoneToUpstream));
+            await dbManager.setCache(cursorKey, "", 1); // 游标归零，下次从第 1 页重新核对
+            totalSynced += total;
+            await dbManager.writeLog(
+              "info",
+              "sync",
+              `Cloudflare 账号 [${alias}] zone 列表同步完成，本账号共 ${total} 个 zone`
+            );
+            break;
+          }
+          // 本页满员但被本次调用的页数上限截断 —— 先落库本批分片（只增不删），
+          // 游标写入（含已同步数量），留待下次定时任务从下一页续拉。
+          await dbManager.upsertAccountDomains(acc.id, res.zones.map(mapZoneToUpstream));
+          cursor.syncedBefore += res.zones.length;
+          page = res.nextPage;
+          await dbManager.setCache(cursorKey, JSON.stringify(cursor), CF_ZONE_CURSOR_TTL);
+          await dbManager.writeLog(
+            "info",
+            "sync",
+            `Cloudflare 账号 [${alias}] zone 数量较多，本次已同步 ${res.zones.length} 个，剩余部分将在后续定时任务中从第 ${page} 页续拉`
+          );
+        }
         continue;
       }
 
@@ -401,15 +697,61 @@ export async function runDailySyncAndRenewal(
 
       // 2. 分页拉取该账户在 DNSHE 系统的全部域名
       const subdomains = await fetchAllSubdomainsFromClient(client);
-      
+
+      // 2.5 已被本面板管理的 CF zone 走快路径，跳过 dns_records 拉取。
+      //
+      // 先收一遍「本面板所有 CF 账号的 zone 名」全集，再把本账号域名分成两拨：
+      //   - 命中 CF zone 全集 → 三态恒定（已委派 / Cloudflare），不需要解析记录；
+      //   - 其余 → 老实逐个拉 dns_records 推导三态（或命中记录缓存，见 2.6）。
+      // 这在「CF 账号多、DNSHE 域名多」的线上环境收益最大（每个命中省 1 次子请求）。
+      //
+      // NOTE: 这是纯 fail-safe 优化 —— collectManagedCfZones 失败时集合为空，全部域名
+      // 退化为老路径；某个 CF 账号尚未同步过、库里没有它的 zone 行时，回源反查一次
+      // （resolveCfZoneOwner），查不到就保留库里的旧归属，都不影响正确性。
+      const cfZones = await collectManagedCfZones(dbManager);
+      const cfFastPath = new Map<number, { alias: string; zoneId: string }>();
+
+      for (const sub of subdomains) {
+        const host = String(sub.full_domain || "").trim().toLowerCase();
+        const zone = host ? cfZones.get(host) : undefined;
+        if (!zone) continue;
+        // 库里已有该 zone 行时信息齐全（真实账号名 + zone id），零子请求；
+        // 库里的 zone 行还没同步过时才回源反查。
+        cfFastPath.set(sub.id, zone);
+      }
+
+      // 2.6 【腿二】记录缓存命中，同样跳过 dns_records 拉取。
+      //
+      // 缓存里的记录就是当初 computeDnsState 的输入，拿它重算三态与回源结果完全等价，
+      // 所以这不是「用旧数据糊弄」，而是省掉一次纯冗余的往返。
+      // 只有定时任务走这条路（dnsCacheOnlyOnScheduled）；手动同步全额回源。
+      //
+      // NOTE: 与腿一不同，这里的行**必须**重新过一遍 computeDnsState —— 缓存只提供了
+      // 记录本身，给不出三态；顺着算出来的托管商才是权威值。
+      const dnsRecordsCache = dnsCacheOnlyOnScheduled
+        ? await dbManager.getDnsRecordsCacheBatch(
+            subdomains.filter((sub) => !cfFastPath.has(sub.id)).map((sub) => sub.id)
+          )
+        : new Map<number, unknown[]>();
+      const cacheFastPath = new Set<number>(dnsRecordsCache.keys());
+
       // 3. 分批并发获取每个子域名的 DNS 记录，自动计算真实状态（已委派 / 已解析 / 未解析）
       //    使用 batchedPromiseAll 控制每批最多 5 个并发请求，避免触发 Worker 子请求限制。
-      const subdomainsWithDnsInfo = await batchedPromiseAll(
-        subdomains,
-        async (sub) => {
+      //
+      // NOTE: 结果按 UpstreamSubdomain[] 收集 —— DNSHE 的 SubdomainInfo 类型里没有
+      // dns_provider / remote_id（那是 db 层写入契约的字段），但落库走的是
+      // UpstreamSubdomain 的形状，这里的 spread 在运行时本就带着额外字段。
+      const needDnsFetch = subdomains.filter(
+        (sub) => !cfFastPath.has(sub.id) && !cacheFastPath.has(sub.id)
+      );
+      const subdomainsWithDnsInfo: UpstreamSubdomain[] = await batchedPromiseAll(
+        needDnsFetch,
+        async (sub): Promise<UpstreamSubdomain> => {
           try {
             const recordsRes = await client.listDnsRecords(sub.id);
             const records = recordsRes.records || [];
+            // 顺手回填缓存：下次定时任务就能命中这里，不再回源
+            await dbManager.setCache(`api_cache:dns:${sub.id}`, JSON.stringify(records));
             return { ...sub, ...computeDnsState(records) };
           } catch (e) {
             // 子请求配额耗尽时直接向上抛出，由外层 catch 统一处理并中止后续账号同步
@@ -421,10 +763,49 @@ export async function runDailySyncAndRenewal(
         5
       );
 
+      // 3.2 缓存命中的行：用缓存里的记录重算三态（零子请求）
+      for (const sub of subdomains) {
+        const records = dnsRecordsCache.get(sub.id);
+        if (!records) continue;
+        // 缓存里的记录形态与上游返回一致（当初就是整体 JSON.stringify 存进去的），
+        // 断言成 computeDnsState 的入参形状；它只读 type / content 两个字段。
+        subdomainsWithDnsInfo.push({
+          ...sub,
+          ...computeDnsState(records as Array<{ type?: string; content?: unknown }>)
+        });
+      }
+
+      // 3.5 CF 快路径行带上 dns_state_known（三态由 CF zone 背书），并入待写入列表
+      for (const sub of subdomains) {
+        const zone = cfFastPath.get(sub.id);
+        if (!zone) continue;
+        subdomainsWithDnsInfo.push({
+          ...sub,
+          status: "已委派",
+          has_dns: 0,
+          dns_provider: "Cloudflare",
+          dns_state_known: true,
+          provider_account_id: sub.provider_account_id ?? zone.alias,
+          // DNSHE 行本不带 zone id（remote_id 是 CF 行的字段），库里能查到就补上
+          remote_id: zone.zoneId || undefined
+        });
+      }
+
       // 4. 同步到本地 cache
       await dbManager.syncAccountDomains(acc.id, subdomainsWithDnsInfo);
       totalSynced += subdomains.length;
-      
+
+      if (cfFastPath.size > 0 || cacheFastPath.size > 0) {
+        const parts: string[] = [];
+        if (cfFastPath.size > 0) parts.push(`${cfFastPath.size} 个已委派到本面板 CF 账号`);
+        if (cacheFastPath.size > 0) parts.push(`${cacheFastPath.size} 个命中记录缓存`);
+        await dbManager.writeLog(
+          "info",
+          "sync",
+          `账号 [${alias}] 共 ${subdomains.length} 个域名，其中 ${parts.join("、")}，跳过解析记录拉取（本次实际拉取 ${needDnsFetch.length} 次，节省 ${subdomains.length - needDnsFetch.length} 次子请求）`
+        );
+      }
+
       // 4. 扫描该账号下的域名，判断是否需要续期
       for (const sub of subdomains) {
         const expiresAt = sub.expires_at as string | undefined;
@@ -479,11 +860,17 @@ export async function runDailySyncAndRenewal(
       await dbManager.writeLog("error", "sync", `同步账号 [${acc.alias}] 的域名数据失败：${message}`, stack);
       // 子请求配额耗尽后同一次 Worker 调用内的所有后续 fetch() 均会失败，
       // 继续遍历剩余账号只会产生一连串相同错误。提前中止并记录提示日志。
+      //
+      // NOTE: 这里不再建议用户去改 wrangler.toml 的 [limits] —— 该配置项对免费计划
+      // 无效（写了也不生效），把用户引向一条走不通的路。应用侧已对大户（Cloudflare
+      // zone 列表、DNSHE 的 dns_records）做了分片续拉，正常情况下不该再撞上限；
+      // 真撞上了说明单个账号规模已超出单次调用能承载的极限，可行的办法只有拆分账号
+      // （把域名分散到多个 API Token 下）或升级 Workers 付费计划。
       if (isSubrequestLimitError(e)) {
         await dbManager.writeLog(
           "warning",
           "sync",
-          "检测到 Worker 子请求配额已耗尽，跳过剩余账号同步。如频繁出现，请在 wrangler.toml [limits] 中提升 subrequests 上限（需 Workers 付费计划）或减少绑定的账号数量"
+          "检测到 Worker 子请求配额已耗尽（免费计划单次调用硬限 50 次），已跳过剩余账号同步。可尝试：把域名较多的账号拆分成多个 API Token 绑定（每个 token 管辖的域名更少），或升级到 Workers 付费计划后取消 wrangler.toml 中 [limits] 的注释"
         );
         break;
       }

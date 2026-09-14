@@ -230,6 +230,15 @@ const THREE_STATE_STATUSES = new Set(["已委派", "已解析", "未解析"]);
 /** 全部账号配额的缓存键（内容为按 account_id 升序排列的数组） */
 export const QUOTA_CACHE_KEY = "api_cache:quota";
 
+/**
+ * RDAP 到期时间查询结果的缓存键前缀（与 index.ts 的 /api/expiry 共用同一命名空间）
+ *
+ * NOTE: 版本号必须与 index.ts 的 RDAP_CACHE_KEY_PREFIX 保持一致 —— 两边读写的是同一批键，
+ * 任何一边改了版本号，另一边的读就会整批落空（那边表现为重复回源、这边表现为永不提醒）。
+ * 提到模块级导出是为了让定时任务的批量读缓存能复用同一常量，而不是各自硬编码字符串。
+ */
+export const RDAP_CACHE_PREFIX = "rdap:4:";
+
 /** 配额缓存中的单个账号条目：成功时展开 quota 字段，失败时带 error */
 export type QuotaEntry = { account_id: number; alias: string; [key: string]: unknown };
 
@@ -537,6 +546,46 @@ export class DatabaseManager {
     }
 
     return hits;
+  }
+
+  /**
+   * 批量读取一批域名的解析记录缓存（单条 SQL，避免逐域名 getCache 往返）
+   *
+   * NOTE: 与 getWhoisPool 同样的两条硬约束 ——
+   *   1. D1 每条 SQL 最多 100 个绑定参数（不是 SQLite 默认的 999），所以 key 必须内联
+   *      成字面量、绑定参数只留「当前时间」这一个；
+   *   2. 域名 id 在入口处已过滤为纯数字，内联无注入面。
+   *
+   * 返回 Map<subdomain_id, records 数组>；缓存缺失或内容损坏的域名不出现在结果里，
+   * 由调用方决定怎么补（见 cron.ts 的 DNSHE 同步分支）。
+   */
+  async getDnsRecordsCacheBatch(ids: number[]): Promise<Map<number, unknown[]>> {
+    const result = new Map<number, unknown[]>();
+    const valid = ids.filter((id) => Number.isSafeInteger(id) && id >= 0);
+    if (valid.length === 0) return result;
+
+    const now = Math.floor(Date.now() / 1000);
+    // 单条 SQL 上限 100KB；每行 key 约 24 字节，400 行内联后约 10KB，留足余量
+    const STMT_CHUNK = 400;
+
+    for (let i = 0; i < valid.length; i += STMT_CHUNK) {
+      const list = valid.slice(i, i + STMT_CHUNK).map((id) => `'api_cache:dns:${id}'`).join(",");
+      const rows = await this.db
+        .prepare(`SELECT key, value FROM cache WHERE key IN (${list}) AND expires_at > ?`)
+        .bind(now)
+        .all<{ key: string; value: string }>();
+      for (const row of rows.results || []) {
+        const id = Number(String(row.key).replace(/^api_cache:dns:/, ""));
+        if (!Number.isFinite(id)) continue;
+        try {
+          const parsed = JSON.parse(String(row.value));
+          if (Array.isArray(parsed)) result.set(id, parsed);
+        } catch {
+          // 缓存内容损坏时跳过，调用方会为它回源重拉并覆盖
+        }
+      }
+    }
+    return result;
   }
 
   /**
@@ -1044,7 +1093,8 @@ export class DatabaseManager {
       }
       if (!cfAccount) {
         try {
-          cfAccount = (await cfClient.listZones()).find((z) => z.account?.id)?.account;
+          // 只为取一个 account.id 做别名回退，拉第一页（50 个 zone）足够
+          cfAccount = (await cfClient.listZones({ maxPages: 1 })).zones.find((z) => z.account?.id)?.account;
         } catch {
           cfAccount = undefined;
         }
@@ -1488,6 +1538,20 @@ export class DatabaseManager {
   }
 
   /**
+   * 增量写入该账号的一批域名（不删除任何行）
+   *
+   * NOTE: 与 syncAccountDomains 的区别只在「不清理差集」——用于跨多次 Worker 调用分片
+   * 拉取上游的场景（Cloudflare zone 列表分页续拉）。分片同步时每次只拿到上游的一个
+   * 子集，若照常做差集删除，没轮到的分片会被当成「上游已删除」而误删。
+   * 只有拿到完整列表（hasMore=false）的那一次调用才该走 syncAccountDomains。
+   */
+  async upsertAccountDomains(accountId: number, subdomains: UpstreamSubdomain[]) {
+    if (subdomains.length === 0) return;
+    const statements = subdomains.map((sub) => this.buildDomainUpsert(accountId, sub));
+    await this.db.batch(statements);
+  }
+
+  /**
    * 标记域名已续期成功
    */
   async markDomainRenewed(id: number, newExpiresAt: string) {
@@ -1662,6 +1726,98 @@ export class DatabaseManager {
       )
       .all<{ account_id: number; full_domain: string; registered_at: string | null; expires_at: string | null; source: string | null }>();
     return results || [];
+  }
+
+  /**
+   * 批量读取指定 CF 账号下域名的手动日期覆盖（key = 小写 full_domain）
+   *
+   * NOTE: 定时任务里为 CF 域名做到期提醒时用 —— 手动覆盖是**零子请求**的数据源，
+   * 优先级高于 RDAP 自动查询（用户录入的就是权威值，RDAP 对子域 zone 本来也查不到）。
+   * 只取有 expires_at 的行：注册时间对「是否即将到期」没有意义，少传一列少占内存。
+   */
+  async getDateOverridesByAccountIds(
+    accountIds: number[]
+  ): Promise<Map<number, Map<string, string>>> {
+    const out = new Map<number, Map<string, string>>();
+    const valid = accountIds.filter((id) => Number.isSafeInteger(id) && id > 0);
+    if (valid.length === 0) return out;
+
+    // ⚠️ D1 硬上限：每条查询最多 100 个绑定参数。账号数远小于该量级，
+    // 但仍按 90 分块，避免下游调用方传入超长列表时静默失败。
+    const CHUNK = 90;
+    for (let i = 0; i < valid.length; i += CHUNK) {
+      const list = valid.slice(i, i + CHUNK).join(",");
+      const { results } = await this.db
+        .prepare(
+          `SELECT account_id, full_domain, expires_at FROM domain_date_overrides
+           WHERE account_id IN (${list}) AND expires_at IS NOT NULL AND expires_at != ''`
+        )
+        .all<{ account_id: number; full_domain: string; expires_at: string }>();
+      for (const row of results || []) {
+        const host = String(row.full_domain || "").trim().toLowerCase();
+        if (!host) continue;
+        let bucket = out.get(row.account_id);
+        if (!bucket) {
+          bucket = new Map<string, string>();
+          out.set(row.account_id, bucket);
+        }
+        bucket.set(host, String(row.expires_at));
+      }
+    }
+    return out;
+  }
+
+  /**
+   * 批量读取 RDAP 到期时间缓存（key = 小写域名，value = expires_at）
+   *
+   * WHY 需要这个：CF zone 对象里**没有到期字段**（有效期登记在注册商处），
+   * 上游结构性不提供 —— 所以给 CF 域名做到期提醒必须另找数据源。RDAP 结果由
+   * 前端 /api/expiry 查询后写入 cache 表（键 rdap:4:<domain>，7 天 TTL），
+   * 定时任务**只读这份缓存、不主动回源**，保证 cron 的额外子请求恒为 0。
+   *
+   * NOTE 两种「无结果」都必须如实返回缺失，不能当成「不过期」：
+   *   - found=false（含 RDAP 404 的子域 zone）→ 没有到期信息，跳过提醒；
+   *   - 带 error 的失败结论本来就不落缓存（见 index.ts 的 /api/expiry），此处自然读不到。
+   * NOTE 与其他批量读缓存的方法一致：key 内联为字面量（D1 每条 SQL 最多 100 个绑定
+   * 参数，不是 SQLite 的 999），绑定参数一个都不留。
+   */
+  async getRdapExpiryCacheBatch(domains: string[]): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
+    const valid = Array.from(
+      new Set(domains.map((d) => String(d || "").trim().toLowerCase()).filter(Boolean))
+    );
+    if (valid.length === 0) return out;
+
+    const STMT_CHUNK = 400;
+    const now = Math.floor(Date.now() / 1000);
+    for (let i = 0; i < valid.length; i += STMT_CHUNK) {
+      const list = valid
+        .slice(i, i + STMT_CHUNK)
+        .map((d) => `'${RDAP_CACHE_PREFIX}${d.replace(/'/g, "''")}'`)
+        .join(",");
+      const { results } = await this.db
+        .prepare(
+          `SELECT key, value FROM cache WHERE key IN (${list}) AND expires_at > ?`
+        )
+        .bind(now)
+        .all<{ key: string; value: string }>();
+      for (const row of results || []) {
+        const host = String(row.key).slice(RDAP_CACHE_PREFIX.length);
+        if (!host) continue;
+        try {
+          const parsed = JSON.parse(String(row.value)) as {
+            found?: boolean;
+            expires_at?: string;
+          };
+          if (parsed && parsed.found && parsed.expires_at) {
+            out.set(host, String(parsed.expires_at));
+          }
+        } catch {
+          // 缓存脏了（非 JSON / 结构不符）按未命中处理
+        }
+      }
+    }
+    return out;
   }
 
   /** 写入/更新单条手动覆盖（空串视为清除对应字段） */

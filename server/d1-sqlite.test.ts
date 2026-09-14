@@ -22,14 +22,19 @@ import { createD1FromSqlite } from "./d1-sqlite";
 const AES_KEY = "test-only-key-do-not-reuse";
 
 let passed = 0;
+let failed = 0;
 async function it(name: string, fn: () => Promise<void> | void): Promise<void> {
   try {
     await fn();
     passed += 1;
     console.log(`  ✓ ${name}`);
   } catch (e) {
-    console.error(`  ✗ ${name}`);
-    console.error(e);
+    failed += 1;
+    // NOTE: 失败信息必须拼进同一条 console.error —— 分两条打时，stdout 的 ✓/✗
+    // 与 stderr 的错误堆栈在管道里会交错，出现「打印了 Error 却仍显示 ✓」的错觉，
+    // 让人误以为这条过了。汇成一条并带上 ✗ 前缀，肉眼与 CI 都不会看错。
+    const detail = e instanceof Error ? (e.stack || e.message) : String(e);
+    console.error(`  ✗ ${name}\n${detail}`);
     process.exitCode = 1;
   }
 }
@@ -130,6 +135,28 @@ await it("syncAccountDomains() 会删除上游已不存在的域名（同一批�
   assert.deepEqual(left, [101, 102]);
 });
 
+await it("upsertAccountDomains() 只增不删（分片续拉时不能误删未拉到的分片）", async () => {
+  // 先落一份完整的账号快照
+  await dbm.syncAccountDomains(1, [sub(101, "alpha"), sub(102, "beta"), sub(103, "gamma")]);
+  // 模拟「分片续拉」：只拿到上游第 2 页的一小部分，此时绝不能把 101/102 当作用户已删域名清掉
+  await dbm.upsertAccountDomains(1, [sub(103, "gamma", { expires_at: "2029-03-03 00:00:00" }), sub(104, "delta")]);
+  const ids = (await dbm.getDomains()).map((d) => d.id).sort();
+  assert.deepEqual(ids, [101, 102, 103, 104], "upsertAccountDomains 不应删除任何行");
+  // 分片里带的新值仍然要生效（走的是同一个 buildDomainUpsert）
+  assert.equal((await dbm.getDomainById(103))?.expires_at, "2029-03-03 00:00:00");
+
+  // 对照：同一次调用改走 syncAccountDomains 就会按差集删掉 101/102
+  await dbm.syncAccountDomains(1, [sub(103, "gamma"), sub(104, "delta")]);
+  assert.deepEqual((await dbm.getDomains()).map((d) => d.id).sort(), [103, 104]);
+});
+
+await it("upsertAccountDomains() 空数组时不发起任何写操作", async () => {
+  await dbm.syncAccountDomains(1, [sub(201, "keep"), sub(202, "keep2")]);
+  const before = (await dbm.getDomains()).map((d) => d.id).sort();
+  await dbm.upsertAccountDomains(1, []);
+  assert.deepEqual((await dbm.getDomains()).map((d) => d.id).sort(), before);
+});
+
 await it("dns_state_known 缺失时不覆盖已识别出的三态", async () => {
   await dbm.syncAccountDomains(1, [
     sub(101, "alpha", { dns_state_known: true, status: "已委派", has_dns: 0, dns_provider: "Cloudflare" }),
@@ -143,6 +170,45 @@ await it("dns_state_known 缺失时不覆盖已识别出的三态", async () => 
   const alpha = await dbm.getDomainById(101);
   assert.equal(alpha?.status, "已委派", "三态被上游注册态覆盖了");
   assert.equal(alpha?.dns_provider, "Cloudflare");
+});
+
+await it("CF 快路径行可正常落库（provider 过滤 + provider_account_id/remote_id 写入）", async () => {
+  // 建一个 Cloudflare 账号，它的 zone 行就是 DNSHE 快路径的比对基准
+  await d1
+    .prepare("INSERT INTO accounts (id, alias, api_key, api_secret, provider) VALUES (?, ?, ?, ?, ?)")
+    .bind(50, "CF主账号", "cfsd_cf_key", "plain:c2VjcmV0", "cloudflare")
+    .run();
+  await dbm.syncAccountDomains(50, [
+    {
+      id: 7001,
+      subdomain: "delegated",
+      rootdomain: "de5.net",
+      full_domain: "delegated.de5.net",
+      status: "已委派",
+      dns_provider: "Cloudflare",
+      provider_account_id: "CF主账号",
+      remote_id: "zone_abc123",
+      dns_state_known: true,
+      has_dns: 0,
+    },
+  ]);
+
+  // provider 过滤必须把 CF zone 行单独筛出来（collectManagedCfZones 依赖它）
+  const cfRows = await dbm.getDomains("", "", undefined, "cloudflare");
+  assert.equal(cfRows.length, 1);
+  assert.equal(cfRows[0].full_domain, "delegated.de5.net");
+  assert.equal(cfRows[0].account_alias, "CF主账号");
+
+  // 默认视图（不传 provider）必须排除 CF 行，避免 CF zone 混进 DNSHE 域名页
+  const dnsheRows = await dbm.getDomains();
+  assert.ok(!dnsheRows.some((d) => d.id === 7001), "CF zone 行混进了 DNSHE 默认视图");
+
+  const row = await dbm.getDomainById(7001);
+  assert.equal(row?.provider_account_id, "CF主账号");
+  assert.equal(row?.remote_id, "zone_abc123");
+
+  // NOTE: 这里刻意不清理 50 号账号与 7001 行 —— 最后的级联断言只针对 1 号账号，
+  // 留着 50 号账号正好反证 deleteAccount(1) 不会误伤其它账号的域名行。
 });
 
 await it("upsertDomain() 单条写入走同一个 bind() 结果（不可变语义）", async () => {
@@ -195,6 +261,95 @@ await it("查重池批量查询（域名内联为字面量，绑定参数恒为 
   assert.deepEqual(hits, ["taken.cn.mt"]);
 });
 
+await it("getDnsRecordsCacheBatch() 批量读记录缓存（跳过缺失/过期/损坏项）", async () => {
+  const recs = [
+    { type: "A", content: "1.2.3.4" },
+    { type: "NS", content: "ns1.cloudflare.com" },
+  ];
+  await dbm.setCache("api_cache:dns:501", JSON.stringify(recs));
+  await dbm.setCache("api_cache:dns:502", JSON.stringify([{ type: "TXT", content: "x" }]));
+  // 503 没有缓存行；504 已过期；505 内容损坏
+  await d1.prepare("INSERT INTO cache (key, value, expires_at) VALUES (?, ?, ?)")
+    .bind("api_cache:dns:504", "[]", 1).run();
+  await dbm.setCache("api_cache:dns:505", "{not json");
+
+  const got = await dbm.getDnsRecordsCacheBatch([501, 502, 503, 504, 505]);
+  assert.deepEqual([...got.keys()].sort(), [501, 502], "只应返回有效且未过期的缓存");
+  assert.deepEqual(got.get(501), recs);
+  assert.deepEqual(got.get(502), [{ type: "TXT", content: "x" }]);
+
+  // 空数组 / 非法 id 不应发起查询
+  assert.equal((await dbm.getDnsRecordsCacheBatch([])).size, 0);
+  assert.equal((await dbm.getDnsRecordsCacheBatch([NaN, -1, 1.5])).size, 0);
+
+  // 大批量（超过单条 SQL 的 400 行分块）也要能全部读回
+  const bulkIds = Array.from({ length: 450 }, (_, i) => 6000 + i);
+  for (const id of bulkIds) {
+    await dbm.setCache(`api_cache:dns:${id}`, JSON.stringify([{ type: "A", content: `10.0.${id % 256}.1` }]));
+  }
+  assert.equal((await dbm.getDnsRecordsCacheBatch(bulkIds)).size, 450);
+});
+
+await it("getDateOverridesByAccountIds() 批量读手动日期覆盖（按账号分桶、跳过空到期时间）", async () => {
+  // domain_date_overrides.account_id 有外键约束，必须先把账号建出来
+  await d1
+    .prepare("INSERT INTO accounts (id, alias, api_key, api_secret) VALUES (?, ?, ?, ?)")
+    .bind(3, "覆盖测试账号", "cfsd_ov_key", "plain:c2VjcmV0")
+    .run();
+
+  await dbm.upsertDateOverride(1, "a.example.com", { expires_at: "2027-01-01" });
+  await dbm.upsertDateOverride(1, "b.example.com", { expires_at: "2028-02-02", source: "手动" });
+  await dbm.upsertDateOverride(3, "c.example.com", { expires_at: "2029-03-03" });
+  // 只有注册时间、没有到期时间的行必须被排除：它对「是否即将到期」没有意义
+  await dbm.upsertDateOverride(1, "no-expiry.example.com", { registered_at: "2020-01-01" });
+  // 大小写归一：库里存什么大小写，读出来都要能按小写 host 命中
+  await dbm.upsertDateOverride(1, "MixedCase.example.com", { expires_at: "2030-04-04" });
+
+  const got = await dbm.getDateOverridesByAccountIds([1, 3]);
+  assert.deepEqual([...got.keys()].sort(), [1, 3], "只应有 1、3 号账号两个桶");
+  const one = got.get(1)!;
+  assert.equal(one.get("a.example.com"), "2027-01-01");
+  assert.equal(one.get("b.example.com"), "2028-02-02");
+  assert.equal(one.get("mixedcase.example.com"), "2030-04-04", "host 应归一为小写");
+  assert.equal(one.has("no-expiry.example.com"), false, "无到期时间的行应被排除");
+  assert.equal(got.get(3)!.get("c.example.com"), "2029-03-03");
+  // 未传入的账号不应出现
+  assert.equal(got.has(2), false);
+
+  // 空数组 / 非法 id 不应发起查询
+  assert.equal((await dbm.getDateOverridesByAccountIds([])).size, 0);
+  assert.equal((await dbm.getDateOverridesByAccountIds([NaN, 0, -5, 1.5])).size, 0);
+});
+
+await it("getRdapExpiryCacheBatch() 批量读 RDAP 到期缓存（只认 found + expires_at）", async () => {
+  const key = (d: string) => `rdap:4:${d}`;
+  await dbm.setCache(key("ok.com"), JSON.stringify({ found: true, expires_at: "2027-06-01" }), 3600);
+  // 查到但无到期时间 → 不给结果（不能当成「不过期」）
+  await dbm.setCache(key("nodate.com"), JSON.stringify({ found: true }), 3600);
+  // 注册局明确「查无此记录」（子域 zone 的典型结论）→ 不给结果
+  await dbm.setCache(key("notfound.com"), JSON.stringify({ found: false }), 3600);
+  // 已过期
+  await d1.prepare("INSERT INTO cache (key, value, expires_at) VALUES (?, ?, ?)")
+    .bind(key("stale.com"), JSON.stringify({ found: true, expires_at: "2020-01-01" }), 1).run();
+  // 内容损坏
+  await dbm.setCache(key("broken.com"), "{not json", 3600);
+  // 带 error 的失败结论本来就不落缓存，这里显式验证「error 但没 expires_at」也不会误报
+  await dbm.setCache(key("errored.com"), JSON.stringify({ found: false, error: "RDAP HTTP 403" }), 3600);
+
+  const got = await dbm.getRdapExpiryCacheBatch([
+    "ok.com", "nodate.com", "notfound.com", "stale.com", "broken.com", "errored.com", "missing.com",
+  ]);
+  assert.deepEqual([...got.keys()], ["ok.com"], "只有 found + expires_at 齐备的项才应返回");
+  assert.equal(got.get("ok.com"), "2027-06-01");
+
+  // 大小写与去重：查询键统一按小写归一，重复项只查一次
+  const got2 = await dbm.getRdapExpiryCacheBatch(["OK.com", "ok.com"]);
+  assert.equal(got2.get("ok.com"), "2027-06-01");
+
+  // 空数组不应发起查询
+  assert.equal((await dbm.getRdapExpiryCacheBatch([])).size, 0);
+});
+
 await it("日志写入与按分类过滤", async () => {
   await dbm.writeLog("success", "operation", "适配层自检日志", { probe: 1 });
   const all = await dbm.getLogs(10);
@@ -212,12 +367,31 @@ await it("markDomainRenewed() 更新到期时间与续期时间", async () => {
 });
 
 await it("deleteAccount() 依赖外键级联清掉 domains_cache", async () => {
-  assert.ok((await dbm.getDomains()).length > 0);
+  // 1 号账号下的域名行必须存在，否则这条断言等于没测
+  assert.ok((await dbm.getDomains()).some((d) => d.account_id === 1));
+  // 另建一个账号与域名行：级联只能清掉被删账号的行，不能误伤别人
+  await d1
+    .prepare("INSERT INTO accounts (id, alias, api_key, api_secret) VALUES (?, ?, ?, ?)")
+    .bind(60, "陪跑账号", "cfsd_other_key", "plain:c2VjcmV0")
+    .run();
+  await dbm.syncAccountDomains(60, [sub(8001, "survivor")]);
+
   await dbm.deleteAccount(1);
-  assert.equal((await dbm.getAccounts()).length, 0);
-  assert.equal((await dbm.getDomains()).length, 0, "外键级联没生效，域名缓存成了孤儿数据");
+  assert.equal((await dbm.getAccounts()).some((a) => a.id === 1), false, "1 号账号没被删掉");
+  assert.equal(
+    (await dbm.getDomains()).some((d) => d.account_id === 1),
+    false,
+    "外键级联没生效，1 号账号的域名缓存成了孤儿数据"
+  );
+  assert.ok(
+    (await dbm.getDomains()).some((d) => d.id === 8001),
+    "级联误伤了其它账号的域名行"
+  );
 });
 
 sqlite.close();
 
-console.log(`\n${passed} 项通过${process.exitCode ? "，存在失败项" : "，全部通过"}\n`);
+console.log(
+  `\n${passed} 项通过${failed ? `，${failed} 项失败` : "，全部通过"}\n`
+);
+if (failed > 0) process.exitCode = 1;

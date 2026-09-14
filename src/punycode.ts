@@ -19,6 +19,50 @@ const DELIMITER = "-";
 // 仅包含 ASCII 字母数字与连字符的正则（合法 LDH 标签）
 const NON_ASCII = /[^\x00-\x7F]/;
 
+// 常见的「多段公共后缀」（public suffix）。RDAP 注册局只登记「注册域」，二级/三级子域
+// （foo.example.com）在注册局 RDAP 里查不到（404）。子域直接不查（跳过），避免把注册域
+// 的日期错误套到子域上；命中下表则注册域 = 最后三段（如 a.b.co.uk → b.co.uk），
+// 否则注册域 = 最后两段（a.com）。表只覆盖最常见二级公共后缀，无需引入完整 PSL 依赖。
+const MULTI_PART_PUBLIC_SUFFIXES = new Set([
+  "co.uk", "org.uk", "me.uk", "ltd.uk", "plc.uk", "net.uk", "sch.uk", "ac.uk", "gov.uk",
+  "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn",
+  "com.au", "net.au", "org.au", "edu.au", "gov.au",
+  "com.br", "net.br", "org.br",
+  "co.jp", "ne.jp", "or.jp", "ac.jp", "go.jp",
+  "co.nz", "net.nz", "org.nz",
+  "co.in", "net.in", "org.in", "firm.in", "gen.in", "ind.in",
+  "com.mx", "org.mx",
+  "co.za", "org.za",
+  "com.ar", "net.ar", "org.ar",
+  "com.tr", "net.tr", "org.tr",
+  "com.hk", "net.hk", "org.hk",
+  "com.tw", "net.tw", "org.tw",
+  "com.sg", "net.sg", "org.sg",
+  "com.my", "net.my", "org.my",
+  "co.kr", "ne.kr", "or.kr", "re.kr",
+  "com.ru", "net.ru", "org.ru"
+]);
+
+/**
+ * 判断是否为「注册域」（而非子域）。非注册域返回 false，RDAP 查询直接跳过。
+ *
+ * NOTE: 放在这个零依赖模块里是因为有两个互不相干的消费方 —— index.ts 的 /api/expiry
+ * （前端批量查询）与 cron.ts 的 CF 到期提醒（定时任务）。若让 cron 从 index.ts 导入，
+ * 会形成 index → cron → index 的循环依赖：esbuild 把 cron 排在前面时，调用点会出现在
+ * 定义点之前。函数声明虽会提升、调用又都发生在模块求值之后的异步上下文里，运行时不会
+ * 出错，但那是隐式的、靠时序侥幸成立的依赖。判定逻辑本身只有一个实现（避免两边分歧），
+ * 但模块位置必须无依赖。
+ */
+export function isRegistrableDomain(input: string): boolean {
+  const host = String(input || "").trim().toLowerCase().replace(/\.$/, "");
+  if (!host) return false;
+  const labels = host.split(".").filter(Boolean);
+  if (labels.length < 2) return false; // 单段（如 localhost）不可注册
+  const last2 = labels.slice(-2).join(".");
+  // 多段公共后缀：注册域应有 ≥3 段（如 b.co.uk）；单段后缀：注册域应恰好 2 段（如 a.com）
+  return MULTI_PART_PUBLIC_SUFFIXES.has(last2) ? labels.length === 3 : labels.length === 2;
+}
+
 /**
  * 将 Unicode 码点数组按 UTF-16 拆解为完整码点（正确处理 emoji / 代理对）
  */

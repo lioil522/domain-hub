@@ -1084,9 +1084,8 @@ export default function App() {
   const [quotas, setQuotas] = useState<Quota[]>([]);
   const [logs, setLogs] = useState<AppLog[]>([]);
 
-  // 账号筛选、DNS 类型与下拉菜单状态
+  // 账号筛选与下拉菜单状态
   const [selectedAccountFilter, setSelectedAccountFilter] = useState<string>("all");
-  const [nsTypeFilter, setNsTypeFilter] = useState<"all" | "default" | "external">("all");
   const [openActionMenuId, setOpenActionMenuId] = useState<number | null>(null);
 
   // Loading 状态
@@ -2660,7 +2659,7 @@ export default function App() {
     } else {
       showToast(
         "warning",
-        `${pending.size} 个账号暂未同步到域名（可能仍在后台进行，也可能该账号名下确实没有域名），可稍后点击「同步所有账号」`
+        `${pending.size} 个账号暂未同步到域名（可能仍在后台进行，也可能该账号名下确实没有域名），可稍后点击各页右上角「同步域名」`
       );
     }
   };
@@ -3031,20 +3030,51 @@ export default function App() {
     return { kw, dnsheHits, cfHits, dpHits, customHits };
   }, [globalSearch, domains, cfZones, dpDomains, customDomains]);
 
-  // 立即发起域名同步
+  /**
+   * 全量同步（概览页入口）：跨所有服务商回源，子请求开销最大。
+   * 日常只改单个服务商时优先用各自页面上的「同步域名」按钮。
+   */
   const handleSyncDomains = async () => {
-    setActionLoading("sync");
+    setActionLoading("sync-all");
     try {
       const res = await apiFetch("/api/domains/sync", { method: "POST" });
       const data = await res.json();
       if (data.success) {
         showToast("success", data.message || "同步域名任务已成功在后台启动");
-        setTimeout(() => fetchDomains(), 5000);
+        setTimeout(() => {
+          fetchDomains();
+          fetchCfZones();
+          fetchDpDomains();
+        }, 5000);
       } else {
         showToast("error", data.message || "启动同步域名任务失败");
       }
     } catch (e) {
       showToast("error", "发起域名同步网络请求失败");
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  /**
+   * DNSHE 页「同步域名」：只回源 DNSHE 账号，不碰 Cloudflare / DigitalPlat。
+   *
+   * NOTE: 走 /api/providers/dnshe/sync 而非旧的 /api/domains/sync —— 后者是全量回源，
+   * 在 DNSHE 页点一下会把另外两个服务商也拉一遍，既慢又白耗子请求配额。
+   */
+  const handleSyncDnsheDomains = async () => {
+    setActionLoading("sync");
+    try {
+      const res = await apiFetch("/api/providers/dnshe/sync", { method: "POST" });
+      const data = await res.json();
+      if (data.success) {
+        showToast("success", data.message || "DNSHE 账号同步已在后台启动");
+        setTimeout(() => fetchDomains(), 5000);
+      } else {
+        showToast("error", data.message || "启动 DNSHE 同步失败");
+      }
+    } catch (e) {
+      showToast("error", "发起同步请求失败");
     } finally {
       setActionLoading(null);
     }
@@ -3440,7 +3470,7 @@ export default function App() {
         // 失败时保持弹窗打开并刷新列表，让实际剩余记录可见
         handleOpenNsModal(nsModalDomain);
       }
-      handleSyncDomains();
+      handleSyncDnsheDomains();
     } catch (e) {
       showToast("error", "恢复系统默认 NS 发生异常");
     } finally {
@@ -3533,7 +3563,7 @@ export default function App() {
         showToast("success", `成功添加 ${succeeded.length} 条 NS 记录：${succeeded.join("、")}`);
         setNewCustomNsContent("");
         handleOpenNsModal(nsModalDomain);
-        handleSyncDomains();
+        handleSyncDnsheDomains();
       }
 
       if (failed.length > 0) {
@@ -7298,12 +7328,36 @@ export default function App() {
     dpDomains.forEach((d) => record(d.full_domain, isExpired(d.expires_at, d.status)));
     customDomains.forEach((d) => record(d.full_domain, isExpired(d.expires_at)));
 
-    let active = 0;
-    let expired = 0;
-    seen.forEach((expiredFlag) => {
-      expiredFlag ? expired++ : active++;
-    });
     const total = seen.size;
+
+    // 统一取每个域名的「真实到期时间」：按 cfZoneDateInfo 的优先级链
+    // （手动覆盖 > DNSHE 上游 > DigitalPlat 上游 > RDAP 自动查询）。
+    //
+    // NOTE: 这里必须用这条链而不是直接读 d.expires_at ——
+    //   · Cloudflare zone 本身没有任何到期字段（有效期登记在注册商处）；
+    //   · DNSHE 对部分域名不返回到期时间（空串）；
+    // 真正查到的值只存在于 cfExpiryMap（RDAP 缓存 + 用户手动录入）里，
+    // 早先统计只读 d.expires_at 才导致「已过期」永远是 0。
+    // 自定义域名的归属：CustomDomain 只带 group_id，分组名要从 customGroupList 里反查。
+    const groupNameById = new Map(customGroupList.map((g) => [g.id, g.alias]));
+    const resolveExpiry = (fullDomain: string, fallback?: string): string | undefined => {
+      const candidates = domainKeyCandidates(fullDomain);
+      for (const k of candidates) {
+        const entry = cfExpiryMap[k];
+        const manual = entry?.manual ? entry : undefined;
+        const raw = manual ? (manual.expires_at || "0000-00-00") : entry?.expires_at;
+        if (raw) return raw;
+      }
+      // 兜底：来源自身带的到期时间（自定义域名没有 cfExpiryMap 条目，全靠这条）
+      return fallback;
+    };
+
+    const expiryRecords = [
+      ...domains.map((d) => ({ full_domain: d.full_domain, expires_at: resolveExpiry(d.full_domain, d.expires_at), status: d.status, source: "DNSHE" as const, alias: d.account_alias })),
+      ...cfZones.map((z) => ({ full_domain: z.full_domain, expires_at: resolveExpiry(z.full_domain, z.expires_at), status: undefined, source: "Cloudflare" as const, alias: z.account_alias })),
+      ...dpDomains.map((d) => ({ full_domain: d.full_domain, expires_at: resolveExpiry(d.full_domain, d.expires_at), status: d.status, source: "DigitalPlat" as const, alias: d.account_alias })),
+      ...customDomains.map((d) => ({ full_domain: d.full_domain, expires_at: resolveExpiry(d.full_domain, d.expires_at), status: undefined, source: "自定义" as const, alias: groupNameById.get(d.group_id) || "" }))
+    ];
 
     // 最近注册：跨来源按 created_at 倒序（自定义服务商无 created_at，排除）。
     // 同名域名去重时优先保留有 created_at 的那条，避免同一域名占多行。
@@ -7322,15 +7376,52 @@ export default function App() {
       .sort((a, b) => new Date(b.created_at!).getTime() - new Date(a.created_at!).getTime())
       .slice(0, 6);
 
+    // 到期统计 + 预警共用同一张表：按归一化域名去重，任一来源过期即算过期（取 OR），
+    // 到期时间取最先出现的非空值（多来源通常同值，冲突时以列表顺序在前者为准）。
+    const expiredKeys = new Set<string>();
+    const expiryByKey = new Map<string, { full_domain: string; daysLeft: number; expired: boolean; source: string; alias: string }>();
+    for (const r of expiryRecords) {
+      const key = normalizeDomainKey(r.full_domain);
+      if (!key) continue;
+      // 永久占位（0000 前缀）与空值：不算过期，也不进预警
+      const permanent = !r.expires_at || r.expires_at.startsWith("0000");
+      if (permanent) continue;
+      const t = new Date(r.expires_at!).getTime();
+      if (isNaN(t)) continue;
+      const daysLeft = (t - now) / 86400000;
+      const isExp = daysLeft < 0;
+      if (isExp) expiredKeys.add(key);
+      const prev = expiryByKey.get(key);
+      // 去重取更紧急的一条：已过期优先，其次剩余天数更少
+      if (prev && (prev.expired && !isExp)) continue;
+      if (!(prev && !prev.expired && isExp) && prev && prev.expired === isExp && prev.daysLeft <= daysLeft) continue;
+      expiryByKey.set(key, { full_domain: r.full_domain, daysLeft, expired: isExp, source: r.source, alias: r.alias || "" });
+    }
+
+    // 已过期口径：RDAP/手动链算出的过期域名，并上原有 isExpired 判定的过期域名
+    // （后者覆盖 expires_at 为空但 status 已标过期的场景）。
+    seen.forEach((expiredFlag, key) => {
+      if (expiredFlag) expiredKeys.add(key);
+    });
+    const expired = expiredKeys.size;
+    const active = Math.max(0, total - expired);
+
+    const EXPIRY_WARN_DAYS = 90;
+    const expiringAll = Array.from(expiryByKey.values())
+      .filter((x) => x.expired || x.daysLeft <= EXPIRY_WARN_DAYS)
+      .sort((a, b) => a.daysLeft - b.daysLeft);
+
     return {
       total,
       active,
       expired,
       // 账号口径：DNSHE 账号 + Cloudflare 账号 + DigitalPlat 账号 + 自定义分组
       accounts: dnsheAccounts.length + cfAccountList.length + dpAccountList.length + customGroupList.length,
-      recent
+      recent,
+      expiring: expiringAll.slice(0, 8),
+      expiringTotal: expiringAll.length
     };
-  }, [domains, cfZones, dpDomains, customDomains, dnsheAccounts, cfAccountList, dpAccountList, customGroupList]);
+  }, [domains, cfZones, dpDomains, customDomains, dnsheAccounts, cfAccountList, dpAccountList, customGroupList, cfExpiryMap]);
 
   // 顶部搜索提交：跳转到域名页并带入搜索词
   const handleGlobalSearchSubmit = () => {
@@ -7709,18 +7800,6 @@ export default function App() {
           {/* 把右侧按钮推到最右；手机上让搜索框吃掉这部分空间 */}
           <div className="hidden sm:block flex-1" />
 
-          {/* 域名页快捷同步 */}
-          {activeTab === "domains" && (
-            <button
-              onClick={handleSyncDomains}
-              disabled={actionLoading === "sync" || loadingDomains}
-              className="btn-primary px-2.5 sm:px-3.5 py-2 rounded-lg text-sm font-semibold text-white flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed flex-shrink-0"
-            >
-              <RefreshCw className={`w-4 h-4 ${actionLoading === "sync" ? "animate-spin" : ""}`} />
-              <span className="hidden sm:inline">同步所有账号</span>
-            </button>
-          )}
-
           {/* 通知铃铛 */}
           <div className="relative flex-shrink-0">
             <button
@@ -7791,11 +7870,23 @@ export default function App() {
         {/* Tab 0: Dashboard 概览 */}
         {activeTab === "dashboard" && (
           <div className="space-y-6 pt-5 md:pt-6">
-            <div>
-              <h2 className="text-2xl font-black text-content-primary flex items-center gap-2">
-                <LayoutDashboard className="w-6 h-6 text-indigo-500" /> 概览
-              </h2>
-              <p className="text-content-muted mt-1 text-sm">域名资产总览与到期预警（DNSHE · Cloudflare · DigitalPlat · 自定义服务商）</p>
+            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+              <div>
+                <h2 className="text-2xl font-black text-content-primary flex items-center gap-2">
+                  <LayoutDashboard className="w-6 h-6 text-indigo-500" /> 概览
+                </h2>
+                <p className="text-content-muted mt-1 text-sm">域名资产总览与到期预警（DNSHE · Cloudflare · DigitalPlat · 自定义服务商）</p>
+              </div>
+              {/* 全量同步（唯一入口）：跨所有服务商回源，子请求量最大，日常优先用各页的「同步域名」 */}
+              <button
+                onClick={handleSyncDomains}
+                disabled={actionLoading === "sync-all"}
+                className="px-4 py-2 text-sm font-semibold text-white bg-blue-600 hover:bg-blue-500 border border-blue-500 rounded-lg transition-all flex items-center justify-center gap-2 whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed flex-shrink-0"
+                title="同步所有服务商（DNSHE / Cloudflare / DigitalPlat）的账号与域名"
+              >
+                <RefreshCw className={`w-4 h-4 ${actionLoading === "sync-all" ? "animate-spin" : ""}`} />
+                同步所有账号
+              </button>
             </div>
 
             {/* 顶部统计卡片 */}
@@ -7843,6 +7934,55 @@ export default function App() {
                         }`}>{d.source}</span>
                       </span>
                       <span className="text-[11px] sm:text-xs text-content-muted truncate min-w-0 sm:flex-shrink-0 sm:max-w-[35%]">{d.alias}</span>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+
+            {/* 到期预警：已过期 + 90 天内到期，最紧急排最前 */}
+            <div className="bg-surface border border-border-base rounded-2xl overflow-hidden">
+              <div className="px-4 sm:px-5 py-3.5 border-b border-border-base flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 text-red-400" />
+                <h3 className="font-bold text-content-primary text-sm">到期预警</h3>
+                <span className="text-[11px] text-content-muted font-normal">
+                  已过期 / 90 天内到期
+                </span>
+                {dashboardStats.expiringTotal > 0 && (
+                  <span className="ml-auto text-[11px] font-semibold text-red-500 dark:text-red-400 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900/60 px-2 py-0.5 rounded-full flex-shrink-0">
+                    {dashboardStats.expiringTotal} 个
+                  </span>
+                )}
+              </div>
+              <div className="divide-y divide-border-soft">
+                {dashboardStats.expiring.length === 0 ? (
+                  <div className="px-5 py-10 text-center text-content-muted text-sm">
+                    暂无临期或已过期域名
+                  </div>
+                ) : (
+                  dashboardStats.expiring.map((d) => (
+                    <div key={`${d.source}-${d.full_domain}`} className="px-4 sm:px-5 py-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1 sm:gap-2 hover:bg-hovered transition-colors">
+                      <span className="font-mono text-xs sm:text-sm text-content-primary truncate min-w-0 flex items-center gap-2">
+                        {d.full_domain}
+                        <span className={`flex-shrink-0 text-[10px] font-semibold px-1.5 py-0.5 rounded ${
+                          d.source === "DNSHE" ? "bg-indigo-50 text-indigo-600 dark:bg-indigo-950/60 dark:text-indigo-400"
+                          : d.source === "Cloudflare" ? "bg-orange-50 text-orange-600 dark:bg-orange-950/60 dark:text-orange-400"
+                          : d.source === "DigitalPlat" ? "bg-emerald-50 text-emerald-600 dark:bg-emerald-950/60 dark:text-emerald-400"
+                          : "bg-slate-100 text-slate-600 dark:bg-slate-800/60 dark:text-slate-300"
+                        }`}>{d.source}</span>
+                      </span>
+                      <span className="flex items-center gap-2 min-w-0 sm:flex-shrink-0">
+                        <span className="text-[11px] sm:text-xs text-content-muted truncate min-w-0 max-w-[160px] sm:max-w-[200px]" title={d.alias}>{d.alias}</span>
+                        <span className={`text-[11px] font-semibold px-2 py-0.5 rounded-full border flex-shrink-0 whitespace-nowrap ${
+                          d.expired
+                            ? "bg-red-50 text-red-700 border-red-200 dark:bg-red-950/50 dark:text-red-400 dark:border-red-900/60"
+                            : d.daysLeft <= 30
+                              ? "bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-950/50 dark:text-amber-300 dark:border-amber-900/60"
+                              : "bg-blue-50 text-blue-700 border-blue-200 dark:bg-blue-950/50 dark:text-blue-300 dark:border-blue-900/60"
+                        }`}>
+                          {d.expired ? `已过期 ${Math.ceil(-d.daysLeft)} 天` : `剩 ${Math.ceil(d.daysLeft)} 天`}
+                        </span>
+                      </span>
                     </div>
                   ))
                 )}
@@ -8728,21 +8868,6 @@ export default function App() {
                     ))}
                   </select>
                 </div>
-
-                <div className="flex items-center gap-2 min-w-0">
-                  <span className="text-sm font-semibold text-content-secondary flex items-center gap-1.5 whitespace-nowrap flex-shrink-0">
-                    <Server className="w-4 h-4 text-sky-400" /> DNS 类型:
-                  </span>
-                  <select
-                    value={nsTypeFilter}
-                    onChange={(e) => setNsTypeFilter(e.target.value as "all" | "default" | "external")}
-                    className="form-input px-3 py-2 rounded-lg text-sm text-content-secondary flex-1 min-w-0 md:flex-none md:min-w-[150px]"
-                  >
-                    <option value="all">全部 DNS 类型</option>
-                    <option value="default">仅系统默认 DNS</option>
-                    <option value="external">仅外部 DNS 委派</option>
-                  </select>
-                </div>
               </div>
 
               {/* NOTE: 这一组原先没有 flex-wrap，却装着三个 whitespace-nowrap 的元素 */}
@@ -8765,6 +8890,14 @@ export default function App() {
                   已绑定账户: <span className="text-indigo-400 font-bold">{dnsheAccounts.length}</span> |
                   托管域名: <span className="text-emerald-400 font-bold">{domains.length}</span> 个
                 </div>
+                <button
+                  onClick={handleSyncDnsheDomains}
+                  disabled={dnsheAccounts.length === 0 || actionLoading === "sync"}
+                  className="px-4 py-2 sm:py-1.5 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-500 border border-blue-500 rounded-lg transition-all flex items-center gap-1.5 whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed ml-auto sm:ml-0"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${actionLoading === "sync" ? "animate-spin" : ""}`} />
+                  同步域名
+                </button>
                 {domains.length > 0 && (
                   <button
                     onClick={toggleAllAccounts}
@@ -8799,7 +8932,7 @@ export default function App() {
                 <p className="text-content-muted text-sm mt-1 max-w-md mx-auto">
                   {selectedAccountFilter !== "all" 
                     ? "当前选中账号下没有绑定任何域名。"
-                    : "尚未绑定账号或本地缓存中没有域名。请前往「账号管理」添加 API 密钥，然后点击「同步所有账号」。"}
+                    : "尚未绑定账号或本地缓存中没有域名。请前往「账号管理」添加 API 密钥，然后点击本页右上角「同步域名」。"}
                 </p>
               </div>
             ) : (
@@ -8808,8 +8941,6 @@ export default function App() {
                   const defaultDomains = group.domains.filter(checkHasDns);
                   const externalDomains = group.domains.filter((d) => !checkHasDns(d));
 
-                  const showDefault = nsTypeFilter === "all" || nsTypeFilter === "default";
-                  const showExternal = nsTypeFilter === "all" || nsTypeFilter === "external";
                   const isCollapsed = collapsedAccounts.has(group.accountId);
 
                   return (
@@ -8877,7 +9008,7 @@ export default function App() {
                       {!isCollapsed && (
                       <>
                       {/* 子分块 1：系统默认 DNS 域名 */}
-                      {showDefault && defaultDomains.length > 0 && (
+                      {defaultDomains.length > 0 && (
                         <div className="space-y-3">
                           <div className="flex items-center flex-wrap gap-x-2 gap-y-1 text-sm font-bold text-content-secondary">
                             <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 inline-block shrink-0" />
@@ -8891,7 +9022,7 @@ export default function App() {
                       )}
 
                       {/* 子分块 2：外部 DNS 委派域名 */}
-                      {showExternal && externalDomains.length > 0 && (
+                      {externalDomains.length > 0 && (
                         <div className="space-y-3 pt-2">
                           <div className="flex items-center flex-wrap gap-x-2 gap-y-1 text-sm font-bold text-content-secondary">
                             <span className="w-2.5 h-2.5 rounded-full bg-sky-400 inline-block shrink-0" />
@@ -8949,14 +9080,10 @@ export default function App() {
                 <button
                   onClick={handleCfSyncZones}
                   disabled={cfAccountList.length === 0 || actionLoading === "cf-sync"}
-                  className="px-4 py-2 sm:py-1.5 text-xs font-semibold text-content-secondary hover:text-content-primary bg-elevated hover:bg-hovered border border-border-base rounded-lg transition-all flex items-center gap-1.5 whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="px-4 py-2 sm:py-1.5 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-500 border border-blue-500 rounded-lg transition-all flex items-center gap-1.5 whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed"
                 >
-                  {actionLoading === "cf-sync" ? (
-                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                  ) : (
-                    <RefreshCw className="w-3.5 h-3.5" />
-                  )}
-                  同步 zones
+                  <RefreshCw className={`w-3.5 h-3.5 ${actionLoading === "cf-sync" ? "animate-spin" : ""}`} />
+                  同步域名
                 </button>
                 {cfZones.length > 0 && (
                   <button
@@ -9107,7 +9234,7 @@ export default function App() {
                 <button
                   onClick={handleDpSyncDomains}
                   disabled={dpAccountList.length === 0 || actionLoading === "dp-sync"}
-                  className="px-4 py-2 sm:py-1.5 text-xs font-semibold text-content-secondary hover:text-content-primary bg-elevated hover:bg-hovered border border-border-base rounded-lg transition-all flex items-center gap-1.5 whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="px-4 py-2 sm:py-1.5 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-500 border border-blue-500 rounded-lg transition-all flex items-center gap-1.5 whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   <RefreshCw className={`w-3.5 h-3.5 ${actionLoading === "dp-sync" ? "animate-spin" : ""}`} />
                   同步域名
@@ -13964,7 +14091,7 @@ export default function App() {
                           onClick={async () => {
                             await handleDeleteDnsRecord(rec.id ?? rec.record_id!, nsModalDomain);
                             handleOpenNsModal(nsModalDomain);
-                            handleSyncDomains();
+                            handleSyncDnsheDomains();
                           }}
                           disabled={actionLoading === `delete-dns-${rec.id ?? rec.record_id}`}
                           className="text-red-600 hover:text-red-700 p-2 md:p-1 hover:bg-red-50 dark:text-red-400 dark:hover:text-red-300 dark:hover:bg-red-950/40 rounded transition-all"

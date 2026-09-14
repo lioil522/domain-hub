@@ -5099,11 +5099,14 @@ export default function App() {
     }
   };
 
-  // 手动触发全量同步（复用后端 /api/domains/sync，它会同步包括 Cloudflare 在内的所有账号）
+  // 手动同步 Cloudflare 账号的 zone 列表
+  //
+  // NOTE: 走 provider 级接口而不是 /api/domains/sync —— 后者是全量同步所有账号，
+  // 在 CF 页点它会连带同步 DNSHE / DP，语义不符且容易撞免费计划的 50 次子请求上限。
   const handleCfSyncZones = async () => {
     setActionLoading("cf-sync");
     try {
-      const res = await apiFetch("/api/domains/sync", {
+      const res = await apiFetch("/api/providers/cloudflare/sync", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({})
@@ -5875,11 +5878,14 @@ export default function App() {
     }
   };
 
-  // 手动触发全量同步（复用后端 /api/domains/sync，它会同步包括 DigitalPlat 在内的所有账号）
+  // 手动同步 DigitalPlat 账号的域名列表
+  //
+  // NOTE: 走 provider 级接口而不是 /api/domains/sync —— 后者是全量同步所有账号，
+  // 在 DP 页点它会连带同步 DNSHE / CF，语义不符。
   const handleDpSyncDomains = async () => {
     setActionLoading("dp-sync");
     try {
-      const res = await apiFetch("/api/domains/sync", {
+      const res = await apiFetch("/api/providers/digitalplat/sync", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({})

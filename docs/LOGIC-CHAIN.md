@@ -514,6 +514,20 @@ import.meta.env.VITE_API_BASE_URL        ← 构建期烘焙
 
 **契约意义**：`successRes` 的扁平化让前端不用区分"顶层字段"和"嵌套字段"，但反过来说**新增接口必须走这两个封装**，否则前端取值失配。
 
+### 6.3.1 三个同步入口的语义边界
+
+手动同步有三条路径，**粒度不同，别混用**：
+
+| 接口 | 粒度 | 前端入口 | 日志措辞 |
+|---|---|---|---|
+| `POST /api/domains/sync` | **全量**（所有账号 + 续期 + 通知） | DNSHE 域名页「同步所有账号」 | 定时任务那套措辞 |
+| `POST /api/providers/:provider/sync` | **单服务商**（该 provider 全部账号） | CF 页 / DP 页的同步按钮 | `手动同步：…` |
+| `POST /api/accounts/:id/sync` | **单账号** | 账号行的同步图标 | `手动同步：…` |
+
+**`/api/providers/:provider/sync` 是后补的**。在此之前 CF 页与 DP 页的同步按钮都调 `/api/domains/sync`（全量），与按钮所在页面的语义不符 —— 用户在 CF 页点同步却连带同步了 DNSHE / DP，且在免费计划下更容易撞 50 次子请求上限。`provider` 走白名单校验（`dnshe` / `cloudflare` / `digitalplat`），`custom` 明确返回「无需同步」而非静默成功。
+
+**⚠️ 后台同步必须写 `writeLog`**：`resyncAccountsInBackground` 原先只有 `console.log`，而 console 在 Workers 里进的是实时日志（wrangler tail / 仪表盘），**不落 D1 的 `logs` 表** —— 结果是面板日志页看不到任何手动同步痕迹，用户以为没跑。cron 那条路径每步都有 `writeLog`，所以只有定时任务有日志。这个差异是缺陷，已修。
+
 ### 6.4 跨源搜索与跳转
 
 ```

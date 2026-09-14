@@ -163,20 +163,47 @@ async function deepSyncAccountDomains(dbManager: DatabaseManager, accountId: num
   return subdomains.length;
 }
 
-// NOTE: 账号绑定/换 Key 后逐个账号深度同步域名，并刷新该账号的配额缓存
-//       （间隔 1.2s 规避 DNSHE 速率限制）
-async function resyncAccountsInBackground(dbManager: DatabaseManager, accountIds: number[]) {
+/**
+ * 账号绑定 / 换 Key / 手动同步 后逐个账号深度同步域名，并刷新该账号的配额缓存
+ *
+ * NOTE: 间隔 1.2s 规避 DNSHE 速率限制。
+ *
+ * WHY 每一处都要 writeLog：这里原先只有 console.log，而 console 在 Workers 里进的是
+ * 实时日志（wrangler tail / 仪表盘），**不落 D1 的 logs 表** —— 结果就是面板的「日志」
+ * 页看不到手动单账号同步的任何痕迹，用户以为同步没跑。定时任务那条路径（cron.ts）每步
+ * 都有 writeLog，所以只有它有日志，这个差异是缺陷而不是设计。
+ *
+ * @param trigger 触发来源，仅用于日志措辞（"manual"=用户手动点同步 / "auto"=绑定后自动）
+ */
+async function resyncAccountsInBackground(
+  dbManager: DatabaseManager,
+  accountIds: number[],
+  trigger: "manual" | "auto" = "auto"
+) {
+  const triggerLabel = trigger === "manual" ? "手动同步" : "后台同步";
   for (const id of accountIds) {
+    // 先取别名用于日志；取不到就用 id 兜底（账号可能已被删除）
+    let aliasForLog = `账号 ${id}`;
     try {
       const { client, alias, provider } = await dbManager.getClientForAccount(id);
+      aliasForLog = alias || aliasForLog;
+
       // custom 分组无上游 API，不刷配额、不同步域名（手动域名已在 custom_domains 表）
       if (provider === "custom") {
-        console.log(`Custom group account ${id} (${alias}) has no upstream, skip sync`);
+        await dbManager.writeLog(
+          "info",
+          "sync",
+          `${triggerLabel}：账号 [${alias}] 是自定义分组，无上游接口，跳过同步`
+        );
         continue;
       }
+
+      await dbManager.writeLog("info", "sync", `${triggerLabel}：开始同步账号 [${alias}]`);
+
       // 先刷配额缓存再同步域名：前端是以「该账号的域名已落库」作为后台任务完成的信号，
       // 放在后面做会让配额缓存慢于这个信号，用户切到配额页仍是旧数据
       await dbManager.refreshAccountQuotaCache(id, alias, provider);
+
       const synced = client instanceof CloudflareClient
         ? await syncCloudflareZones(dbManager, id, client)
         : client instanceof DigitalPlatClient
@@ -184,8 +211,25 @@ async function resyncAccountsInBackground(dbManager: DatabaseManager, accountIds
           : client instanceof DNSHEClient
             ? await deepSyncAccountDomains(dbManager, id, client)
             : 0;
+
+      // 按 provider 给出可读的完成措辞 —— zone 和「域名」是两种不同的东西，不该混称
+      const unit = client instanceof CloudflareClient ? "个 zone" : "个域名";
+      await dbManager.writeLog(
+        "success",
+        "sync",
+        `${triggerLabel}：账号 [${alias}] 同步完成，共 ${synced} ${unit}`
+      );
       console.log(`Deep sync finished for account ${id}: ${synced} domains`);
     } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : "未知错误";
+      const stack = e instanceof Error ? (e.stack || message) : message;
+      // 失败必须落库 —— 这正是原先只 console.error 时用户完全看不到的那类信息
+      await dbManager.writeLog(
+        "error",
+        "sync",
+        `${triggerLabel}：账号 [${aliasForLog}] 同步失败：${message}`,
+        stack
+      );
       console.error(`Background account resync failed for account ${id}:`, e);
     }
     await sleep(1200);
@@ -1471,8 +1515,55 @@ app.post("/api/accounts/:id/sync", async (c) => {
     if (provider === "custom") {
       return c.json(successRes({ message: "自定义分组无需同步（手动管理域名）" }));
     }
-    c.executionCtx.waitUntil(resyncAccountsInBackground(dbManager, [accountId]));
+    c.executionCtx.waitUntil(resyncAccountsInBackground(dbManager, [accountId], "manual"));
     return c.json(successRes({ message: "该账号的域名同步已在后台启动，请稍后刷新" }));
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "未知错误";
+    return c.json(errorRes(message), 500);
+  }
+});
+
+/**
+ * 2.2 按服务商同步：只同步指定 provider 下的全部账号
+ *
+ * WHY 需要这个接口：CF / DP 页面上的「同步」按钮原先都调 /api/domains/sync（全量同步
+ * 所有账号），与按钮所在页面的语义不符 —— 用户在 CF 页点同步，期望的是「只刷 CF」。
+ * 全量同步在免费计划下还容易撞 50 次子请求上限，把本来只需 1~2 次子请求的操作放大成
+ * 一次高危操作。
+ *
+ * NOTE: provider 必须走白名单校验 —— 这个值会参与账号筛选，虽然 getAccounts(provider)
+ * 走的是绑定参数不会注入，但放任意字符串进来会让接口语义变得不可预期（比如传 "custom"
+ * 应当被明确拒绝，而不是静默同步 0 个账号后回一句「已启动」）。
+ */
+const SYNCABLE_PROVIDERS = ["dnshe", "cloudflare", "digitalplat"] as const;
+
+app.post("/api/providers/:provider/sync", async (c) => {
+  const dbManager = c.get("db");
+  const provider = String(c.req.param("provider") || "").trim().toLowerCase();
+
+  if (provider === "custom") {
+    return c.json(successRes({ message: "自定义分组无需同步（手动管理域名）" }));
+  }
+  if (!(SYNCABLE_PROVIDERS as readonly string[]).includes(provider)) {
+    return c.json(
+      errorRes(`不支持的服务商类型：${provider}（可选：${SYNCABLE_PROVIDERS.join(" / ")}）`, "bad_provider"),
+      400
+    );
+  }
+
+  try {
+    const accounts = await dbManager.getAccounts(provider as (typeof SYNCABLE_PROVIDERS)[number]);
+    if (accounts.length === 0) {
+      return c.json(successRes({ message: `没有绑定任何 ${provider} 账号，无需同步` }));
+    }
+    const ids = accounts.map((a) => a.id);
+    c.executionCtx.waitUntil(resyncAccountsInBackground(dbManager, ids, "manual"));
+    return c.json(
+      successRes({
+        message: `${provider} 的 ${ids.length} 个账号同步已在后台启动，请稍后刷新`,
+        count: ids.length
+      })
+    );
   } catch (e: unknown) {
     const message = e instanceof Error ? e.message : "未知错误";
     return c.json(errorRes(message), 500);

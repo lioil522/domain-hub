@@ -17,6 +17,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import { DatabaseManager, DATA_EXPORT_VERSION } from "../src/db";
 import type { UpstreamSubdomain } from "../src/db";
+import { pickAccountBatch } from "../src/cron";
 import { createD1FromSqlite } from "./d1-sqlite";
 
 const AES_KEY = "test-only-key-do-not-reuse";
@@ -532,6 +533,72 @@ await it("deleteAccount() 依赖外键级联清掉 domains_cache", async () => {
     (await dbm.getDomains()).some((d) => d.id === 8001),
     "级联误伤了其它账号的域名行"
   );
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 账号分批轮转（pickAccountBatch）
+//
+// 这是「解决账号饿死」的核心逻辑：免费计划单次调用 50 次子请求，一条 for 走到底时
+// 谁先吃光配额谁 break，后面的账号永远轮不到。分批 + 环状游标让每个账号都有机会。
+// 纯函数，直接在内存构造账号列表验证，不需要数据库。
+// ─────────────────────────────────────────────────────────────────────────────
+
+const mkAccounts = (ids: number[]) => ids.map((id) => ({ id, alias: `账号${id}` }));
+
+await it("pickAccountBatch() 首次运行（游标为 0）从第一个账号开始取 N 个", () => {
+  const accs = mkAccounts([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+  const { batch, nextCursor } = pickAccountBatch(accs, { lastId: 0, rounds: 0 }, 5);
+  assert.deepEqual(batch.map((a) => a.id), [1, 2, 3, 4, 5], "首轮应取前 5 个");
+  assert.equal(nextCursor.lastId, 5, "游标应停在第 5 个账号");
+});
+
+await it("pickAccountBatch() 第二轮紧接上轮末尾，不重复也不跳过", () => {
+  const accs = mkAccounts([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+  const { batch } = pickAccountBatch(accs, { lastId: 5, rounds: 0 }, 5);
+  assert.deepEqual(batch.map((a) => a.id), [6, 7, 8, 9, 10], "第二轮应取后 5 个");
+});
+
+await it("pickAccountBatch() 环回：到末尾后回绕到开头继续", () => {
+  const accs = mkAccounts([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+  // 游标停在最后一个账号 → 下一轮应从第 1 个重新开始
+  const { batch, nextCursor } = pickAccountBatch(accs, { lastId: 10, rounds: 0 }, 5);
+  assert.deepEqual(batch.map((a) => a.id), [1, 2, 3, 4, 5], "环回应回到开头");
+  assert.equal(nextCursor.rounds, 1, "完成一圈应累加轮次计数");
+});
+
+await it("pickAccountBatch() 账号数少于批大小时全部返回", () => {
+  const accs = mkAccounts([1, 2, 3]);
+  const { batch } = pickAccountBatch(accs, { lastId: 0, rounds: 0 }, 5);
+  assert.deepEqual(batch.map((a) => a.id), [1, 2, 3], "账号不足 N 个时应全部返回");
+  assert.equal(batch.length, 3);
+});
+
+await it("pickAccountBatch() 空账号列表不崩、游标保持原值", () => {
+  const { batch, nextCursor } = pickAccountBatch([], { lastId: 7, rounds: 2 }, 5);
+  assert.equal(batch.length, 0);
+  assert.equal(nextCursor.lastId, 7, "空列表时游标不应被改写");
+  assert.equal(nextCursor.rounds, 2);
+});
+
+await it("pickAccountBatch() 游标指向已删除的账号时不卡死，从后继继续", () => {
+  // 场景：账号 5 被用户删了，但游标还停在 5 —— 必须能正确找到 6 而不是死循环
+  const accs = mkAccounts([1, 2, 3, 6, 7, 8]);
+  const { batch } = pickAccountBatch(accs, { lastId: 5, rounds: 0 }, 3);
+  assert.deepEqual(batch.map((a) => a.id), [6, 7, 8], "应跳过不存在的 5 号，从 6 号继续");
+});
+
+await it("pickAccountBatch() 连续多轮必须覆盖全部账号（无遗漏）", () => {
+  // 这是「饿死」问题是否真正解决的核心断言：轮转足够多轮后，每个账号都应被覆盖过。
+  const accs = mkAccounts([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+  const seen = new Set<number>();
+  let cursor = { lastId: 0, rounds: 0 };
+  // 账号 12 个 / N=5 → 理论上 3 轮（取 15 个位置）必定覆盖全部 12 个
+  for (let i = 0; i < 3; i++) {
+    const r = pickAccountBatch(accs, cursor, 5);
+    for (const a of r.batch) seen.add(a.id);
+    cursor = r.nextCursor;
+  }
+  assert.equal(seen.size, 12, `轮转 3 轮后应覆盖全部 12 个账号，实际只覆盖了 ${seen.size} 个`);
 });
 
 sqlite.close();

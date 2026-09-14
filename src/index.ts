@@ -8,7 +8,16 @@ import type { CreateDnsRecordParams, UpdateDnsRecordParams } from "./dnshe";
 import { CloudflareClient, mapZoneToUpstream } from "./cloudflare";
 import type { CfZoneInfo } from "./cloudflare";
 import { DigitalPlatClient, mapDomainToUpstream } from "./digitalplat";
-import { runDailySyncAndRenewal, fetchAllSubdomainsFromClient, sendTelegramNotification, sendWebhookNotification } from "./cron";
+import {
+  runDailySyncAndRenewal,
+  fetchAllSubdomainsFromClient,
+  sendTelegramNotification,
+  sendWebhookNotification,
+  cfZoneCursorKey,
+  readCfZoneCursor,
+  CF_ZONE_CURSOR_TTL,
+  CF_ZONE_ROUNDS_PER_RUN
+} from "./cron";
 import type { WebhookType } from "./cron";
 // NOTE: 同一模块既要把 isRegistrableDomain 转出给外部（见下方 export ... from），
 // 又要在本文件内直接调用它 —— `export { x } from` 只做转出、不建立本地绑定，
@@ -49,21 +58,59 @@ type Bindings = {
   DEFAULT_API_ALIAS?: string;
 };
 
-// NOTE: 深度同步 Cloudflare 账号的 zone 列表。zones 拉取成功即视为权威结论——
-// 上游删掉的 zone 会由 syncAccountDomains 的差集清理逻辑移除，包括 0 个 zone 的情况。
-// zone → 上游行 的映射复用 cloudflare.ts 的 mapZoneToUpstream。
+// NOTE: 深度同步单个 Cloudflare 账号的 zone 列表。
+//
+// WHY 改成「分片续拉 + 游标」而不是一次拉到底：
+// 原先这里是 `for (let page = 1; page <= 50; )` 一路拉完，最多 50 页 = 50 次子请求 ——
+// 正好等于免费计划单次调用的硬限。一个 2500 zone 的大账号光列表就能吃光整份配额，
+// 且失败后**没有游标**，下次点击还得从第 1 页重来，永远拉不完（每次都倒在半路）。
+//
+// 现在改为「单次预算 CF_ZONE_ROUNDS_PER_RUN 页」，未拉完就写游标返回，界面提示
+// 「还有 N 页待续拉」，用户再点一次即从断点继续。这样：
+//   - 小账号（≤50 zone，占绝大多数）：一页拉完，hasMore=false 走权威全量 + 差集清理，
+//     行为与以前完全一致，零感知；
+//   - 大账号：分多次点按逐步推进，每次都能落地一部分，不会白跑。
+//
+// ⚠️ 游标 key 与 cron.ts 的 cfZoneCursorKey 共用同一个 —— 两处操作同一个账号时必须
+// 看到同一份进度，否则手动同步拉了一半、定时任务又从第 1 页重拉，互相覆盖白费配额。
 async function syncCloudflareZones(dbManager: DatabaseManager, accountId: number, client: CloudflareClient): Promise<number> {
-  // NOTE: 手动/绑定后的深度同步走「一页一页续拉到拉完」的循环，不做单次调用的页数预算
-  // 限制 —— 这里由用户显式触发且只针对一个账号，拉全才有意义（唯一一次的差集删除也靠
-  // 这里的完整列表）。若中途子请求耗尽，抛错上抛，已落库的分片仍然保留。
+  const cursorKey = cfZoneCursorKey(accountId);
+  const cursor = await readCfZoneCursor(dbManager, cursorKey);
+
   const zones: CfZoneInfo[] = [];
-  for (let page = 1; page <= 50; ) {
+  let completed = false;
+  for (let page = cursor.startPage, round = 0; round < CF_ZONE_ROUNDS_PER_RUN; round++) {
     const res = await client.listZones({ startPage: page, maxPages: 1 });
     zones.push(...res.zones);
-    if (!res.hasMore) break;
+    if (!res.hasMore) {
+      completed = true;
+      break;
+    }
+    // 本页满员且预算用尽 —— 先把这半截落库（只增不删），游标记下进度
+    if (round === CF_ZONE_ROUNDS_PER_RUN - 1) {
+      await dbManager.upsertAccountDomains(accountId, zones.map(mapZoneToUpstream));
+      await dbManager.setCache(
+        cursorKey,
+        JSON.stringify({ startPage: res.nextPage, syncedBefore: cursor.syncedBefore + zones.length }),
+        CF_ZONE_CURSOR_TTL
+      );
+      throw new Error(
+        `该账号 zone 数量较多，本次已同步 ${zones.length} 个（共约 ${cursor.syncedBefore + zones.length} 个以上），` +
+          `剩余部分请再次点击「同步」继续拉取`
+      );
+    }
     page = res.nextPage;
   }
+
+  // 拉完最后一页才算拿到权威全量 —— 只有此时才能安全地做差集删除
+  // （清理上游已删的 zone，包括 0 个 zone 的情况）
   await dbManager.syncAccountDomains(accountId, zones.map(mapZoneToUpstream));
+  if (completed) {
+    // 用同步前的计数 + 本次拉到的数量作为总数（游标周期内累计）
+    const total = cursor.syncedBefore + zones.length;
+    await dbManager.setCache(cursorKey, "", 1); // 游标归零，下次从第 1 页重新核对
+    return total;
+  }
   return zones.length;
 }
 

@@ -46,9 +46,24 @@ import {
   CalendarDays,
   Folder,
   DatabaseBackup,
-  Upload
+  Upload,
+  Palette
 } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import { toASCII, hasNonASCII, toUnicode } from "./punycode";
+import { NavItem, NavSubItem, type NavSource } from "./components/NavItem";
+import { Badge, type BadgeTone, type BadgeSource } from "./components/Badge";
+import { Button } from "./components/Button";
+import { DomainTimeline } from "./components/DomainTimeline";
+import { ThemePicker } from "./components/ThemePicker";
+import {
+  applyThemeAttribute,
+  readStoredTheme,
+  DEFAULT_THEME,
+  THEME_STORAGE_KEY,
+  THEME_LABELS,
+  type ThemeId
+} from "./theme";
 import {
   loadWordBanks,
   saveWordBanks,
@@ -987,6 +1002,15 @@ export default function App() {
   const [theme, setTheme] = useState<"light" | "dark">(
     () => (localStorage.getItem("DNSHE_THEME") as "light" | "dark") || "dark"
   );
+  /*
+   * 配色主题 —— 与 theme（明暗）正交的第二维度。
+   * NOTE: 初值必须与 theme-init.js 的判定保持一致，否则首帧会出现
+   * 「脚本设了 A、React 首渲染又改回 B」的闪色。两处都读同一个
+   * DNSHE_COLOR_THEME 键、同一个 DEFAULT_THEME 回落值。
+   */
+  const [colorTheme, setColorTheme] = useState<ThemeId>(() =>
+    typeof window === "undefined" ? DEFAULT_THEME : readStoredTheme()
+  );
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(
     () => localStorage.getItem("DNSHE_SIDEBAR_COLLAPSED") === "1"
   );
@@ -1072,6 +1096,18 @@ export default function App() {
     document.documentElement.classList.toggle("dark", theme === "dark");
     localStorage.setItem("DNSHE_THEME", theme);
   }, [theme]);
+
+  // 同步配色主题到 <html data-theme> 并持久化
+  // NOTE: 与上面的明暗 effect 刻意分开 —— 两个维度独立变化，
+  // 合成一个 effect 会让「只改配色」也重写 DNSHE_THEME，逻辑上说不通。
+  useEffect(() => {
+    applyThemeAttribute(colorTheme);
+    try {
+      localStorage.setItem(THEME_STORAGE_KEY, colorTheme);
+    } catch {
+      /* 隐私模式下写入会抛异常，不影响本次会话内的主题切换 */
+    }
+  }, [colorTheme]);
 
   // 持久化侧栏折叠
   useEffect(() => {
@@ -2251,6 +2287,61 @@ export default function App() {
     return Number.isNaN(new Date(s).getTime());
   };
 
+  /**
+   * 到期剩余天数 → 徽章语义与文案。
+   *
+   * WHY 抽成 helper：这段「永久 / 已过期 / 30 天内告警 / 正常」四分支判断
+   * 原先在自定义域名面板里被复制了两份（未归属账号域名、账号下域名），
+   * 两份各带一套硬编码明暗配色 —— 改阈值或改配色时必须同步两处，必然改漏。
+   * 现在文案与 tone 一起产出，配色交给 Badge 的令牌层。
+   */
+  const expiryBadge = (expiresAt?: string | null, daysLeftRaw?: number) => {
+    const daysLeft = typeof daysLeftRaw === "number" && Number.isFinite(daysLeftRaw) ? daysLeftRaw : 0;
+    const permanent = isPermanentExpiry(expiresAt);
+    const expired = !permanent && daysLeft < 0;
+    // 阈值 30 天与后端 renew_threshold_days / 概览页 EXPIRY_WARN_DAYS 同档
+    const warning = !permanent && !expired && daysLeft <= 30;
+    // 永久域名用 info（蓝）而非 ok（绿）：它没有到期日，
+    // 不该被读成「刚续过的健康状态」。
+    const tone: BadgeTone = permanent
+      ? "info"
+      : expired
+        ? "danger"
+        : warning
+          ? "warn"
+          : "ok";
+    const text = permanent
+      ? "永久"
+      : expired
+        ? `已过期 ${Math.ceil(-daysLeft)} 天`
+        : `剩 ${Math.ceil(daysLeft)} 天`;
+    return { tone, text, permanent, expired, warning };
+  };
+
+  /**
+   * 服务商名称 → 来源色徽章。
+   *
+   * WHY：概览页「最近注册」「到期预警」两张表原先各自手写了一套四分支的
+   * `d.source === "DNSHE" ? "bg-indigo-50 ..." : ...`，两套配色还不完全一致
+   * （一张表的兜底是 emerald，另一张是 slate），同一个域名在两处会显示成
+   * 不同颜色。收敛到这里后，来源色由 Badge 的 source 令牌统一决定。
+   *
+   * 未识别的来源（后端新增服务商但前端未同步）退回 idle 中性色，
+   * 而不是崩掉或渲染成 undefined class。
+   */
+  const DomainSourceBadge = ({ source }: { source: string }) => {
+    const map: Record<string, BadgeSource> = {
+      DNSHE: "dnshe",
+      Cloudflare: "cloudflare",
+      DigitalPlat: "digitalplat",
+      "自定义": "custom"
+    };
+    const key = map[source];
+    return key
+      ? <Badge source={key} size="sm" className="flex-shrink-0">{source}</Badge>
+      : <Badge tone="idle" size="sm" className="flex-shrink-0">{source}</Badge>;
+  };
+
   // 转为 <input type="date"> 所需的 YYYY-MM-DD；无法解析（“永久”/“未记录”/空）时返回空串
   const toDateInputValue = (dateStr?: string | null) => {
     if (!dateStr) return "";
@@ -2312,6 +2403,7 @@ export default function App() {
   };
 
   // 渲染域名三态徽章：未解析 / 已解析 / 已委派
+  // 三态语义 → Badge tone 映射：委派=info / 已解析=ok / 未解析=idle
   const renderStatusBadge = (dom: Domain) => {
     let statusText = dom.status;
     const isDelegated = Number(dom.has_dns) === 0 || dom.status === "已委派";
@@ -2324,25 +2416,10 @@ export default function App() {
       statusText = "未解析";
     }
 
-    if (statusText === "已委派") {
-      return (
-        <span className="text-xs px-2.5 py-0.5 rounded-full font-semibold bg-sky-50 text-sky-700 border border-sky-200 dark:bg-sky-950/80 dark:text-sky-300 dark:border-sky-800/60">
-          已委派
-        </span>
-      );
-    }
-    if (statusText === "已解析") {
-      return (
-        <span className="text-xs px-2.5 py-0.5 rounded-full font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200 dark:bg-emerald-950/80 dark:text-emerald-400 dark:border-emerald-900/60">
-          已解析
-        </span>
-      );
-    }
-    return (
-      <span className="text-xs px-2.5 py-0.5 rounded-full font-semibold bg-elevated text-content-muted border border-border-base">
-        未解析
-      </span>
-    );
+    const tone: BadgeTone =
+      statusText === "已委派" ? "info" : statusText === "已解析" ? "ok" : "idle";
+
+    return <Badge tone={tone}>{statusText}</Badge>;
   };
 
   // 渲染单个域名卡片
@@ -2429,46 +2506,56 @@ export default function App() {
         )}
 
         <div className="flex items-center gap-3 ml-auto flex-shrink-0">
-          <button
+          {/* NOTE: 禁用理由必须让读屏用户也能拿到 —— 默认系统会为 disabled 按钮
+              跳过 aria-label，所以把解释放在 title 上，同时给出可访问名称。 */}
+          <Button
+            variant="secondary"
+            size="xs"
+            icon={<Settings className="w-3.5 h-3.5" aria-hidden="true" />}
             onClick={() => handleOpenDnsModal(dom)}
             disabled={!checkHasDns(dom)}
-            className={`text-xs font-semibold px-4 py-2 rounded-lg flex items-center gap-1.5 transition-all shadow-inner ${
-              checkHasDns(dom)
-                ? "bg-elevated hover:bg-hovered text-content-secondary cursor-pointer"
-                : "bg-elevated text-content-muted opacity-50 cursor-not-allowed"
-            }`}
+            title={checkHasDns(dom) ? `管理 ${dom.full_domain} 的 DNS 解析` : "该域名未托管在当前系统，无 DNS 记录可管理"}
+            aria-label={checkHasDns(dom) ? `管理 ${dom.full_domain} 的 DNS 解析` : "该域名未托管在当前系统，无 DNS 记录可管理"}
           >
-            <Settings className={`w-3.5 h-3.5 ${checkHasDns(dom) ? "text-content-muted" : "text-content-muted"}`} /> DNS
-          </button>
+            DNS
+          </Button>
 
         <div className="relative">
-          <button
+          <Button
+            variant="ghost"
+            size="sm"
+            iconOnly
+            icon={<MoreVertical className="w-4 h-4" aria-hidden="true" />}
+            aria-label={`${dom.full_domain} 的更多操作`}
+            aria-haspopup="menu"
+            aria-expanded={openActionMenuId === dom.id}
+            title="更多操作"
             onClick={(e) => {
               e.stopPropagation();
               setOpenActionMenuId(openActionMenuId === dom.id ? null : dom.id);
             }}
-            className="p-2 hover:bg-hovered text-content-muted hover:text-content-primary rounded-lg transition-colors"
-          >
-            <MoreVertical className="w-4 h-4" />
-          </button>
+          />
 
           {/* 三点下拉操作菜单 */}
           {openActionMenuId === dom.id && (
             <div 
               onClick={(e) => e.stopPropagation()}
+              role="menu"
               className="absolute right-0 bottom-10 z-30 w-40 bg-elevated border border-border-base rounded-xl shadow-2xl overflow-hidden text-xs py-1 animate-in fade-in zoom-in-95"
             >
               <button
+                role="menuitem"
                 onClick={() => {
                   setOpenActionMenuId(null);
                   handleOpenNsModal(dom);
                 }}
                 className="w-full text-left px-3.5 py-2.5 hover:bg-hovered text-content-secondary hover:text-content-primary flex items-center gap-2"
               >
-                <Server className="w-3.5 h-3.5 text-content-muted" /> 修改 NS 记录
+                <Server className="w-3.5 h-3.5 text-content-muted" aria-hidden="true" /> 修改 NS 记录
               </button>
               
               <button
+                role="menuitem"
                 onClick={() => {
                   setOpenActionMenuId(null);
                   handleRenewDomain(dom);
@@ -2476,18 +2563,19 @@ export default function App() {
                 disabled={actionLoading === `renew-${dom.id}`}
                 className="w-full text-left px-3.5 py-2.5 hover:bg-hovered text-content-secondary hover:text-content-primary flex items-center gap-2 border-t border-border-base"
               >
-                <RefreshCw className={`w-3.5 h-3.5 text-content-muted ${actionLoading === `renew-${dom.id}` ? "animate-spin" : ""}`} />
+                <RefreshCw className={`w-3.5 h-3.5 text-content-muted ${actionLoading === `renew-${dom.id}` ? "animate-spin" : ""}`} aria-hidden="true" />
                 续期域名
               </button>
 
               <button
+                role="menuitem"
                 onClick={() => {
                   setOpenActionMenuId(null);
                   handleOpenDeleteModal(dom);
                 }}
                 className="w-full text-left px-3.5 py-2.5 hover:bg-rose-50 text-rose-600 hover:text-rose-700 dark:hover:bg-rose-950/40 dark:text-rose-400 dark:hover:text-rose-300 flex items-center gap-2 border-t border-border-base"
               >
-                <Trash2 className="w-3.5 h-3.5" /> 删除域名
+                <Trash2 className="w-3.5 h-3.5" aria-hidden="true" /> 删除域名
               </button>
             </div>
           )}
@@ -3843,43 +3931,53 @@ export default function App() {
         />
       ),
       saveButton: (
-        <button
-          onClick={() => handleUpdateDnsRecord(key)}
-          disabled={saving}
-          className="text-emerald-700 hover:text-emerald-800 disabled:opacity-50 p-2 md:p-1 hover:bg-emerald-50 dark:text-emerald-400 dark:hover:text-emerald-300 dark:hover:bg-emerald-950/40 rounded transition-all"
+        <Button
+          variant="ghost"
+          size="xs"
+          iconOnly
+          icon={<Save className="w-4 h-4" aria-hidden="true" />}
+          loading={saving}
+          aria-label={`保存 ${rec.type} 记录 ${rec.name} 的修改`}
           title="保存修改（回车）"
-        >
-          {saving ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
-        </button>
+          onClick={() => handleUpdateDnsRecord(key)}
+        />
       ),
       cancelButton: (
-        <button
-          onClick={() => setEditingDnsKey(null)}
-          className="text-content-muted hover:text-content-primary p-2 md:p-1 hover:bg-hovered rounded transition-all"
+        <Button
+          variant="ghost"
+          size="xs"
+          iconOnly
+          icon={<X className="w-4 h-4" aria-hidden="true" />}
+          aria-label={`取消编辑 ${rec.type} 记录 ${rec.name}`}
           title="取消（Esc）"
-        >
-          <X className="w-4 h-4" />
-        </button>
+          onClick={() => setEditingDnsKey(null)}
+        />
       ),
       // ── 展示态操作 ──
       editButton: (
-        <button
-          onClick={() => handleStartEditDnsRecord(rec)}
-          className="text-indigo-600 hover:text-indigo-700 p-2 md:p-1 hover:bg-indigo-50 dark:text-indigo-400 dark:hover:text-indigo-300 dark:hover:bg-indigo-950/40 rounded transition-all"
+        <Button
+          variant="ghost"
+          size="xs"
+          iconOnly
+          icon={<Pencil className="w-4 h-4" aria-hidden="true" />}
+          aria-label={`修改 ${rec.type} 记录 ${rec.name}`}
           title="修改此记录"
-        >
-          <Pencil className="w-4 h-4" />
-        </button>
+          className="text-state-info-fg hover:bg-state-info-bg"
+          onClick={() => handleStartEditDnsRecord(rec)}
+        />
       ),
       deleteButton: (
-        <button
-          onClick={() => handleDeleteDnsRecord(key)}
-          disabled={actionLoading === `delete-dns-${key}`}
-          className="text-red-600 hover:text-red-700 disabled:opacity-50 p-2 md:p-1 hover:bg-red-50 dark:text-red-400 dark:hover:text-red-300 dark:hover:bg-red-950/40 rounded transition-all"
+        <Button
+          variant="ghost"
+          size="xs"
+          iconOnly
+          icon={<Trash2 className="w-4 h-4" aria-hidden="true" />}
+          loading={actionLoading === `delete-dns-${key}`}
+          aria-label={`删除 ${rec.type} 记录 ${rec.name}`}
           title="删除此记录"
-        >
-          <Trash2 className="w-4 h-4" />
-        </button>
+          className="text-state-danger-fg hover:bg-state-danger-bg"
+          onClick={() => handleDeleteDnsRecord(key)}
+        />
       ),
     };
   };
@@ -4957,10 +5055,28 @@ export default function App() {
     };
   }, [dnsheHighlightDomainId, activeTab]);
 
+  /**
+   * 服务商显示名 → 跨来源跳转的 source 键。
+   *
+   * WHY：时间轴、概览卡片等地方拿到的是**展示用的**服务商名（"DNSHE" /
+   * "Cloudflare" / "DigitalPlat" / "自定义"），而跳转分派用的是短键
+   * （"dnshe" / "cf" / "dp" / "custom"）。中间需要一层显式映射，
+   * 不能靠字符串相等 —— "Cloudflare" 不等于 "cf"。
+   *
+   * 未识别的来源退回 "dnshe" 是**有意为之的降级**：至少切到域名列表页，
+   * 让用户有个可用的落点，而不是点了没反应。
+   */
+  const toJumpSource = (displayName: string): "dnshe" | "cf" | "dp" | "custom" => {
+    const s = displayName.toLowerCase();
+    if (s === "cloudflare" || s === "cf") return "cf";
+    if (s === "digitalplat" || s === "dp") return "dp";
+    if (s === "自定义" || s === "custom") return "custom";
+    return "dnshe";
+  };
+
   // 跨来源搜索跳转：根据来源与完整域名跳到对应标签页并定位高亮。
   // DNSHE/CF/DP 复用已有的 gotoXxx 定位；自定义服务商仅切页（三级结构定位后续再补）。
-  const handleCrossSourceJump = (source: "dnshe" | "cf" | "dp" | "custom", fullDomain: string) => {
-    if (source === "dnshe") {
+  const handleCrossSourceJump = (source: "dnshe" | "cf" | "dp" | "custom", fullDomain: string) => {    if (source === "dnshe") {
       gotoDnsheDomain(fullDomain);
     } else if (source === "cf") {
       gotoCfZone(fullDomain);
@@ -6114,19 +6230,21 @@ export default function App() {
     }
   };
 
-  // DigitalPlat 注册态 → 徽标文案与配色
-  const dpStatusBadge = (status: string) => {
+  // DigitalPlat 注册态 → 徽标文案与语义 tone
+  // pendingdelete 是上游「待删除（7 天后释放）」的宽限期状态，用 danger 而非 warn：
+  // 它不可逆，且用户需要立刻行动（续期或迁移），配色必须最高优先级。
+  const dpStatusBadge = (status: string): { text: string; tone: BadgeTone } => {
     const s = String(status || "").toLowerCase();
     if (s === "ok" || s === "active") {
-      return { text: "正常", cls: "bg-emerald-50 text-emerald-700 border border-emerald-200 dark:bg-emerald-950/80 dark:text-emerald-400 dark:border-emerald-900/60" };
+      return { text: "正常", tone: "ok" };
     }
     if (s.includes("pendingdelete") || s.includes("pending delete")) {
-      return { text: "待删除（7 天后释放）", cls: "bg-red-50 text-red-700 border border-red-200 dark:bg-red-950/80 dark:text-red-300 dark:border-red-900/60" };
+      return { text: "待删除（7 天后释放）", tone: "danger" };
     }
     if (s) {
-      return { text: s, cls: "bg-amber-50 text-amber-700 border border-amber-200 dark:bg-amber-950/80 dark:text-amber-300 dark:border-amber-900/60" };
+      return { text: s, tone: "warn" };
     }
-    return { text: "未知", cls: "bg-slate-100 text-slate-600 border border-slate-200 dark:bg-slate-900/80 dark:text-slate-300 dark:border-slate-800" };
+    return { text: "未知", tone: "idle" };
   };
 
   // DigitalPlat 域名卡片 —— 布局与 renderDomainCard（域名列表页）一致：
@@ -6165,9 +6283,9 @@ export default function App() {
           >
             {unicodeDomain}
           </button>
-          <span className={`text-xs px-2.5 py-0.5 rounded-full font-semibold flex-shrink-0 ${badge.cls}`}>
+          <Badge tone={badge.tone} className="flex-shrink-0">
             {badge.text}
-          </span>
+          </Badge>
         </div>
 
         {/* 中间：注册时间与到期时间 */}
@@ -7225,17 +7343,43 @@ export default function App() {
   };
 
   // 侧栏菜单项定义
-  const navItems: Array<{ key: TabKey; label: string; icon: React.ReactNode; badge?: number }> = [
-    { key: "dashboard", label: "概览", icon: <LayoutDashboard className="w-5 h-5" /> },
-    { key: "domains", label: "DNSHE", icon: <Globe className="w-5 h-5" />, badge: domains.length },
-    { key: "cloudflare", label: "Cloudflare", icon: <Cloud className="w-5 h-5" />, badge: cfZones.length },
-    { key: "digitalplat", label: "DigitalPlat", icon: <Globe className="w-5 h-5" />, badge: dpDomains.length },
-    { key: "custom", label: "自定义", icon: <Folder className="w-5 h-5" />, badge: customDomains.length },
-    { key: "accounts", label: "账号管理", icon: <Key className="w-5 h-5" />, badge: accounts.length },
-    { key: "quota", label: "账户配额", icon: <Database className="w-5 h-5" /> },
-    { key: "logs", label: "运行日志", icon: <ScrollText className="w-5 h-5" /> },
-    { key: "settings", label: "设置", icon: <Settings className="w-5 h-5" /> },
+  //
+  // NOTE: source 用于给服务商类菜单的图标与色带着色，与跨源搜索、
+  // 域名来源徽章共用同一套来源令牌（--source-*）。用户在侧栏建立的
+  // 「紫=DNSHE / 橙=CF / 绿=DP / 琥珀=自定义」认知，可以直接带到域名列表里。
+  // 非服务商菜单（概览/账号/配额/日志/设置）不传 source，走中性色。
+  const navItems: Array<{
+    key: TabKey;
+    label: string;
+    badge?: number;
+    source?: NavSource;
+  }> = [
+    { key: "dashboard", label: "概览" },
+    { key: "domains", label: "DNSHE", badge: domains.length, source: "dnshe" },
+    { key: "cloudflare", label: "Cloudflare", badge: cfZones.length, source: "cloudflare" },
+    { key: "digitalplat", label: "DigitalPlat", badge: dpDomains.length, source: "digitalplat" },
+    { key: "custom", label: "自定义", badge: customDomains.length, source: "custom" },
+    { key: "accounts", label: "账号管理", badge: accounts.length },
+    { key: "quota", label: "账户配额" },
+    { key: "logs", label: "运行日志" },
+    { key: "settings", label: "设置" },
   ];
+
+  // 侧栏图标映射 —— NavItem 接收的是组件本身而非 JSX 元素，
+  // 这样才能把着色 class 直接挂在图标上（元素形式需要在调用处再包一层 span）。
+  // 放在组件外部定义会引入对 lucide 图标的重复导入顺序问题，故置于此处。
+  const NAV_ICONS: Record<TabKey, LucideIcon> = {
+    dashboard: LayoutDashboard,
+    domains: Globe,
+    cloudflare: Cloud,
+    digitalplat: Globe,
+    custom: Folder,
+    accounts: Key,
+    register: Plus,
+    quota: Database,
+    logs: ScrollText,
+    settings: Settings,
+  };
 
   // 通知铃铛数据源：最近的告警/错误日志
   const alertLogs = useMemo(
@@ -7284,15 +7428,20 @@ export default function App() {
    */
   const logRowParts = (log: AppLog) => ({
     time: new Date(log.created_at).toLocaleString("zh-CN"),
+    // NOTE: 原先四种类型硬编码了「深底亮字」的暗色配色，却没有 dark: 变体——
+    // 亮色主题下渲染成近乎全黑的药丸，与页面格格不入。现统一走 Badge 语义色。
     badge: (
-      <span className={`inline-block px-2.5 py-0.5 rounded-full font-bold uppercase text-xs flex-shrink-0 ${
-        log.type === "success" ? "bg-emerald-950 text-emerald-400" :
-        log.type === "error" ? "bg-red-950 text-red-400 animate-pulse" :
-        log.type === "warning" ? "bg-amber-950 text-amber-400" :
-        "bg-elevated text-content-secondary"
-      }`}>
+      <Badge
+        tone={
+          log.type === "success" ? "ok"
+          : log.type === "error" ? "danger"
+          : log.type === "warning" ? "warn"
+          : "idle"
+        }
+        className="uppercase flex-shrink-0"
+      >
         {log.type}
-      </span>
+      </Badge>
     ),
     details: log.details ? (
       <pre className="mt-2 p-2.5 rounded bg-elevated text-content-muted text-[11px] md:text-xs font-mono max-h-40 overflow-auto whitespace-pre-wrap break-all">
@@ -7411,6 +7560,77 @@ export default function App() {
       .filter((x) => x.expired || x.daysLeft <= EXPIRY_WARN_DAYS)
       .sort((a, b) => a.daysLeft - b.daysLeft);
 
+    /**
+     * 未来 12 个月到期分布（时间轴数据源）。
+     *
+     * WHY 单独算而不是复用 expiryByKey：预警列表只保留「90 天内或已过期」这一个
+     * 紧急维度，是**筛选后的**子集；时间轴要回答的是「未来一年的续费压力长什么样」，
+     * 需要完整分布。两者的筛选口径不同，共用一张表会让「第 7 个月有 3 个到期」
+     * 这类信息被静默丢掉。
+     *
+     * 分桶口径：
+     * - 以「本月」为第 0 桶，往后共 12 桶（本月含今天之前的日子，所以本桶可能混有
+     *   刚过期的域名，用 expired 计数单独标出，不混淆）。
+     * - 已过期（daysLeft < 0）单独归入 overdue，不占月桶 —— 否则它们会全部挤在
+     *   第 0 桶里，把「本月真实待续」的数量淹掉。
+     * - 永久域名（无到期日 / 0000 占位）单独归入 permanent，同样不进月桶。
+     */
+    const timelineStart = new Date();
+    timelineStart.setHours(0, 0, 0, 0);
+    timelineStart.setDate(1); // 对齐到本月 1 日
+    const monthKeyOf = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+
+    const buckets: Array<{
+      key: string;
+      label: string;
+      year: number;
+      month: number; // 1-12
+      isCurrent: boolean;
+      items: Array<{ full_domain: string; source: string; alias: string; daysLeft: number; day: number }>;
+    }> = [];
+    for (let i = 0; i < 12; i++) {
+      const d = new Date(timelineStart.getFullYear(), timelineStart.getMonth() + i, 1);
+      buckets.push({
+        key: monthKeyOf(d),
+        // 跨年时补上年份，避免 12 月与次年 1 月看起来一样
+        label: `${d.getMonth() + 1}月`,
+        year: d.getFullYear(),
+        month: d.getMonth() + 1,
+        isCurrent: i === 0,
+        items: []
+      });
+    }
+    const bucketByKey = new Map(buckets.map((b) => [b.key, b]));
+    let permanentCount = 0;
+
+    // NOTE: 用 expiryRecords（含 resolveExpiry 优先级链）而非原始的 d.expires_at ——
+    // 与上面「已过期」统计保持同一口径，否则时间轴和概览卡片会对不上数。
+    for (const r of expiryRecords) {
+      const key = normalizeDomainKey(r.full_domain);
+      if (!key) continue;
+      const permanent = !r.expires_at || r.expires_at.startsWith("0000");
+      if (permanent) {
+        permanentCount++;
+        continue;
+      }
+      const t = new Date(r.expires_at!).getTime();
+      if (isNaN(t)) continue;
+      const daysLeft = (t - now) / 86400000;
+      if (daysLeft < 0) continue; // 已过期 → 走 overdue，不占月桶
+      const due = new Date(t);
+      const bucket = bucketByKey.get(monthKeyOf(due));
+      if (!bucket) continue; // 落在 12 个月之外
+      bucket.items.push({
+        full_domain: r.full_domain,
+        source: r.source,
+        alias: r.alias || "",
+        daysLeft,
+        day: due.getDate()
+      });
+    }
+    // 桶内按自然日升序，让「这个月先到期的排前面」
+    buckets.forEach((b) => b.items.sort((a, b2) => a.day - b2.day));
+
     return {
       total,
       active,
@@ -7419,7 +7639,15 @@ export default function App() {
       accounts: dnsheAccounts.length + cfAccountList.length + dpAccountList.length + customGroupList.length,
       recent,
       expiring: expiringAll.slice(0, 8),
-      expiringTotal: expiringAll.length
+      expiringTotal: expiringAll.length,
+      // 时间轴
+      timeline: {
+        buckets,
+        maxCount: Math.max(1, ...buckets.map((b) => b.items.length)),
+        scheduledTotal: buckets.reduce((sum, b) => sum + b.items.length, 0),
+        permanentCount,
+        overdueCount: expired
+      }
     };
   }, [domains, cfZones, dpDomains, customDomains, dnsheAccounts, cfAccountList, dpAccountList, customGroupList, cfExpiryMap]);
 
@@ -7637,7 +7865,15 @@ export default function App() {
               const isActive = activeTab === "domains" || activeTab === "register";
               return (
                 <div key={item.key} className="relative">
-                  <button
+                  <NavItem
+                    label={item.label}
+                    icon={Globe}
+                    source={item.source}
+                    active={isActive}
+                    railMode={railMode}
+                    badge={item.badge}
+                    hasSubmenu
+                    expanded={dnsheMenuOpen}
                     onClick={() => {
                       if (railMode) {
                         // 折叠态：点击直接进域名列表
@@ -7650,59 +7886,35 @@ export default function App() {
                         setSidebarOpen(false);
                       }
                     }}
-                    title={railMode ? item.label : undefined}
-                    className={`group w-full flex items-center gap-3 px-3 py-3 md:py-2.5 rounded-lg text-sm font-semibold transition-all ${
-                      isActive
-                        ? "bg-indigo-600 text-white shadow-lg shadow-indigo-500/20"
-                        : "text-content-muted hover:text-content-primary hover:bg-hovered"
-                    } ${railMode ? "justify-center" : ""}`}
                   >
-                    <span className="flex-shrink-0">{item.icon}</span>
-                    {!railMode && (
-                      <>
-                        <span className="flex-1 text-left whitespace-nowrap">{item.label}</span>
-                        {item.badge !== undefined && item.badge > 0 && (
-                          <span className="text-xs px-1.5 py-0.5 rounded-full bg-black/20 text-current opacity-80">
-                            {item.badge}
-                          </span>
-                        )}
-                        <ChevronDown
-                          className={`w-4 h-4 flex-shrink-0 transition-transform ${dnsheMenuOpen ? "rotate-180" : ""}`}
+                    {/* 子菜单：域名列表 / 注册·查重 */}
+                    {!railMode && dnsheMenuOpen && (
+                      <div className="mt-1 ml-4 pl-3 border-l border-border-base space-y-0.5">
+                        <NavSubItem
+                          label="域名列表"
+                          active={activeTab === "domains"}
+                          onClick={() => { setActiveTab("domains"); setSidebarOpen(false); }}
                         />
-                      </>
+                        <NavSubItem
+                          label="注册 / 查重"
+                          active={activeTab === "register"}
+                          onClick={() => { setActiveTab("register"); setSidebarOpen(false); }}
+                        />
+                      </div>
                     )}
-                  </button>
-                  {/* 子菜单：域名列表 / 注册·查重 */}
-                  {!railMode && dnsheMenuOpen && (
-                    <div className="mt-1 ml-4 pl-3 border-l border-border-base space-y-0.5">
-                      <button
-                        onClick={() => { setActiveTab("domains"); setSidebarOpen(false); }}
-                        className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-semibold transition-all ${
-                          activeTab === "domains"
-                            ? "text-indigo-500 dark:text-indigo-400"
-                            : "text-content-muted hover:text-content-primary hover:bg-hovered"
-                        }`}
-                      >
-                        <Globe className="w-3.5 h-3.5" /> 域名列表
-                      </button>
-                      <button
-                        onClick={() => { setActiveTab("register"); setSidebarOpen(false); }}
-                        className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-semibold transition-all ${
-                          activeTab === "register"
-                            ? "text-indigo-500 dark:text-indigo-400"
-                            : "text-content-muted hover:text-content-primary hover:bg-hovered"
-                        }`}
-                      >
-                        <Plus className="w-3.5 h-3.5" /> 注册 / 查重
-                      </button>
-                    </div>
-                  )}
+                  </NavItem>
                 </div>
               );
             }
             return (
-              <button
+              <NavItem
                 key={item.key}
+                label={item.label}
+                icon={NAV_ICONS[item.key] || Globe}
+                source={item.source}
+                active={activeTab === item.key}
+                railMode={railMode}
+                badge={item.badge}
                 onClick={() => {
                   setActiveTab(item.key);
                   // 点击其它菜单时自动收起 DNSHE 子菜单
@@ -7710,25 +7922,7 @@ export default function App() {
                   // 手机上选完就收起抽屉，否则内容被遮住还得再点一次
                   setSidebarOpen(false);
                 }}
-                title={railMode ? item.label : undefined}
-                className={`group w-full flex items-center gap-3 px-3 py-3 md:py-2.5 rounded-lg text-sm font-semibold transition-all ${
-                  activeTab === item.key
-                    ? "bg-indigo-600 text-white shadow-lg shadow-indigo-500/20"
-                    : "text-content-muted hover:text-content-primary hover:bg-hovered"
-                } ${railMode ? "justify-center" : ""}`}
-              >
-                <span className="flex-shrink-0">{item.icon}</span>
-                {!railMode && (
-                  <>
-                    <span className="flex-1 text-left whitespace-nowrap">{item.label}</span>
-                    {item.badge !== undefined && item.badge > 0 && (
-                      <span className="text-xs px-1.5 py-0.5 rounded-full bg-black/20 text-current opacity-80">
-                        {item.badge}
-                      </span>
-                    )}
-                  </>
-                )}
-              </button>
+              />
             );
           })}
         </nav>
@@ -7911,6 +8105,28 @@ export default function App() {
               ))}
             </div>
 
+            {/* 资产时间轴：未来 12 个月的到期分布。
+                放在统计卡之后、两个明细列表之前 —— 它提供的是「全局压力感」，
+                先看分布再看具体哪几个，认知顺序比反过来更顺。
+                NOTE: 与下方「到期预警」口径不同：预警只筛 90 天内，
+                时间轴是全量 12 个月，所以两张卡的域名数不必相等。 */}
+            <DomainTimeline
+              buckets={dashboardStats.timeline.buckets}
+              maxCount={dashboardStats.timeline.maxCount}
+              scheduledTotal={dashboardStats.timeline.scheduledTotal}
+              permanentCount={dashboardStats.timeline.permanentCount}
+              overdueCount={dashboardStats.timeline.overdueCount}
+              onPickDomain={(fullDomain, source) => {
+                // NOTE: 必须按来源分派，不能只「填搜索 + 切到域名页」——
+                // 域名列表页（domains）只有 DNSHE 数据，groupedDomains /
+                // domainSearchIndex 都只扫 domains 数组，所以一个 DigitalPlat
+                // 或 Cloudflare 域名填进搜索框后命中数恒为 0，用户看到的是
+                // 「搜索了但什么都没有」。这里复用跨来源搜索同一套 gotoXxx
+                // 定位链（切到对应标签页 + 展开账号分组 + 高亮滚动）。
+                handleCrossSourceJump(toJumpSource(source), fullDomain);
+              }}
+            />
+
             {/* 中间：最近注册 */}
             <div className="bg-surface border border-border-base rounded-2xl overflow-hidden">
               <div className="px-4 sm:px-5 py-3.5 border-b border-border-base flex items-center gap-2">
@@ -7927,11 +8143,7 @@ export default function App() {
                     <div key={`${d.source}-${d.full_domain}`} className="px-4 sm:px-5 py-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-0.5 sm:gap-2 hover:bg-hovered transition-colors">
                       <span className="font-mono text-xs sm:text-sm text-content-primary truncate min-w-0 flex items-center gap-2">
                         {d.full_domain}
-                        <span className={`flex-shrink-0 text-[10px] font-semibold px-1.5 py-0.5 rounded ${
-                          d.source === "DNSHE" ? "bg-indigo-50 text-indigo-600 dark:bg-indigo-950/60 dark:text-indigo-400"
-                          : d.source === "Cloudflare" ? "bg-orange-50 text-orange-600 dark:bg-orange-950/60 dark:text-orange-400"
-                          : "bg-emerald-50 text-emerald-600 dark:bg-emerald-950/60 dark:text-emerald-400"
-                        }`}>{d.source}</span>
+                        <DomainSourceBadge source={d.source} />
                       </span>
                       <span className="text-[11px] sm:text-xs text-content-muted truncate min-w-0 sm:flex-shrink-0 sm:max-w-[35%]">{d.alias}</span>
                     </div>
@@ -7961,29 +8173,32 @@ export default function App() {
                   </div>
                 ) : (
                   dashboardStats.expiring.map((d) => (
-                    <div key={`${d.source}-${d.full_domain}`} className="px-4 sm:px-5 py-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1 sm:gap-2 hover:bg-hovered transition-colors">
+                    /* 与时间轴的域名行保持同一交互：点击按来源跳到对应标签页并定位高亮。
+                       两处展示的是同一批数据，一处可点一处不可点会让人以为后者是坏的。 */
+                    <button
+                      key={`${d.source}-${d.full_domain}`}
+                      type="button"
+                      onClick={() => handleCrossSourceJump(toJumpSource(d.source), d.full_domain)}
+                      title={`前往 ${d.source} 列表查看 ${d.full_domain}`}
+                      className="w-full text-left px-4 sm:px-5 py-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1 sm:gap-2 hover:bg-hovered transition-colors"
+                    >
                       <span className="font-mono text-xs sm:text-sm text-content-primary truncate min-w-0 flex items-center gap-2">
                         {d.full_domain}
-                        <span className={`flex-shrink-0 text-[10px] font-semibold px-1.5 py-0.5 rounded ${
-                          d.source === "DNSHE" ? "bg-indigo-50 text-indigo-600 dark:bg-indigo-950/60 dark:text-indigo-400"
-                          : d.source === "Cloudflare" ? "bg-orange-50 text-orange-600 dark:bg-orange-950/60 dark:text-orange-400"
-                          : d.source === "DigitalPlat" ? "bg-emerald-50 text-emerald-600 dark:bg-emerald-950/60 dark:text-emerald-400"
-                          : "bg-slate-100 text-slate-600 dark:bg-slate-800/60 dark:text-slate-300"
-                        }`}>{d.source}</span>
+                        <DomainSourceBadge source={d.source} />
                       </span>
                       <span className="flex items-center gap-2 min-w-0 sm:flex-shrink-0">
                         <span className="text-[11px] sm:text-xs text-content-muted truncate min-w-0 max-w-[160px] sm:max-w-[200px]" title={d.alias}>{d.alias}</span>
-                        <span className={`text-[11px] font-semibold px-2 py-0.5 rounded-full border flex-shrink-0 whitespace-nowrap ${
-                          d.expired
-                            ? "bg-red-50 text-red-700 border-red-200 dark:bg-red-950/50 dark:text-red-400 dark:border-red-900/60"
-                            : d.daysLeft <= 30
-                              ? "bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-950/50 dark:text-amber-300 dark:border-amber-900/60"
-                              : "bg-blue-50 text-blue-700 border-blue-200 dark:bg-blue-950/50 dark:text-blue-300 dark:border-blue-900/60"
-                        }`}>
+                        {/* 二态语义：已过期走 danger（不可逆），临期走 warn。
+                            阈值与 expiryBadge / 时间轴同档（30 天），全站一致。 */}
+                        <Badge
+                          tone={d.expired ? "danger" : d.daysLeft <= 30 ? "warn" : "info"}
+                          size="sm"
+                          className="flex-shrink-0 whitespace-nowrap"
+                        >
                           {d.expired ? `已过期 ${Math.ceil(-d.daysLeft)} 天` : `剩 ${Math.ceil(d.daysLeft)} 天`}
-                        </span>
+                        </Badge>
                       </span>
-                    </div>
+                    </button>
                   ))
                 )}
               </div>
@@ -8963,6 +9178,8 @@ export default function App() {
                       >
                         <button
                           onClick={() => toggleAccountCollapse(group.accountId)}
+                          aria-expanded={!isCollapsed}
+                          aria-controls={`account-panel-${group.accountId}`}
                           className={`flex-1 min-w-0 flex items-center text-left transition-opacity ${
                             isCollapsed ? "hover:opacity-80" : ""
                           }`}
@@ -9006,7 +9223,7 @@ export default function App() {
 
                       {/* 域名内容区（收起时隐藏） */}
                       {!isCollapsed && (
-                      <>
+                      <div id={`account-panel-${group.accountId}`}>
                       {/* 子分块 1：系统默认 DNS 域名 */}
                       {defaultDomains.length > 0 && (
                         <div className="space-y-3">
@@ -9034,7 +9251,7 @@ export default function App() {
                           </div>
                         </div>
                       )}
-                      </>
+                      </div>
                       )}
                     </div>
                   );
@@ -9525,18 +9742,7 @@ export default function App() {
                               </div>
                               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
                                 {group.unassignedDomains.map((dom) => {
-                                  const daysLeft = dom.daysLeft;
-                                  const permanent = isPermanentExpiry(dom.expires_at);
-                                  const expired = !permanent && daysLeft < 0;
-                                  const warning = !permanent && !expired && daysLeft <= 30;
-                                  const badgeCls = permanent
-                                    ? "bg-indigo-50 text-indigo-700 border-indigo-200 dark:bg-indigo-950/80 dark:text-indigo-300 dark:border-indigo-900/60"
-                                    : expired
-                                      ? "bg-red-50 text-red-700 border-red-200 dark:bg-red-950/80 dark:text-red-400 dark:border-red-900/60"
-                                      : warning
-                                        ? "bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-950/80 dark:text-amber-300 dark:border-amber-900/60"
-                                        : "bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/80 dark:text-emerald-400 dark:border-emerald-900/60";
-                                  const daysText = permanent ? "永久" : expired ? `已过期 ${Math.ceil(-daysLeft)} 天` : `剩 ${Math.ceil(daysLeft)} 天`;
+                                  const { tone: badgeTone, text: daysText, permanent } = expiryBadge(dom.expires_at, dom.daysLeft);
                                   const hasCfZone = domainKeyCandidates(dom.full_domain).some((k) => cfZoneFullDomainSet.has(k));
                                   return (
                                     <div key={dom.id} className="bg-hovered border border-border-base rounded-lg p-3 flex flex-col gap-2">
@@ -9552,9 +9758,7 @@ export default function App() {
                                             到期: {permanent ? "永久" : dom.expires_at.slice(0, 10)}
                                           </div>
                                         </div>
-                                        <span className={`text-[11px] px-2 py-0.5 rounded-full font-semibold border flex-shrink-0 ${badgeCls}`}>
-                                          {daysText}
-                                        </span>
+                                        <Badge tone={badgeTone} size="sm" className="flex-shrink-0">{daysText}</Badge>
                                       </div>
                                       {dom.remark && (
                                         <div className="text-[11px] text-content-secondary bg-surface border border-border-soft rounded-md px-2.5 py-1.5">
@@ -9573,20 +9777,28 @@ export default function App() {
                                           </button>
                                         )}
                                         <div className="flex items-center gap-0.5 ml-auto flex-shrink-0">
-                                          <button
-                                            onClick={() => openCustomDomainModal({ id: group.groupId, alias: group.alias, api_key: "", created_at: "" } as Account, null, dom)}
-                                            className="p-1 text-content-muted hover:text-content-primary hover:bg-hovered rounded transition-colors"
+                                          {/* NOTE: 原先只有 title，没有 aria-label。title 在部分读屏/
+                                              触屏场景下不可靠（触屏无 hover、部分 AT 不朗读 title），
+                                              这里补上权威的可访问名称，并把 20px 的点击区放到 28px。 */}
+                                          <Button
+                                            variant="ghost"
+                                            size="xs"
+                                            iconOnly
+                                            icon={<Pencil className="w-3.5 h-3.5" aria-hidden="true" />}
+                                            aria-label={`编辑域名 ${dom.full_domain}`}
                                             title="编辑域名"
-                                          >
-                                            <Pencil className="w-3.5 h-3.5" />
-                                          </button>
-                                          <button
-                                            onClick={() => setCustomDeleteDomain(dom)}
-                                            className="p-1 text-content-muted hover:text-red-600 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40 rounded transition-colors"
+                                            onClick={() => openCustomDomainModal({ id: group.groupId, alias: group.alias, api_key: "", created_at: "" } as Account, null, dom)}
+                                          />
+                                          <Button
+                                            variant="ghost"
+                                            size="xs"
+                                            iconOnly
+                                            icon={<Trash2 className="w-3.5 h-3.5" aria-hidden="true" />}
+                                            aria-label={`删除域名 ${dom.full_domain}`}
                                             title="删除域名"
-                                          >
-                                            <Trash2 className="w-3.5 h-3.5" />
-                                          </button>
+                                            className="hover:text-state-danger-fg hover:bg-state-danger-bg"
+                                            onClick={() => setCustomDeleteDomain(dom)}
+                                          />
                                         </div>
                                       </div>
                                     </div>
@@ -9632,18 +9844,7 @@ export default function App() {
                               ) : (
                                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
                                   {acc.domains.map((dom) => {
-                                    const daysLeft = dom.daysLeft;
-                                    const permanent = isPermanentExpiry(dom.expires_at);
-                                    const expired = !permanent && daysLeft < 0;
-                                    const warning = !permanent && !expired && daysLeft <= 30;
-                                    const badgeCls = permanent
-                                      ? "bg-indigo-50 text-indigo-700 border-indigo-200 dark:bg-indigo-950/80 dark:text-indigo-300 dark:border-indigo-900/60"
-                                      : expired
-                                        ? "bg-red-50 text-red-700 border-red-200 dark:bg-red-950/80 dark:text-red-400 dark:border-red-900/60"
-                                        : warning
-                                          ? "bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-950/80 dark:text-amber-300 dark:border-amber-900/60"
-                                          : "bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/80 dark:text-emerald-400 dark:border-emerald-900/60";
-                                    const daysText = permanent ? "永久" : expired ? `已过期 ${Math.ceil(-daysLeft)} 天` : `剩 ${Math.ceil(daysLeft)} 天`;
+                                    const { tone: badgeTone, text: daysText, permanent } = expiryBadge(dom.expires_at, dom.daysLeft);
                                     const hasCfZone = domainKeyCandidates(dom.full_domain).some((k) => cfZoneFullDomainSet.has(k));
                                     return (
                                       <div key={dom.id} className="bg-hovered border border-border-base rounded-lg p-3 flex flex-col gap-2">
@@ -9659,9 +9860,7 @@ export default function App() {
                                               到期: {permanent ? "永久" : dom.expires_at.slice(0, 10)}
                                             </div>
                                           </div>
-                                          <span className={`text-[11px] px-2 py-0.5 rounded-full font-semibold border flex-shrink-0 ${badgeCls}`}>
-                                            {daysText}
-                                          </span>
+                                          <Badge tone={badgeTone} size="sm" className="flex-shrink-0">{daysText}</Badge>
                                         </div>
                                         {dom.remark && (
                                           <div className="text-[11px] text-content-secondary bg-surface border border-border-soft rounded-md px-2.5 py-1.5">
@@ -9680,20 +9879,25 @@ export default function App() {
                                             </button>
                                           )}
                                           <div className="flex items-center gap-0.5 ml-auto flex-shrink-0">
-                                            <button
-                                              onClick={() => openCustomDomainModal({ id: acc.group_id, alias: "", api_key: "", created_at: "" } as Account, acc, dom)}
-                                              className="p-1 text-content-muted hover:text-content-primary hover:bg-hovered rounded transition-colors"
+                                            <Button
+                                              variant="ghost"
+                                              size="xs"
+                                              iconOnly
+                                              icon={<Pencil className="w-3.5 h-3.5" aria-hidden="true" />}
+                                              aria-label={`编辑域名 ${dom.full_domain}`}
                                               title="编辑域名"
-                                            >
-                                              <Pencil className="w-3.5 h-3.5" />
-                                            </button>
-                                            <button
-                                              onClick={() => setCustomDeleteDomain(dom)}
-                                              className="p-1 text-content-muted hover:text-red-600 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40 rounded transition-colors"
+                                              onClick={() => openCustomDomainModal({ id: acc.group_id, alias: "", api_key: "", created_at: "" } as Account, acc, dom)}
+                                            />
+                                            <Button
+                                              variant="ghost"
+                                              size="xs"
+                                              iconOnly
+                                              icon={<Trash2 className="w-3.5 h-3.5" aria-hidden="true" />}
+                                              aria-label={`删除域名 ${dom.full_domain}`}
                                               title="删除域名"
-                                            >
-                                              <Trash2 className="w-3.5 h-3.5" />
-                                            </button>
+                                              className="hover:text-state-danger-fg hover:bg-state-danger-bg"
+                                              onClick={() => setCustomDeleteDomain(dom)}
+                                            />
                                           </div>
                                         </div>
                                       </div>
@@ -12045,17 +12249,74 @@ export default function App() {
           <div className="space-y-6 max-w-3xl pt-5 md:pt-6">
             <div>
               <h2 className="text-2xl font-black text-content-primary flex items-center gap-2">
-                <Settings className="w-6 h-6 text-indigo-500" /> 设置
+                <Settings className="w-6 h-6 text-accent" /> 设置
               </h2>
-              <p className="text-content-muted mt-1 text-sm">系统配置、通知渠道与自动续期策略</p>
+              <p className="text-content-muted mt-1 text-sm">外观、系统配置、通知渠道与自动续期策略</p>
             </div>
 
             {loadingSettings ? (
               <div className="flex justify-center py-20">
-                <RefreshCw className="w-6 h-6 animate-spin text-indigo-500" />
+                <RefreshCw className="w-6 h-6 animate-spin text-accent" />
               </div>
             ) : (
               <>
+                {/* ── 外观 ────────────────────────────────────────────────
+                    NOTE: 这里原本只有一个「主题模式」卡片，与顶栏的日/月按钮
+                    完全同源（都改 theme 这一个 state），属重复入口，曾被移除。
+                    现在重新加回来，但职责不同 —— 它管的是「配色身份」这个
+                    新维度（colorTheme），顶栏那个仍管明暗。两个开关正交，
+                    用户在设置页能同时看到两种外观维度，不会误以为是同一个。 */}
+                <div className="bg-surface border border-border-base rounded-2xl p-4 sm:p-5 space-y-4">
+                  <h3 className="font-bold text-content-primary flex items-center gap-2">
+                    <Palette className="w-4 h-4 text-accent" /> 外观
+                  </h3>
+
+                  <div>
+                    <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1 mb-3">
+                      <label className="text-sm font-semibold text-content-primary">配色主题</label>
+                      <span className="text-[11px] text-content-muted">与明暗模式独立，可自由组合</span>
+                    </div>
+
+                    <ThemePicker value={colorTheme} onChange={setColorTheme} />
+
+                    <p className="text-[11px] text-content-muted mt-3 leading-relaxed">
+                      当前为
+                      <b className="text-content-secondary">
+                        {" "}{THEME_LABELS[colorTheme]}{" "}
+                      </b>
+                      ×
+                      <b className="text-content-secondary">
+                        {" "}{theme === "dark" ? "暗色" : "亮色"}{" "}
+                      </b>
+                      组合。选择会保存在本机浏览器，下次打开直接生效。
+                    </p>
+                  </div>
+
+                  <div className="pt-3 border-t border-border-soft flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="text-sm font-semibold text-content-primary">暗色模式</div>
+                      <div className="text-xs text-content-muted mt-0.5">
+                        深色界面适合夜间与弱光环境；顶栏右上角也有快捷开关
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={theme === "dark"}
+                      aria-label="暗色模式"
+                      onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
+                      className={`w-12 h-6 rounded-full transition-all relative flex-shrink-0 ${
+                        theme === "dark" ? "bg-accent" : "bg-elevated border border-border-base"
+                      }`}
+                    >
+                      <span
+                        className={`absolute top-0.5 w-5 h-5 rounded-full bg-white transition-all ${
+                          theme === "dark" ? "left-6" : "left-0.5"
+                        }`}
+                      />
+                    </button>
+                  </div>
+                </div>
                 {/* NOTE: 这里原有一个「外观 / 主题模式」卡片，与顶栏的太阳/月亮切换按钮
                     完全同源（都改 theme 这一个 state），属重复入口，已移除。
                     主题切换保留在顶栏，任何页面都能直接点到，不必先进设置页。 */}
@@ -12063,7 +12324,7 @@ export default function App() {
                 {/* 后端地址 */}
                 <div className="bg-surface border border-border-base rounded-2xl p-4 sm:p-5 space-y-4">
                   <h3 className="font-bold text-content-primary flex items-center gap-2">
-                    <Server className="w-4 h-4 text-indigo-400" /> 后端地址
+                    <Server className="w-4 h-4 text-accent" /> 后端地址
                   </h3>
 
                   {backendUrlEditing ? (
@@ -12102,7 +12363,7 @@ export default function App() {
                       </div>
                       <button
                         onClick={() => { setBackendUrlInput(localStorage.getItem("DOMAIN_HUB_BACKEND_URL") || ""); setBackendUrlEditing(true); }}
-                        className="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 hover:text-indigo-800 border border-indigo-200 dark:bg-indigo-950/60 dark:hover:bg-indigo-900/60 dark:text-indigo-400 dark:hover:text-indigo-200 dark:border-indigo-900/50 px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 flex-shrink-0"
+                        className="bg-elevated hover:bg-hovered text-content-secondary border border-border-base px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 flex-shrink-0"
                       >
                         <Pencil className="w-3.5 h-3.5" /> {backendUrl ? "修改" : "配置"}
                       </button>
@@ -12120,7 +12381,7 @@ export default function App() {
                   <div className="flex items-center justify-between gap-2 text-sm">
                     <span className="text-content-muted flex-shrink-0">当前管理员</span>
                     <span className="font-mono font-semibold text-content-primary flex items-center gap-1.5 min-w-0">
-                      <UserCheck className="w-4 h-4 text-indigo-400 flex-shrink-0" />
+                      <UserCheck className="w-4 h-4 text-accent flex-shrink-0" />
                       <span className="truncate">{accountInfo.username || "—"}</span>
                     </span>
                   </div>
@@ -12225,7 +12486,7 @@ export default function App() {
                             <p className="text-[11px] text-content-muted">
                               无法扫码时，可在验证器中手动录入以下密钥：
                             </p>
-                            <div className="font-mono text-sm bg-surface border border-border-base rounded-lg px-3 py-2 break-all text-indigo-400 select-all text-center tracking-wider">
+                            <div className="font-mono text-sm bg-surface border border-border-base rounded-lg px-3 py-2 break-all text-accent select-all text-center tracking-wider">
                               {twoFaSetup.secret}
                             </div>
                             <p className="text-xs text-content-secondary">2. 输入验证器当前显示的 6 位动态码以完成开启：</p>
@@ -12294,7 +12555,10 @@ export default function App() {
                     </div>
                     <button
                       onClick={() => setSettings((s) => ({ ...s, auto_renew: s.auto_renew === "1" ? "0" : "1" }))}
-                      className={`w-12 h-6 rounded-full transition-all relative flex-shrink-0 ${settings.auto_renew === "1" ? "bg-indigo-600" : "bg-elevated border border-border-base"}`}
+                      role="switch"
+                      aria-checked={settings.auto_renew === "1"}
+                      aria-label="启用自动续期"
+                      className={`w-12 h-6 rounded-full transition-all relative flex-shrink-0 ${settings.auto_renew === "1" ? "bg-accent" : "bg-elevated border border-border-base"}`}
                     >
                       <span className={`absolute top-0.5 w-5 h-5 rounded-full bg-white transition-all ${settings.auto_renew === "1" ? "left-6" : "left-0.5"}`} />
                     </button>
@@ -12316,7 +12580,10 @@ export default function App() {
                     </div>
                     <button
                       onClick={() => setSettings((s) => ({ ...s, dns_records_cache_mode: s.dns_records_cache_mode === "scheduled" ? "always" : "scheduled" }))}
-                      className={`w-12 h-6 rounded-full transition-all relative flex-shrink-0 ${settings.dns_records_cache_mode === "scheduled" ? "bg-indigo-600" : "bg-elevated border border-border-base"}`}
+                      role="switch"
+                      aria-checked={settings.dns_records_cache_mode === "scheduled"}
+                      aria-label="定时同步复用解析记录缓存"
+                      className={`w-12 h-6 rounded-full transition-all relative flex-shrink-0 ${settings.dns_records_cache_mode === "scheduled" ? "bg-accent" : "bg-elevated border border-border-base"}`}
                     >
                       <span className={`absolute top-0.5 w-5 h-5 rounded-full bg-white transition-all ${settings.dns_records_cache_mode === "scheduled" ? "left-6" : "left-0.5"}`} />
                     </button>
@@ -12517,13 +12784,25 @@ export default function App() {
 
                 {/* 保存按钮 */}
                 <div className="flex justify-end">
-                  <button
+                  {/*
+                    NOTE: 这里原先写的是 text-content-primary，压在 btn-primary 的
+                    品牌渐变上。亮色主题下 --text-primary 是近黑色（#0f172a），
+                    在靛蓝渐变上对比度只有 1.9:1，按钮文字几乎看不清 ——
+                    而且它跟着明暗主题变，暗色下又变成白色，等于同一个按钮
+                    在两种主题下有两种（其中一种是错的）前景色。
+                    正确做法是让颜色由强调色对比令牌决定：用 Button 组件的
+                    primary variant，它已经处理好了 accent-contrast。
+                  */}
+                  <Button
+                    variant="primary"
+                    size="md"
+                    icon={<Save className="w-4 h-4" />}
+                    loading={actionLoading === "save-settings"}
                     onClick={handleSaveSettings}
-                    disabled={actionLoading === "save-settings"}
-                    className="btn-primary px-6 py-2.5 rounded-lg text-sm font-bold text-content-primary flex items-center gap-2 disabled:opacity-50"
+                    className="px-6"
                   >
-                    <Save className="w-4 h-4" /> 保存全部设置
-                  </button>
+                    保存全部设置
+                  </Button>
                 </div>
 
                 {/* 数据备份：导出需要 2FA（未配置 2FA 时禁用导出） */}

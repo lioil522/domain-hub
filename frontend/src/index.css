@@ -2,9 +2,121 @@
 @tailwind components;
 @tailwind utilities;
 
-/*
- * 主题配色变量 —— 语义化 CSS 变量，配合 tailwind.config.js 中的语义色使用。
- * 亮色为默认 (:root)，暗色通过挂在 <html> 上的 .dark 类切换。
+/* ═══════════════════════════════════════════════════════════════════
+ * 主题令牌层
+ *
+ * 架构：两个正交维度
+ *   · 主题（配色身份）→ <html data-theme="indigo|inkjade">
+ *   · 明暗（明度模式）→ <html class="dark">
+ *
+ * WHY 拆成正交两轴：
+ *   原先只有 :root 与 .dark 两组，等于把「用什么颜色」和「要多亮」压在
+ *   同一条轴上 —— 想加第二套配色就必须再写一遍 .dark，两套主题的暗色规则
+ *   会互相覆盖。现在配色身份与明暗各自独立，4 个组合只需写 4 份令牌块，
+ *   且新增第 3 套主题的边际成本只有 2 个块。
+ *
+ * 书写顺序（重要，靠源码顺序解决特异性平局）：
+ *   ① 主题色板（identity）      —— 只声明 --accent-* / --source-* 这类「色相」令牌
+ *   ② 明暗基底（luminance）      —— 声明 --bg-* / --text-* / --shadow-* 与状态语义色
+ *   ③ 主题 × 暗色 修正块          —— 只写「该主题在暗色下需要偏离明暗基底」的部分
+ *
+ * NOTE: ② 与 ③ 同为单类/单属性选择器时特异性相同（0,2,0），此时后者胜出靠的是
+ * 源码顺序 —— 所以「修正块」必须永远排在「基底块」之后，不要重排本节。
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* ── 维度一 · 主题色板 ──────────────────────────────────────────────
+ * 只负责「品牌身份」：强调色、链接色、服务商来源色。
+ * 明暗相关的底色/字色/阴影一律不在这里声明，交给下面的明暗基底。
+ */
+
+/* 靛蓝 · 石板 —— 默认主题
+ *
+ * WHY 保持色相、只调明度：
+ *   这是线上既有主题，用户对「它是什么颜色」已有肌肉记忆。原先的
+ *   #6366f1 存在对比度缺陷（于纯白仅 4.47:1、于 bg-base 4.08:1、暗色下
+ *   于 bg-elevated 仅 3.50:1），「强调色当作正文大小文字」长期不达标。
+ *   修复时刻意只动明度/饱和度，不动色相 —— 用户看到的仍是同一个靛蓝，
+ *   只是深浅变了，避免「我什么都没设置，但界面换了个颜色」的困惑。
+ *
+ * 改法：固定 H，优先降 V；V 触顶后（暗色需要提亮）再联合降 S。
+ *   亮色 #6366f1 → #5d60e3（压深，刚好跨过 AA）
+ *   暗色 #6366f1 → #7c7ff5（提亮 + 微降饱和，V 已到顶）
+ *
+ * 对比度实测（全部配对 ≥4.5:1，可用项目根 contrast-check.mjs 复核）：
+ *   亮色 accent #5d60e3  于 bg-base 4.51:1 ✓ / surface 4.94:1 ✓ / elevated 4.73:1 ✓
+ *   亮色 白字于 accent                4.94:1 ✓
+ *   暗色 accent #7c7ff5  于 bg-elevated 4.62:1 ✓ / surface 5.41:1 ✓ / base 5.75:1 ✓
+ *   暗色 accent-contrast #0b0a26 于 accent 5.72:1 ✓
+ *         ↑ 关键：暗色把主色提亮后，白字压上去只剩 3.46:1（读不清）。
+ *           必须换深色前景 —— 与墨玉暗色同一个坑，同一个解法。
+ *   text-muted #627188 于 bg-base 4.52:1 ✓（原 #64748b 为 4.34:1 ✗）
+ *
+ * NOTE: --accent-hover / --accent-strong / --accent-deep 与 --accent-soft
+ * 不承担正文文字职责（它们是渐变端、悬停态、极浅底），因此不要求各自
+ * 满足 4.5:1 —— 与大字号 3:1 的宽松档一致即可，这也与原设计一致。
+ */
+:root,
+[data-theme="indigo"] {
+  --accent: #5d60e3;
+  --accent-hover: #6b6ee9;     /* 比 accent 亮 ΔL≈0.04，悬停有可辨反馈 */
+  --accent-strong: #575ad4;    /* 渐变深端 */
+  --accent-deep: #4a4dbb;      /* 渐变最深端 / 按下态 */
+  --accent-soft: #e0e1fb;      /* 强调色的极浅底色（选中标签底） */
+  --accent-contrast: #ffffff;  /* 压在强调色实底上的前景色（亮色下用白字） */
+  --accent-rgb: 93 96 227;     /* 用于 rgb() / rgba() 拼接，避免各处重复写数 */
+
+  --source-dnshe-bg: #eef2ff;
+  --source-dnshe-fg: #4f46e5;
+  --source-cf-bg: #fff7ed;
+  --source-cf-fg: #c2410c;
+  --source-dp-bg: #ecfdf5;
+  --source-dp-fg: #047857;
+  --source-custom-bg: #fffbeb;
+  --source-custom-fg: #b45309;
+}
+
+/* 墨玉 · 深青绿 —— 第二套主题
+ * 设计意图：把「品牌色」从紫蓝挪到深青绿，中性色从冷石板挪到暖玉灰。
+ * 整体饱和度压低（青绿主色 S≈38%，而非 Tailwind teal-500 的 71%），
+ * 让界面沉下来 —— 这是一个管理「资产」与「凭据」的后台，不是营销页，
+ * 高饱和的糖果色会让密集数据区域显得吵。
+ *
+ * 对比度实测（本主题自有的 9 项配对，全部 ≥4.5:1，详见项目根的
+ * contrast-check.mjs 脚本，可重跑）：
+ *   accent #1f7a68 于白色     5.20:1 ✓   强调色作文字
+ *   白字于 accent             5.20:1 ✓   主按钮 / 侧栏选中态
+ *   accent 于 bg-base         4.57:1 ✓
+ *   text-muted #5c726d 于 bg-base 4.60:1 ✓
+ *   source-dnshe #1c6d5d 于 #e4f1ee 4.90:1 ✓
+ *   source-cf     #9c4d1c 于 #fbeee2 4.67:1 ✓
+ *   source-dp     #476a35 于 #e8f0e4 5.05:1 ✓
+ *   source-custom #83600f 于 #f8eed4 5.00:1 ✓
+ */
+[data-theme="inkjade"] {
+  --accent: #1f7a68;           /* 墨玉青绿 · 亮色下的主色 */
+  --accent-hover: #1a6a5a;
+  --accent-strong: #186152;
+  --accent-deep: #124c41;
+  --accent-soft: #d5e9e4;
+  --accent-contrast: #ffffff;
+  --accent-rgb: 31 122 104;
+
+  /* 来源色随主题整体偏移到青绿/琥珀/砖红的暖调家族，与主色同处一个色温。
+   * DNSHE 作为「主服务商」吸收主题主色，让侧栏选中态与来源色自然呼应。
+   * NOTE: 每个 fg 都压深到 ≥4.5:1 —— 语义色在浅底上当中小号文字用，
+   * 只满足大字号 3:1 是不够的（来源徽章是 11-12px）。 */
+  --source-dnshe-bg: #e4f1ee;
+  --source-dnshe-fg: #1c6d5d;
+  --source-cf-bg: #fbeee2;
+  --source-cf-fg: #9c4d1c;
+  --source-dp-bg: #e8f0e4;
+  --source-dp-fg: #476a35;
+  --source-custom-bg: #f8eed4;
+  --source-custom-fg: #83600f;
+}
+
+/* ── 维度二 · 明暗基底 ──────────────────────────────────────────────
+ * 亮色为默认。所有明度相关的令牌都在这里，主题无关。
  */
 :root {
   --bg-base: #f1f5f9;      /* 页面最底层背景 */
@@ -15,13 +127,74 @@
   --border-soft: #eef2f7;  /* 更浅的分隔线 */
   --text-primary: #0f172a; /* 主文字 */
   --text-secondary: #334155;
-  --text-muted: #64748b;   /* 次要/说明文字 */
-  --accent: #6366f1;       /* 品牌强调色 */
+  --text-muted: #627188;   /* 次要/说明文字
+                            * NOTE: 由 #64748b 微调而来 —— 原值在 bg-base
+                            * #f1f5f9 上只有 4.34:1，差 0.16 到 AA。这是最容
+                            * 易被忽略的一处不达标（说明文字通常字号小、用得多）。
+                            * 新值在该底上 4.52:1 ✓，观感差异肉眼几乎不可辨。 */
   --glass-bg: rgba(255, 255, 255, 0.72);
   --glass-border: rgba(15, 23, 42, 0.06);
   --glass-shadow: 0 8px 32px 0 rgba(15, 23, 42, 0.08);
   --input-bg: rgba(248, 250, 252, 0.9);
   --input-border: rgba(15, 23, 42, 0.12);
+
+  /* 状态语义色（组件层唯一入口）
+   * NOTE: 组件层不再直接写 emerald / amber / red / slate / sky，
+   * 统一引用这四个语义名。改为品牌色只需动本节。
+   * 每个状态提供 -bg / -fg / -border 三元组，保证成对出现时对比度达标：
+   *   ok     bg #ecfdf5 ↔ fg #047857  对比度 4.8:1  ✓ WCAG AA
+   *   warn   bg #fffbeb ↔ fg #b45309  对比度 4.6:1  ✓
+   *   danger bg #fef2f2 ↔ fg #b91c1c  对比度 5.9:1  ✓
+   *   info   bg #eff6ff ↔ fg #1d4ed8  对比度 5.7:1  ✓
+   *   idle   bg #f1f5f9 ↔ fg #475569  对比度 6.4:1  ✓
+   * NOTE: 状态色刻意不随主题变化 —— 「绿=正常 / 红=过期」是跨主题的
+   * 稳定语义，跟随品牌色漂移会让用户重新学习一遍状态含义。
+   */
+  --state-ok-bg: #ecfdf5;
+  --state-ok-fg: #047857;
+  --state-ok-border: #a7f3d0;
+  --state-warn-bg: #fffbeb;
+  --state-warn-fg: #b45309;
+  --state-warn-border: #fde68a;
+  --state-danger-bg: #fef2f2;
+  --state-danger-fg: #b91c1c;
+  --state-danger-border: #fecaca;
+  --state-info-bg: #eff6ff;
+  --state-info-fg: #1d4ed8;
+  --state-info-border: #bfdbfe;
+  --state-idle-bg: #f1f5f9;
+  --state-idle-fg: #475569;
+  --state-idle-border: #e2e8f0;
+
+  /* 圆角令牌（4 档，替代散落的 rounded-lg/xl/2xl） */
+  --radius-xs: 4px;   /* 行内小元素：徽章内的小块、勾选框 */
+  --radius-sm: 6px;   /* 输入框、小按钮 */
+  --radius-md: 8px;   /* 按钮、下拉、表格容器 */
+  --radius-lg: 12px;  /* 卡片、面板、弹窗（默认档） */
+  --radius-xl: 16px;  /* 大面板、模态框 */
+  --radius-full: 9999px; /* 胶囊徽章、状态点 */
+
+  /* 阴影令牌（3 档 + 品牌辉光）
+   * NOTE: --shadow-accent 用 rgb(var(--accent-rgb)) 而非写死色值 ——
+   * 这样它自动跟随主题，新增主题不必再补一条辉光规则。 */
+  --shadow-xs: 0 1px 2px 0 rgba(15, 23, 42, 0.04);
+  --shadow-sm: 0 1px 3px 0 rgba(15, 23, 42, 0.06), 0 1px 2px -1px rgba(15, 23, 42, 0.06);
+  --shadow-md: 0 4px 12px -2px rgba(15, 23, 42, 0.08), 0 2px 4px -2px rgba(15, 23, 42, 0.05);
+  --shadow-lg: 0 12px 32px -4px rgba(15, 23, 42, 0.12);
+  --shadow-accent: 0 6px 18px -4px rgb(var(--accent-rgb) / 0.4);
+
+  /* 品牌渐变（按钮 / 选中态共用。合成放令牌层，组件只引用）
+   * NOTE: 用 135deg 的 --accent-strong → --accent，比原先 indigo-500→600
+   * 的方向更「亮面朝左上」，与界面光源方向一致。 */
+  --gradient-accent: linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%);
+  --gradient-accent-hover: linear-gradient(135deg, var(--accent-hover) 0%, var(--accent) 100%);
+
+  /* 动效令牌 */
+  --ease-out: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-spring: cubic-bezier(0.34, 1.4, 0.64, 1);
+  --dur-fast: 120ms;
+  --dur-base: 200ms;
+  --dur-slow: 320ms;
 }
 
 .dark {
@@ -34,13 +207,152 @@
   --text-primary: #ffffff;
   --text-secondary: #cbd5e1;
   --text-muted: #94a3b8;
-  --accent: #6366f1;
   --glass-bg: rgba(26, 36, 51, 0.6);
   --glass-border: rgba(255, 255, 255, 0.05);
   --glass-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
   --input-bg: rgba(15, 21, 31, 0.8);
   --input-border: rgba(255, 255, 255, 0.1);
+
+  /* 状态语义色 · 暗色版本
+   * NOTE: 暗色下不能沿用亮色的 #ecfdf5 底 —— 那是接近白的高亮面，
+   * 在深色页面里会刺眼且破坏层次。改为「深底 + 亮字」：
+   *   ok     fg #34d399 on #0f151f ≈ 8.9:1  ✓
+   *   warn   fg #fbbf24 on #0f151f ≈ 10.5:1 ✓
+   *   danger fg #f87171 on #0f151f ≈ 5.6:1  ✓
+   *   info   fg #60a5fa on #0f151f ≈ 6.6:1  ✓
+   * 底色用同色系极低透明度叠加，保留色相辨识度又不抢主体内容。
+   */
+  --state-ok-bg: rgba(16, 185, 129, 0.14);
+  --state-ok-fg: #34d399;
+  --state-ok-border: rgba(16, 185, 129, 0.3);
+  --state-warn-bg: rgba(245, 158, 11, 0.14);
+  --state-warn-fg: #fbbf24;
+  --state-warn-border: rgba(245, 158, 11, 0.3);
+  --state-danger-bg: rgba(239, 68, 68, 0.14);
+  --state-danger-fg: #f87171;
+  --state-danger-border: rgba(239, 68, 68, 0.3);
+  --state-info-bg: rgba(59, 130, 246, 0.14);
+  --state-info-fg: #60a5fa;
+  --state-info-border: rgba(59, 130, 246, 0.3);
+  --state-idle-bg: rgba(148, 163, 184, 0.12);
+  --state-idle-fg: #94a3b8;
+  --state-idle-border: rgba(148, 163, 184, 0.22);
+
+  /* 暗色下阴影靠加深实现「浮起」，品牌辉光降低不透明度避免糊成一团 */
+  --shadow-xs: 0 1px 2px 0 rgba(0, 0, 0, 0.3);
+  --shadow-sm: 0 1px 3px 0 rgba(0, 0, 0, 0.4), 0 1px 2px -1px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 12px -2px rgba(0, 0, 0, 0.45), 0 2px 4px -2px rgba(0, 0, 0, 0.3);
+  --shadow-lg: 0 12px 32px -4px rgba(0, 0, 0, 0.6);
+  --shadow-accent: 0 6px 18px -4px rgb(var(--accent-rgb) / 0.35);
 }
+
+/* ── 维度三 · 主题 × 明暗 修正块 ────────────────────────────────────
+ * 只声明「该主题在某个明度下必须偏离明暗基底」的令牌。
+ * 必须保持在所有基底块之后 —— 靠源码顺序压过基底块的同名声明。
+ *
+ * ⚠ 关键约定：**亮色修正块必须写成 `[data-theme=x]:not(.dark)`**
+ *
+ *   WHY（这是一次真实事故的教训）：
+ *   亮色修正块里的中性色（--text-primary 等）是给浅底用的深色字。如果写成
+ *   裸的 `[data-theme=inkjade]`，它在暗色下**同样命中**，而它又排在 `.dark`
+ *   之后（同特异性 0,1,0 → 源码顺序决胜），于是把 .dark 的 --text-* 全部
+ *   覆盖成亮色的深色值 —— 深墨绿字 (#14211f) 压在近黑底 (#080f0e) 上，
+ *   对比度只剩 1.17:1，整个界面文字几乎不可见。
+ *
+ *   特异性推导：`:not()` 本身不计权，其参数按其中最高的简单选择器计，
+ *   所以 `[data-theme=inkjade]:not(.dark)` = (0,2,0)：
+ *     · 亮色下：胜 .dark? 不参与；胜默认基底? 是（0,2,0 > 0,1,0）✓
+ *     · 暗色下：不命中（.dark 存在）→ .dark 的 --text-* 完好 ✓
+ *   这样「亮色修正块」就真的只管亮色了。
+ */
+
+/* 靛蓝 · 石板 × 暗色
+ * 亮色的 #5d60e3 放到 #1a2433 上只有 2.9:1，必须提亮。但紫蓝这种高饱和色
+ * 提亮到能跨过 AA 需要极亮的 V，单靠 V 会撞上亮度天花板 —— 所以在提亮的同时
+ * 微降饱和度（S 0.589 → 0.493），#7c7ff5 才既够亮又还是靛蓝。
+ *
+ * KEY: accent-contrast 在暗色下必须从白字换成深色 #0b0a26。
+ *   提亮后的 accent 上压白字只有 3.46:1 —— 这是典型的「看起来没问题但读不清」
+ *   （主按钮、侧栏选中态都会中招）。深色前景 5.72:1 ✓。
+ *   与墨玉暗色的处理完全一致，这是双轴主题架构下每个「暗色提亮主色」的
+ *   主题都必须单独检查的一处。
+ */
+[data-theme="indigo"].dark {
+  --accent: #7c7ff5;
+  --accent-hover: #999bff;
+  --accent-strong: #6e71eb;
+  --accent-deep: #6567d6;
+  --accent-soft: rgba(124, 127, 245, 0.16);
+  --accent-contrast: #0b0a26;
+  --accent-rgb: 124 127 245;
+}
+
+/* 墨玉 · 亮色：把中性色从冷石板（slate）挪到暖玉灰（sage）
+ * WHY 必须偏离默认基底：默认基底的 --bg-base #f1f5f9 是明显的冷蓝调，
+ * 而墨玉主色是青绿 —— 冷蓝底 + 青绿主色会让品牌色显得「脏」（像是
+ * 青绿被衬成了水鸭蓝）。换成带一丝绿意的暖灰底，主色的青绿才读得出来。
+ * NOTE: text-muted 用 #5c726d 而非更浅的灰 —— 在 #eef1ee 上需 ≥4.5:1，
+ * 这个值是实测边界（4.52:1）。
+ * ⚠ 选择器必须带 `:not(.dark)` —— 否则暗色下会把 .dark 的字色覆盖掉，
+ *   详见上方「维度三」开头的事故说明。 */
+[data-theme="inkjade"]:not(.dark) {
+  --bg-base: #eef1ee;
+  --bg-surface: #ffffff;
+  --bg-elevated: #f6f8f6;
+  --bg-hover: #e9ede9;
+  --border-base: #dce3de;
+  --border-soft: #e8ece9;
+  --text-primary: #14211f;
+  --text-secondary: #3c4f4b;
+  --text-muted: #5c726d;
+  --glass-bg: rgba(255, 255, 255, 0.72);
+  --glass-border: rgba(20, 33, 31, 0.06);
+  --glass-shadow: 0 8px 32px 0 rgba(20, 33, 31, 0.08);
+  --input-bg: rgba(246, 248, 246, 0.9);
+  --input-border: rgba(20, 33, 31, 0.12);
+}
+
+/* 墨玉 · 深青绿 × 暗色
+ * 亮色的 #1f7a68 放到 #090d14 上只有 2.6:1，字都看不清，必须提亮。
+ * #4ec9ac 在 #0d1615 上约 9.0:1 ✓，且保留青绿色相（不是灰绿）。
+ * NOTE: accent-contrast 从这里开始变成深墨绿 #05201a ——
+ * 高亮青绿上压白字只有 1.9:1，是典型的「看起来没问题但读不清」。
+ */
+[data-theme="inkjade"].dark {
+  --accent: #4ec9ac;
+  --accent-hover: #6ed7bd;
+  --accent-strong: #38b195;
+  --accent-deep: #2a8f78;
+  --accent-soft: rgba(78, 201, 172, 0.16);
+  --accent-contrast: #05201a;
+  --accent-rgb: 78 201 172;
+
+  --source-dnshe-bg: rgba(78, 201, 172, 0.16);
+  --source-dnshe-fg: #7fdcc5;
+  --source-cf-bg: rgba(207, 127, 60, 0.16);
+  --source-cf-fg: #e8b183;
+  --source-dp-bg: rgba(132, 181, 110, 0.16);
+  --source-dp-fg: #a8cf95;
+  --source-custom-bg: rgba(214, 172, 72, 0.16);
+  --source-custom-fg: #e5c77e;
+
+  /* 墨玉主题的底色带一点青绿倾向（原靛蓝主题是纯冷灰蓝），
+   * 否则主色是青绿、底色是蓝灰，两者色温打架。 */
+  --bg-base: #080f0e;
+  --bg-surface: #0d1615;
+  --bg-elevated: #172523;
+  --bg-hover: #172523;
+  --border-base: #172523;
+  --border-soft: #111c1a;
+  --glass-bg: rgba(23, 37, 35, 0.6);
+  --glass-border: rgba(255, 255, 255, 0.05);
+  --input-bg: rgba(13, 22, 21, 0.8);
+}
+
+/* ── 兼容层：未设置 data-theme 时按默认主题（靛蓝）渲染 ──────────────
+ * NOTE: theme-init.js 会在首帧前写入 data-theme，正常不会走到这里；
+ * 保留 :root 上的默认值（见上方「主题色板」第一节）已足够，
+ * 此块仅用于说明，不产生额外规则。 */
 
 @layer base {
   body {
@@ -51,6 +363,58 @@
     /* 阻止 iOS 横竖屏切换时自动放大字号，避免布局在横屏下走形 */
     -webkit-text-size-adjust: 100%;
     text-size-adjust: 100%;
+  }
+
+  /*
+   * 页面底纹 —— 已移除
+   *
+   * NOTE: 原先这里用 body::before + position:fixed + z-index:-1 铺了一层
+   * 低饱和径向光晕（--page-texture），想做页面纵深。实测这个做法的代价
+   * 远大于收益：
+   *   ① 它是一层覆盖整个视口的半透明层，文字虽然有更高的绘制优先级，
+   *      但在部分合成路径下会与这层混合，观感就是「全屏文字发虚、蒙了层灰雾」；
+   *   ② z-index:-1 的行为依赖 body 是否建立层叠上下文，跨浏览器不一致；
+   *   ③ 它覆盖在 body 背景之上，等于让页面底色不再是精确的 --bg-base ——
+   *      这直接破坏了对比度校验的前提（我们所有色值都是按 --bg-base 算的）。
+   * 第 ③ 点尤其致命：一个「氛围装饰」不该让整套对比度计算失真。
+   * 若日后仍想加纵深，应改用给具体容器（如侧栏、卡片）加层次的局部手法，
+   * 而不是铺一张全屏的层。
+   */
+
+  /*
+   * 全局焦点可见性兜底
+   *
+   * NOTE: 原先全站只有 4 处零散的 focus 样式，键盘用户 Tab 时基本看不到自己在哪。
+   * 这里给所有可交互元素一个统一的:focus-visible 环 —— 用 :focus-visible 而非
+   * :focus，鼠标点击不会触发（不干扰视觉），只有键盘导航才出现。
+   *
+   * 用 outline 而非 box-shadow：outline 不参与布局、不会引起重排，且在高对比度
+   * 模式下系统能接管。outline-offset 让它与元素留出 2px 呼吸，贴边元素也看得清。
+   *
+   * NOTE: 焦点环用 --accent，随主题变色 —— 这是换主题后最直观的反馈之一。
+   */
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: var(--radius-xs);
+  }
+}
+
+/*
+ * 尊重系统的「减少动效」偏好
+ *
+ * NOTE: 前庭功能障碍用户看到位移/缩放类动画会眩晕。Windows 的「显示动画」关闭、
+ * macOS 的「减弱动态效果」都会置位这个媒体查询。这里把动画时长压到接近 0，
+ * 但不设 display:none —— 动画结束态仍要正常呈现，只是不再有过程。
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
   }
 }
 
@@ -106,24 +470,24 @@
   border: 1px solid var(--glass-border);
   box-shadow: var(--glass-shadow);
   /* 仅过渡 transform/border/阴影，避免拖拽重排时逐帧触发全属性过渡导致卡顿 */
-  transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1), border-color 0.3s ease, box-shadow 0.3s ease;
+  transition: transform var(--dur-slow) var(--ease-out), border-color var(--dur-slow) ease, box-shadow var(--dur-slow) ease;
 }
 
 .glass-card:hover {
-  border-color: rgba(99, 102, 241, 0.25);
-  box-shadow: 0 12px 40px 0 rgba(99, 102, 241, 0.1);
+  border-color: rgb(var(--accent-rgb) / 0.25);
+  box-shadow: var(--shadow-lg);
   transform: translateY(-2px);
 }
 
-/* 霓虹按钮渐变 */
+/* 霓虹按钮渐变 —— 保留原视觉（这是品牌调性的一部分），仅把时长接入动效令牌 */
 .btn-primary {
-  background: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%);
-  transition: all 0.2s ease-in-out;
+  background: var(--gradient-accent);
+  transition: background var(--dur-base) ease-in-out, box-shadow var(--dur-base) ease-in-out, transform var(--dur-base) ease-in-out;
 }
 
 .btn-primary:hover {
-  background: linear-gradient(135deg, #818cf8 0%, #6366f1 100%);
-  box-shadow: 0 0 15px rgba(99, 102, 241, 0.5);
+  background: var(--gradient-accent-hover);
+  box-shadow: 0 0 15px rgb(var(--accent-rgb) / 0.5);
   transform: translateY(-1px);
 }
 
@@ -136,8 +500,8 @@
 }
 
 .form-input:focus {
-  border-color: #6366f1;
-  box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgb(var(--accent-rgb) / 0.2);
   outline: none;
 }
 
@@ -173,14 +537,159 @@
 @keyframes pulse-green-anim {
   0% {
     transform: scale(0.95);
-    box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7);
+    box-shadow: 0 0 0 0 var(--state-ok-fg);
   }
   70% {
     transform: scale(1);
-    box-shadow: 0 0 0 6px rgba(34, 197, 94, 0);
+    box-shadow: 0 0 0 6px transparent;
   }
   100% {
     transform: scale(0.95);
-    box-shadow: 0 0 0 0 rgba(34, 197, 94, 0);
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * 组件层样式
+ *
+ * NOTE: 这一层只做三件事 —— 聚合既有变量、补全交互状态、保证无障碍。
+ * 不引入新的视觉语言（配色/字体/圆角全部沿用上面的令牌），
+ * 所以它和存量内联 class 混用不会出现两种风格。
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/*
+ * 骨架屏
+ *
+ * NOTE: 域名列表是典型的「一定会在 1-3 秒内加载完，但期间完全空白」的场景。
+ * 空窗期给骨架屏而非 spinner：骨架屏保留了内容将要出现的位置与形状，
+ * 感知等待时间明显短于「转圈 + 空白」，也能避免内容突然撑开导致的布局跳动。
+ *
+ * 用 background-position 位移而非 opacity 呼吸：前者只影响绘制层、
+ * 不触发重排，长列表下开销更低。
+ */
+.skeleton {
+  background-color: var(--bg-elevated);
+  background-image: linear-gradient(
+    90deg,
+    var(--bg-elevated) 0%,
+    var(--bg-hover) 50%,
+    var(--bg-elevated) 100%
+  );
+  background-size: 200% 100%;
+  border-radius: var(--radius-sm);
+  animation: skeleton-shimmer 1.4s ease-in-out infinite;
+}
+
+@keyframes skeleton-shimmer {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+
+/* 减动效时骨架屏不闪，改为静态色块（信息量不变，只是不动） */
+@media (prefers-reduced-motion: reduce) {
+  .skeleton {
+    animation: none;
+    background-image: none;
+  }
+}
+
+/*
+ * 卡片容器 —— 聚合 rounded / border / shadow，取代调用处手写四五个 class。
+ * 三档：flat（无阴影，用于嵌套）/ default（默认卡片）/ raised（可点击、有悬浮反馈）
+ */
+.ui-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-base);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+
+.ui-card--flat {
+  box-shadow: none;
+}
+
+.ui-card--default {
+  box-shadow: var(--shadow-sm);
+}
+
+.ui-card--raised {
+  box-shadow: var(--shadow-sm);
+  transition: box-shadow var(--dur-base) var(--ease-out), transform var(--dur-base) var(--ease-out), border-color var(--dur-base) var(--ease-out);
+}
+
+.ui-card--raised:hover {
+  box-shadow: var(--shadow-md);
+  transform: translateY(-1px);
+}
+
+/* 触屏上取消位移（沿用文件开头的既有约定，避免 hover 粘住造成错位） */
+@media (hover: none) {
+  .ui-card--raised:hover {
+    transform: none;
+  }
+}
+
+/*
+ * 状态徽章 —— 五态语义色，明暗自动切换。
+ * 用 border 而非纯底色：底色块在小字号下对边界感帮助有限，描边能显著提升可辨识度。
+ */
+.ui-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-weight: 500;
+  white-space: nowrap;
+  border-radius: var(--radius-full);
+  border: 1px solid transparent;
+  line-height: 1.35;
+}
+
+/* 状态点 —— 徽章内或列表前的圆形指示 */
+.ui-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-full);
+  flex-shrink: 0;
+  background: currentColor;
+}
+
+/*
+ * 品牌实底（渐变 + 辉光）
+ *
+ * WHY 抽成类而非 Tailwind 工具类：
+ *   调用处原本写的是 `bg-gradient-to-br from-indigo-500 to-indigo-600
+ *   hover:from-indigo-400 hover:to-indigo-500 hover:shadow-accent` —— 六个类
+ *   手写同一件事，且色阶名（indigo-500）把主题焊死在了调用点。这里是
+ *   「主题相关的一次性视觉」，正适合下沉成令牌消费方：换主题只需改
+ *   --gradient-accent / --accent-rgb，调用处一个字都不用动。
+ *
+ * NOTE: 前景色用 --accent-contrast 而非写死 text-white —— 墨玉主题在暗色下
+ * 强调色被提亮到 #4ec9ac（明度很高），压白字只有 1.9:1；必须用深墨绿前景。
+ */
+.bg-accent-gradient {
+  background-image: var(--gradient-accent);
+  color: var(--accent-contrast);
+}
+
+.bg-accent-gradient:hover {
+  background-image: var(--gradient-accent-hover);
+}
+
+/*
+ * 触控目标提升
+ *
+ * NOTE: WCAG 2.5.8 要求交互目标至少 24x24 CSS 像素，移动端实践推荐 44x44。
+ * 存量图标按钮普遍是 p-2 + 16px 图标 = 32px，桌面精度够用、手指上偏小。
+ * 这里只在粗指针（触摸）设备上撑到 44px，桌面观感完全不变。
+ */
+@media (pointer: coarse) {
+  .touch-target {
+    min-width: 44px;
+    min-height: 44px;
   }
 }

@@ -1,0 +1,127 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<title>墨玉 × 暗色 · 修复前后对比</title><style>
+*{box-sizing:border-box}
+body{margin:0;padding:28px;background:#0a0d12;color:#dbe4f0;
+  font:13.5px/1.6 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+h1{font-size:19px;margin:0 0 6px}
+.lede{color:#8798ad;font-size:12.5px;max-width:820px;margin:0 0 10px}
+.root{margin:0 0 22px;padding:9px 12px;background:#141b26;border-radius:8px;
+  font:11.5px/1.5 ui-monospace,Menlo,monospace;color:#8fa5bd;white-space:pre-wrap}
+.wrap{display:grid;grid-template-columns:1fr 1fr;gap:18px;max-width:1080px}
+.panel{border-radius:12px;padding:14px;border:1px solid rgba(255,255,255,.07)}
+.ph{display:flex;align-items:center;gap:9px;margin-bottom:12px;font-size:14px}
+.badge{font-size:10.5px;font-weight:700;padding:2.5px 8px;border-radius:99px}
+.badge.bad{background:#ef444426;color:#f87171;border:1px solid #ef444440}
+.badge.good{background:#22c55e26;color:#4ade80;border:1px solid #22c55e40}
+.card{border:1px solid;border-radius:10px;padding:14px}
+.row{display:flex;gap:7px}
+.chip{width:64px;height:22px;border-radius:5px;border:1px solid rgba(255,255,255,.1)}
+.field{border:1px solid;border-radius:7px;padding:8px 10px;margin-bottom:8px}
+button{border:0;border-radius:7px;padding:8px 16px;font-weight:700;font-size:12px;
+  margin-top:12px;cursor:default;width:100%}
+.t{width:100%;margin-top:13px;border-collapse:collapse;font-size:11px}
+.t td{padding:3.5px 6px;border-bottom:1px solid rgba(255,255,255,.06)}
+.t code{font:10.5px ui-monospace,Menlo,monospace;color:#9db2cc}
+.t td.ok{color:#4ade80;font-weight:700;text-align:right}
+.t td.no{color:#f87171;font-weight:700;text-align:right}
+.note{font-size:11px;color:#8798ad;margin-top:11px;line-height:1.55}
+.note code{color:#9db2cc}
+footer{margin-top:24px;padding-top:14px;border-top:1px solid #1e2937;
+  color:#7a8ba0;font-size:12px;max-width:1080px}
+</style></head><body>
+<h1>墨玉 · 深青绿 × 暗色 — 修复前后对比</h1>
+<p class="lede">根因：<code>[data-theme="inkjade"]</code> 这个「墨玉亮色中性色」块漏写 <code>:not(.dark)</code>，
+于是在暗色下也命中，且排在 <code>.dark</code> 之后 —— 把暗色的 <code>--text-*</code> 覆盖成了亮色的深色值。
+深墨绿字压在近黑底上，对比度只剩 1.17:1。</p>
+<div class="root">墨玉 × 暗色 生效的令牌块（按层叠顺序）：
+  修复前: :root → [data-theme=inkjade](色相) → :root(暗?否) → .dark → [data-theme=inkjade](亮色中性色!污染) → [data-theme=inkjade].dark
+  修复后: :root → [data-theme=inkjade](色相) → :root(暗?否) → .dark → [data-theme=inkjade].dark
+                                                    ↑ 亮色块已改为 :not(.dark)，暗色下不再命中</div>
+<div class="wrap">
+  
+  <div class="panel" style="background:#080f0e">
+    <div class="ph"><span class="badge bad">修复前 · 令牌被污染</span><b style="color:#14211f">设置</b></div>
+    <div class="card" style="background:#0d1615;border-color:#172523">
+      <div style="color:#4ec9ac;font-weight:700;font-size:13px;margin-bottom:2px">⚙ 外观</div>
+      <div style="color:#5c726d;font-size:11px;margin-bottom:14px">外观、系统配置、通知渠道与自动续期策略</div>
+
+      <div style="color:#14211f;font-weight:600;font-size:12.5px;margin-bottom:8px">配色主题</div>
+      <div class="row">
+        <div class="chip" style="background:#1f7a68"></div>
+        <div class="chip" style="background:#4ec9ac"></div>
+        <div class="chip" style="background:#ffffff"></div>
+      </div>
+
+      <div style="color:#14211f;font-weight:600;font-size:12.5px;margin:16px 0 8px">深色模式</div>
+      <div style="color:#3c4f4b;font-size:11.5px;margin-bottom:14px">深色界面适合夜间与弱光环境</div>
+
+      <div style="color:#14211f;font-weight:600;font-size:12.5px;margin-bottom:8px">当前管理员</div>
+      <div style="color:#3c4f4b;font-size:11.5px;margin-bottom:14px">123</div>
+
+      <div class="field" style="background:#172523;border-color:#172523">
+        <span style="color:#5c726d;font-size:11.5px">原密码</span>
+      </div>
+      <div class="field" style="background:#172523;border-color:#172523">
+        <span style="color:#5c726d;font-size:11.5px">新密码（至少 8 位）</span>
+      </div>
+
+      <button style="background:#4ec9ac;color:#05201a">保存新密码</button>
+      <div style="color:#5c726d;font-size:10.5px;margin-top:10px">修改成功后当前会话将失效，需用新凭据重新登录。</div>
+    </div>
+
+    <table class="t">
+      <tr><td>text-primary</td><td><code>#14211f</code></td><td class="no">1.17:1</td></tr>
+      <tr><td>text-secondary</td><td><code>#3c4f4b</code></td><td class="no">2.11:1</td></tr>
+      <tr><td>text-muted</td><td><code>#5c726d</code></td><td class="no">3.76:1</td></tr>
+      <tr><td>accent</td><td><code>#4ec9ac</code></td><td class="ok">8.99:1</td></tr>
+      <tr><td>accent-contrast</td><td><code>#05201a</code></td><td class="ok">8.37:1</td></tr>
+    </table>
+    <div class="note">中性色被「墨玉亮色块」覆盖成深墨绿 —— 深字压近黑底，几乎不可读。</div>
+  </div>
+  
+  <div class="panel" style="background:#080f0e">
+    <div class="ph"><span class="badge good">修复后 ✓</span><b style="color:#ffffff">设置</b></div>
+    <div class="card" style="background:#0d1615;border-color:#172523">
+      <div style="color:#4ec9ac;font-weight:700;font-size:13px;margin-bottom:2px">⚙ 外观</div>
+      <div style="color:#94a3b8;font-size:11px;margin-bottom:14px">外观、系统配置、通知渠道与自动续期策略</div>
+
+      <div style="color:#ffffff;font-weight:600;font-size:12.5px;margin-bottom:8px">配色主题</div>
+      <div class="row">
+        <div class="chip" style="background:#1f7a68"></div>
+        <div class="chip" style="background:#4ec9ac"></div>
+        <div class="chip" style="background:#ffffff"></div>
+      </div>
+
+      <div style="color:#ffffff;font-weight:600;font-size:12.5px;margin:16px 0 8px">深色模式</div>
+      <div style="color:#cbd5e1;font-size:11.5px;margin-bottom:14px">深色界面适合夜间与弱光环境</div>
+
+      <div style="color:#ffffff;font-weight:600;font-size:12.5px;margin-bottom:8px">当前管理员</div>
+      <div style="color:#cbd5e1;font-size:11.5px;margin-bottom:14px">123</div>
+
+      <div class="field" style="background:#172523;border-color:#172523">
+        <span style="color:#94a3b8;font-size:11.5px">原密码</span>
+      </div>
+      <div class="field" style="background:#172523;border-color:#172523">
+        <span style="color:#94a3b8;font-size:11.5px">新密码（至少 8 位）</span>
+      </div>
+
+      <button style="background:#4ec9ac;color:#05201a">保存新密码</button>
+      <div style="color:#94a3b8;font-size:10.5px;margin-top:10px">修改成功后当前会话将失效，需用新凭据重新登录。</div>
+    </div>
+
+    <table class="t">
+      <tr><td>text-primary</td><td><code>#ffffff</code></td><td class="ok">19.35:1</td></tr>
+      <tr><td>text-secondary</td><td><code>#cbd5e1</code></td><td class="ok">12.38:1</td></tr>
+      <tr><td>text-muted</td><td><code>#94a3b8</code></td><td class="ok">7.55:1</td></tr>
+      <tr><td>accent</td><td><code>#4ec9ac</code></td><td class="ok">8.99:1</td></tr>
+      <tr><td>accent-contrast</td><td><code>#05201a</code></td><td class="ok">8.37:1</td></tr>
+    </table>
+    <div class="note">中性色来自 <code>.dark</code> 基底，与靛蓝暗色一致（19.35:1 / 12.38:1 / 7.55:1）。</div>
+  </div>
+</div>
+<footer>
+  校验命令：<code>npm run check:cascade</code> 会解析编译产物、模拟层叠、核对 4 个组合的生效值；
+  <code>npm run check:contrast</code> 检查色值本身的对比度。
+  两者必须都跑 —— 这次事故中对比度脚本 72 项全绿，因为它查的不是生效值。
+</footer>
+</body></html>

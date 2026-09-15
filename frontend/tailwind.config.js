@@ -59,6 +59,52 @@ export default {
         "content-secondary": "var(--text-secondary)",
         "content-muted": "var(--text-muted)",
         accent: "var(--accent)",
+
+        /*
+         * 状态语义色 —— 组件层唯一入口，替代直接写 emerald/amber/red/slate/sky。
+         *
+         * NOTE: 键名统一为 ok / warn / danger / info / idle，每个带 bg / fg / border
+         * 三个子键，所以用法是 `bg-state-ok-bg text-state-ok-fg border-state-ok-border`。
+         * 这套值在 index.css 的 :root 与 .dark 各有一份，明暗自动切换。
+         *
+         * 为什么不沿用 Tailwind 内置色阶（如 bg-emerald-50 dark:bg-emerald-950/80）：
+         * 1) 每处要写两遍、且暗色档位靠人工配，App.tsx 里已散落大量这种双写；
+         * 2) 暗色档位写错时（如日志区写死 bg-red-950 却用在亮色主题）不会报错，
+         *    只会静默显示成错误配色 —— 收敛到语义名后不可能写错主题。
+         */
+        state: {
+          "ok-bg": "var(--state-ok-bg)",
+          "ok-fg": "var(--state-ok-fg)",
+          "ok-border": "var(--state-ok-border)",
+          "warn-bg": "var(--state-warn-bg)",
+          "warn-fg": "var(--state-warn-fg)",
+          "warn-border": "var(--state-warn-border)",
+          "danger-bg": "var(--state-danger-bg)",
+          "danger-fg": "var(--state-danger-fg)",
+          "danger-border": "var(--state-danger-border)",
+          "info-bg": "var(--state-info-bg)",
+          "info-fg": "var(--state-info-fg)",
+          "info-border": "var(--state-info-border)",
+          "idle-bg": "var(--state-idle-bg)",
+          "idle-fg": "var(--state-idle-fg)",
+          "idle-border": "var(--state-idle-border)"
+        },
+
+        /*
+         * 服务商来源色 —— 跨源搜索分组、侧栏 badge、域名卡片来源带共用。
+         * 让「这条数据来自哪个服务商」成为可扫读的视觉锚点。
+         */
+        source: {
+          "dnshe-bg": "var(--source-dnshe-bg)",
+          "dnshe-fg": "var(--source-dnshe-fg)",
+          "cf-bg": "var(--source-cf-bg)",
+          "cf-fg": "var(--source-cf-fg)",
+          "dp-bg": "var(--source-dp-bg)",
+          "dp-fg": "var(--source-dp-fg)",
+          "custom-bg": "var(--source-custom-bg)",
+          "custom-fg": "var(--source-custom-fg)"
+        },
+
         // 自定义一些高端、质感更好的暗色系调色板（保留兼容）
         dark: {
           50: "#f6f6f9",
@@ -74,6 +120,36 @@ export default {
           900: "#0f151f",
           950: "#090d14",
         }
+      },
+      /*
+       * 圆角令牌 —— 覆盖 Tailwind 默认档位，让 rounded-md / rounded-lg / rounded-xl
+       * 全部指向 index.css 的 --radius-*，全站换圆角风格只改一处。
+       *
+       * NOTE: 这里只覆盖不新增，因为 App.tsx 里已有大量 rounded-lg / rounded-xl 调用，
+       * 保持同名才能让存量代码自动吃到新令牌，而无需批量改写。
+       */
+      borderRadius: {
+        sm: "var(--radius-sm)",
+        md: "var(--radius-md)",
+        lg: "var(--radius-lg)",
+        xl: "var(--radius-xl)",
+        "2xl": "var(--radius-lg)", // 收敛：2xl 归入 lg，避免弹窗圆角过大
+      },
+      boxShadow: {
+        xs: "var(--shadow-xs)",
+        sm: "var(--shadow-sm)",
+        md: "var(--shadow-md)",
+        lg: "var(--shadow-lg)",
+        accent: "var(--shadow-accent)",
+      },
+      transitionTimingFunction: {
+        out: "var(--ease-out)",
+        spring: "var(--ease-spring)",
+      },
+      transitionDuration: {
+        fast: "var(--dur-fast)",
+        base: "var(--dur-base)",
+        slow: "var(--dur-slow)",
       }
     },
   },

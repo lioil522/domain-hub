@@ -10,7 +10,10 @@
     "build:node": "esbuild server/index.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/server.mjs",
     "start:node": "node dist-node/server.mjs",
     "verify:node": "tsc --noEmit -p server",
-    "test:node": "esbuild server/d1-sqlite.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/d1-sqlite.test.mjs && node dist-node/d1-sqlite.test.mjs"
+    "test:node": "esbuild server/d1-sqlite.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/d1-sqlite.test.mjs && node dist-node/d1-sqlite.test.mjs",
+    "check:contrast": "node contrast-check.mjs",
+    "check:cascade": "node cascade-check.mjs",
+    "check:theme": "node cascade-check.mjs && node contrast-check.mjs"
   },
   "engines": {
     "node": ">=22.5.0"

@@ -1,0 +1,29 @@
+/*
+ * Domain Hub · 全局样式入口（编排层）
+ *
+ * WHY 拆成 styles/ 多个文件（方案 §十四）：
+ *   原先 index.css 单文件 1158 行，令牌层 / 基础层 / 液态玻璃覆写层 / 组件层
+ *   混在一起，改一个组件样式要在千行文件里翻找，且「主题令牌」与「业务组件
+ *   覆写」容易互相污染（后者带 !important，前者是变量声明）。
+ *   按职责拆分后，改令牌只开 tokens.css、改玻璃主题只开 liquid-glass.css。
+ *
+ * NOTE: 拆分是**纯搬运** —— 各分片的源码内容与本文件里的 @import 顺序，
+ * 与拆分前的单文件逐行一致，产物 CSS 内容不变（已用产物字节对比验证）。
+ *   ① tailwind      @tailwind base/components/utilities 三层指令
+ *   ② tokens        主题令牌（色板 / 明暗基底 / 交叉修正 / 兼容说明）
+ *   ③ base          @layer base 基础层（body、:focus-visible 兜底）
+ *   ④ liquid-glass  液态玻璃主题的组件覆写层
+ *   ⑤ components    组件层（skeleton / ui-card / ui-badge / accent-gradient / touch-target）
+ *
+ * ⚠ 顺序敏感：tokens 内部靠源码顺序解决特异性平局（见该文件头注释），
+ *   liquid-glass 覆写层必须在 tokens 之后。不要重排下面的 @import。
+ *
+ * ⚠ @import 必须位于所有规则之前（CSS 规范 + PostCSS/Vite 约定），因此本文件
+ *   只放 @import，不写任何规则；@tailwind 指令收进 styles/tailwind.css 并排在首位。
+ */
+
+@import "./styles/tailwind.css";
+@import "./styles/tokens.css";
+@import "./styles/base.css";
+@import "./styles/liquid-glass.css";
+@import "./styles/components.css";

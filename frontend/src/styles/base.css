@@ -1,0 +1,45 @@
+@layer base {
+  body {
+    font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    background-color: var(--bg-base);
+    color: var(--text-primary);
+    transition: background-color 0.3s ease, color 0.3s ease;
+    /* 阻止 iOS 横竖屏切换时自动放大字号，避免布局在横屏下走形 */
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+  }
+
+  /*
+   * 页面底纹 —— 已移除
+   *
+   * NOTE: 原先这里用 body::before + position:fixed + z-index:-1 铺了一层
+   * 低饱和径向光晕（--page-texture），想做页面纵深。实测这个做法的代价
+   * 远大于收益：
+   *   ① 它是一层覆盖整个视口的半透明层，文字虽然有更高的绘制优先级，
+   *      但在部分合成路径下会与这层混合，观感就是「全屏文字发虚、蒙了层灰雾」；
+   *   ② z-index:-1 的行为依赖 body 是否建立层叠上下文，跨浏览器不一致；
+   *   ③ 它覆盖在 body 背景之上，等于让页面底色不再是精确的 --bg-base ——
+   *      这直接破坏了对比度校验的前提（我们所有色值都是按 --bg-base 算的）。
+   * 第 ③ 点尤其致命：一个「氛围装饰」不该让整套对比度计算失真。
+   * 若日后仍想加纵深，应改用给具体容器（如侧栏、卡片）加层次的局部手法，
+   * 而不是铺一张全屏的层。
+   */
+
+  /*
+   * 全局焦点可见性兜底
+   *
+   * NOTE: 原先全站只有 4 处零散的 focus 样式，键盘用户 Tab 时基本看不到自己在哪。
+   * 这里给所有可交互元素一个统一的:focus-visible 环 —— 用 :focus-visible 而非
+   * :focus，鼠标点击不会触发（不干扰视觉），只有键盘导航才出现。
+   *
+   * 用 outline 而非 box-shadow：outline 不参与布局、不会引起重排，且在高对比度
+   * 模式下系统能接管。outline-offset 让它与元素留出 2px 呼吸，贴边元素也看得清。
+   *
+   * NOTE: 焦点环用 --accent，随主题变色 —— 这是换主题后最直观的反馈之一。
+   */
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: var(--radius-xs);
+  }
+}

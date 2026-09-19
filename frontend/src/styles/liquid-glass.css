@@ -1,0 +1,649 @@
+/* ═══════════════════════════════════════════════════════════════════
+ * 液态玻璃主题 · 组件覆写层
+ *
+ * WHY 单独一节而不是改 App.tsx：
+ *   液态玻璃的核心效果（半透明底 + backdrop-filter + 背景图透出）需要
+ *   侧栏/顶栏/卡片全部从实底改为玻璃底——涉及散落在 14000+ 行 App.tsx
+ *   中的 40+ 处 className。逐个改既高风险又破坏其余两套主题的观感。
+ *   这里用属性选择器 [data-theme="liquidglass"] 统一覆写，零 TSX 改动；
+ *   其余两套主题完全不受影响。
+ *
+ * 原理：
+ *   ① body 直接用背景图替代实色底 → 这是玻璃的「可透层」
+ *   ② 根容器 (.bg-page) 改为透明 → 让 body 背景图可见
+ *   ③ 侧栏/顶栏/卡片的 bg-surface → 改为 --glass-bg + backdrop-filter
+ *   ④ 悬浮层/弹窗保留实底 → 避免多层半透明叠加的「层漏」
+ *
+ * NOTE: 这些规则的特异性 (0,2,0) 高于 Tailwind 的单类 (0,1,0)，
+ * 能稳定压过 .bg-surface / .bg-page 等工具类。
+ *
+ * ── 特异性契约（CSS 审计结论，方案 §十五）───────────────────────────
+ * 全项目 31 处 !important **全部集中在本文件**，tokens / base / components
+ * 三层零 !important。这是刻意维持的边界，请勿打破：
+ *   · 令牌层（tokens）      → 只声明 CSS 变量，永远不需要 !important；
+ *   · 基础层（base）        → 元素级 reset，特异性最低，靠源码顺序生效；
+ *   · 组件层（components）  → 单类选择器（.ui-card 等），与 Tailwind 工具类
+ *                            同级，靠「调用方 className 排最后」的约定处理冲突；
+ *   · 玻璃覆写层（本文件）  → **唯一**允许 !important 的地方：它以属性选择器
+ *                            [data-theme="liquidglass"] 覆写散落在 TSX 里的
+ *                            Tailwind 工具类，两者特异性可能打平，用 !important
+ *                            把「主题覆写」的优先级显式固定下来，避免依赖脆弱
+ *                            的源码顺序。
+ * 新增样式时：先问「它属于哪一层」，再到对应文件里写；不要在组件层新引入
+ * !important，也不要让业务组件自己决定 z-index / 颜色（走令牌与语义类）。
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* ── ① body 背景图 ────────────────────────────────────────────────
+ * 亮色叠加晨光水影径向微光，暗色叠加深海冷碧波光，
+ * 让底层水波纹理与反光光斑清澈灵动地贯穿全屏。 */
+[data-theme="liquidglass"] body {
+  background: 
+    radial-gradient(ellipse 90% 40% at 50% 0%, rgba(255, 255, 255, 0.45), transparent 70%),
+    var(--bg-base) url("/liquid-glass-bg.jpg") center / cover no-repeat fixed;
+}
+
+[data-theme="liquidglass"].dark body {
+  background: 
+    radial-gradient(ellipse 80% 50% at 50% -10%, rgba(116, 236, 224, 0.2), transparent 70%),
+    linear-gradient(rgba(4, 20, 18, 0.58), rgba(2, 14, 12, 0.75)),
+    url("/liquid-glass-bg.jpg") center / cover no-repeat fixed;
+}
+
+/* ── ② 根容器透明 ──────────────────────────────────────────────────
+ * 让 body 的背景图毫无阻挡地穿透整个页面。 */
+[data-theme="liquidglass"] .bg-page {
+  background-color: transparent !important;
+}
+
+/* ── ③ 侧栏 · 晶莹竖向玻璃面板 ──────────────────────────────────────
+ * 侧栏不再是一大块死板实色，而是高透晶莹的竖置玻璃面板，
+ * 具有右侧透镜聚光边框与轻柔投影。 */
+[data-theme="liquidglass"] aside.bg-surface {
+  background: var(--glass-bg) !important;
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  border-right: 1px solid var(--glass-border) !important;
+  box-shadow: inset -1px 0 0 0 var(--glass-border), 4px 0 24px 0 rgba(0, 0, 0, 0.06);
+}
+
+/* ── ④ 顶栏 · 横向透镜高光条 ────────────────────────────────────── */
+[data-theme="liquidglass"] header.border-b {
+  background: var(--glass-bg) !important;
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  border-bottom: 1px solid var(--glass-border) !important;
+  box-shadow: inset 0 -1px 0 0 var(--glass-border), 0 4px 20px 0 rgba(0, 0, 0, 0.05);
+}
+
+/* ── ⑤ 卡片 · 液态水凝玻璃 ──────────────────────────────────────────
+ * 核心：高通透、绝无磨砂感、双重内高光折射、光滑如镜面的弧面反光层。
+ * NOTE: 必须排除 :not(.absolute):not(.fixed)，避免覆盖顶栏搜索下拉等绝对定位浮层。 */
+[data-theme="liquidglass"] .bg-surface[class*="rounded-2xl"]:not(.absolute):not(.fixed),
+[data-theme="liquidglass"] .bg-surface[class*="rounded-xl"]:not(.absolute):not(.fixed),
+[data-theme="liquidglass"] .glass-card:not(.absolute):not(.fixed),
+[data-theme="liquidglass"] .ui-card:not(.absolute):not(.fixed) {
+  background: var(--glass-bg) !important;
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  border: 1px solid var(--glass-border) !important;
+  box-shadow: var(--glass-shadow) !important;
+  position: relative;
+  overflow: hidden;
+}
+
+/* 卡片液态镜面流动反光层：模拟凸面透镜的光滑油膜与反光弧度 */
+[data-theme="liquidglass"] .bg-surface[class*="rounded-2xl"]:not(.absolute):not(.fixed)::before,
+[data-theme="liquidglass"] .bg-surface[class*="rounded-xl"]:not(.absolute):not(.fixed)::before,
+[data-theme="liquidglass"] .glass-card:not(.absolute):not(.fixed)::before,
+[data-theme="liquidglass"] .ui-card:not(.absolute):not(.fixed)::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--glass-highlight);
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* 保证卡片内部所有文字、图标和操作按钮在反光层之上，清晰锐利 */
+[data-theme="liquidglass"] .bg-surface[class*="rounded-2xl"]:not(.absolute):not(.fixed) > *,
+[data-theme="liquidglass"] .bg-surface[class*="rounded-xl"]:not(.absolute):not(.fixed) > *,
+[data-theme="liquidglass"] .glass-card:not(.absolute):not(.fixed) > *,
+[data-theme="liquidglass"] .ui-card:not(.absolute):not(.fixed) > * {
+  position: relative;
+  z-index: 2;
+}
+
+/* 悬停微动：水面涟漪光感反馈 */
+[data-theme="liquidglass"] .glass-card:hover,
+[data-theme="liquidglass"] button.glass-card:hover {
+  border-color: rgba(255, 255, 255, 0.85) !important;
+  box-shadow: 
+    inset 0 2px 2px 0 rgba(255, 255, 255, 0.9),
+    inset 0 -1.5px 2px 0 rgba(10, 60, 52, 0.08),
+    0 16px 40px -6px rgba(18, 70, 64, 0.16) !important;
+}
+[data-theme="liquidglass"].dark .glass-card:hover,
+[data-theme="liquidglass"].dark button.glass-card:hover {
+  border-color: rgba(255, 255, 255, 0.42) !important;
+  box-shadow: 
+    inset 0 2px 2px 0 rgba(255, 255, 255, 0.55),
+    inset 0 0 2px 1px rgba(255, 255, 255, 0.12),
+    0 18px 48px -4px rgba(0, 0, 0, 0.6) !important;
+}
+
+/* ── ⑤-1 账号分组容器与分组面板 · 透光流玻 ──────────────────────────
+ * DomainsPage / CfZonesPage / DpZonesPage / MultiProviderPage 外层大卡片
+ * 使用了 .bg-hovered.rounded-2xl，流玻主题下必须统一转为透光玻璃质感，
+ * 消除大黑块，让背景水波纹穿透整个卡片组。 */
+[data-theme="liquidglass"] .bg-hovered[class*="rounded-2xl"]:not(.absolute):not(.fixed),
+[data-theme="liquidglass"] div[class*="bg-hovered"][class*="rounded-2xl"]:not(.absolute):not(.fixed),
+[data-theme="liquidglass"] .bg-hovered[class*="rounded-xl"]:not(.absolute):not(.fixed),
+[data-theme="liquidglass"] div[class*="bg-hovered"][class*="rounded-xl"]:not(.absolute):not(.fixed) {
+  background: var(--glass-bg) !important;
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  border: 1px solid var(--glass-border) !important;
+  box-shadow: var(--glass-shadow) !important;
+  position: relative;
+}
+
+/* 账号展开时的 sticky 吸顶行：背景完全透明保持与外层卡片浑然一体，消除双重叠加色差 */
+[data-theme="liquidglass"] .sticky[class*="bg-transparent"],
+[data-theme="liquidglass"] .sticky[class*="bg-hovered"] {
+  background: transparent !important;
+  backdrop-filter: blur(12px) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(12px) saturate(var(--glass-saturate));
+  border-bottom: 1px solid var(--glass-border) !important;
+}
+
+/* 嵌套在流玻外框内的域名卡片：微调底色纯净度，避免多层暗色叠加发黑 */
+[data-theme="liquidglass"].dark .bg-hovered .bg-surface[class*="rounded-2xl"],
+[data-theme="liquidglass"].dark div[class*="bg-hovered"] .bg-surface[class*="rounded-2xl"] {
+  background: rgba(255, 255, 255, 0.035) !important;
+  border-color: rgba(255, 255, 255, 0.18) !important;
+}
+[data-theme="liquidglass"]:not(.dark) .bg-hovered .bg-surface[class*="rounded-2xl"],
+[data-theme="liquidglass"]:not(.dark) div[class*="bg-hovered"] .bg-surface[class*="rounded-2xl"] {
+  background: rgba(255, 255, 255, 0.5) !important;
+  border-color: rgba(255, 255, 255, 0.8) !important;
+}
+
+/* ── ⑤-2 筛选胶囊（FilterChip）· 透亮流玻水滴胶囊 ──────────────────
+ * 彻底消除账号管理等页面筛选栏未选中时的黑沉实色块，让背景水波穿透，微反光浮现 */
+[data-theme="liquidglass"] .filter-chip:not([aria-pressed="true"]) {
+  background: var(--glass-bg) !important;
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  border: 1px solid var(--glass-border) !important;
+  box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.2), 0 2px 8px -2px rgba(0, 0, 0, 0.1);
+}
+[data-theme="liquidglass"].dark .filter-chip:not([aria-pressed="true"]) {
+  background: rgba(4, 24, 21, 0.42) !important;
+  border: 1px solid rgba(255, 255, 255, 0.18) !important;
+  box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.3), 0 2px 8px -2px rgba(0, 0, 0, 0.25);
+}
+[data-theme="liquidglass"] .filter-chip:not([aria-pressed="true"]):hover {
+  background: rgba(255, 255, 255, 0.25) !important;
+  border-color: var(--accent) !important;
+  box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.4), 0 0 10px 0 rgba(var(--accent-rgb) / 0.2) !important;
+}
+[data-theme="liquidglass"].dark .filter-chip:not([aria-pressed="true"]):hover {
+  background: rgba(8, 38, 34, 0.6) !important;
+  border-color: var(--accent) !important;
+  box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.45), 0 0 10px 0 rgba(var(--accent-rgb) / 0.3) !important;
+}
+
+
+/* ── ⑥ 表单输入框与搜索框 · 晶莹微凹水槽与现代圆角 ────────────── */
+[data-theme="liquidglass"] .form-input,
+[data-theme="liquidglass"] input.form-input,
+[data-theme="liquidglass"] select.form-input,
+[data-theme="liquidglass"] textarea.form-input {
+  background: var(--input-bg) !important;
+  border: 1px solid var(--input-border) !important;
+  border-radius: 12px !important;
+  box-shadow: inset 0 1.5px 3px 0 rgba(0, 0, 0, 0.12);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+[data-theme="liquidglass"] .form-input:focus,
+[data-theme="liquidglass"] input.form-input:focus,
+[data-theme="liquidglass"] select.form-input:focus,
+[data-theme="liquidglass"] textarea.form-input:focus {
+  border-color: var(--accent) !important;
+  box-shadow: inset 0 1px 2px 0 rgba(0, 0, 0, 0.08), 0 0 0 2px rgb(var(--accent-rgb) / 0.35) !important;
+}
+
+[data-theme="liquidglass"].dark .form-input,
+[data-theme="liquidglass"].dark input.form-input,
+[data-theme="liquidglass"].dark select.form-input,
+[data-theme="liquidglass"].dark textarea.form-input {
+  background: rgba(4, 20, 18, 0.45) !important;
+  border: 1px solid rgba(255, 255, 255, 0.16) !important;
+  box-shadow: inset 0 1.5px 3px 0 rgba(0, 0, 0, 0.35) !important;
+}
+
+/* 原生 select 及 option 暗色模式适配兜底 */
+.dark select.form-input,
+[data-theme="liquidglass"].dark select.form-input,
+.dark select {
+  color-scheme: dark;
+}
+:root:not(.dark) select.form-input,
+:root:not(.dark) select {
+  color-scheme: light;
+}
+select.form-input option,
+select option {
+  background-color: var(--bg-elevated, #1a2433);
+  color: var(--text-primary, #ffffff);
+}
+
+/* ── ⑦ 次级容器与 elevated 模块 · 通透水润 ──────────────────────── */
+[data-theme="liquidglass"] .bg-elevated {
+  background-color: rgba(255, 255, 255, 0.45) !important;
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  border-color: var(--glass-border) !important;
+}
+
+[data-theme="liquidglass"].dark .bg-elevated {
+  background-color: rgba(4, 28, 24, 0.45) !important;
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  border-color: var(--glass-border) !important;
+}
+
+/* 弹窗及卡片内部嵌套模块（消除弹窗内实黑死墨绿）：轻透水感分层 */
+[data-theme="liquidglass"].dark .bg-surface .bg-elevated,
+[data-theme="liquidglass"].dark .bg-surface .bg-hovered,
+[data-theme="liquidglass"].dark .bg-surface div[class*="bg-elevated"],
+[data-theme="liquidglass"].dark .bg-surface div[class*="bg-hovered"],
+[data-theme="liquidglass"].dark div[role="dialog"] div[class*="bg-hovered"],
+[data-theme="liquidglass"].dark div[role="dialog"] div[class*="bg-elevated"] {
+  background: rgba(255, 255, 255, 0.035) !important;
+  border-color: rgba(255, 255, 255, 0.12) !important;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+[data-theme="liquidglass"]:not(.dark) .bg-surface .bg-elevated,
+[data-theme="liquidglass"]:not(.dark) .bg-surface .bg-hovered,
+[data-theme="liquidglass"]:not(.dark) .bg-surface div[class*="bg-elevated"],
+[data-theme="liquidglass"]:not(.dark) .bg-surface div[class*="bg-hovered"],
+[data-theme="liquidglass"]:not(.dark) div[role="dialog"] div[class*="bg-hovered"],
+[data-theme="liquidglass"]:not(.dark) div[role="dialog"] div[class*="bg-elevated"] {
+  background: rgba(255, 255, 255, 0.6) !important;
+  border-color: rgba(255, 255, 255, 0.8) !important;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+/* 弹窗及卡片内表格表头与行内水润分层 */
+[data-theme="liquidglass"].dark table thead tr,
+[data-theme="liquidglass"].dark table thead tr.bg-elevated,
+[data-theme="liquidglass"].dark tr.bg-elevated {
+  background: rgba(255, 255, 255, 0.05) !important;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12) !important;
+}
+
+[data-theme="liquidglass"]:not(.dark) table thead tr,
+[data-theme="liquidglass"]:not(.dark) table thead tr.bg-elevated,
+[data-theme="liquidglass"]:not(.dark) tr.bg-elevated {
+  background: rgba(0, 0, 0, 0.03) !important;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.08) !important;
+}
+
+/* 侧栏二级导航项（激活态）：晶莹微凹胶囊光感 */
+[data-theme="liquidglass"] button[aria-current="page"]:not(.group) {
+  background: rgb(var(--accent-rgb) / 0.18) !important;
+  color: var(--accent) !important;
+  border: 1px solid rgb(var(--accent-rgb) / 0.35) !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.25), 0 2px 8px rgb(var(--accent-rgb) / 0.15) !important;
+}
+
+/* ── ⑧ 模态遮罩、弹窗、下拉浮层与交互面板 · 深邃水凝琉璃立体感 ─────
+ * 杜绝冷板岩 slate-950 死黑，让背景水波纹通透穿透全站弹窗与遮罩。 */
+
+/* 模态遮罩层：透射深邃碧潭水光，取代生硬板岩死黑 */
+[data-theme="liquidglass"].dark .fixed.inset-0[class*="bg-slate-950"],
+[data-theme="liquidglass"].dark .fixed.inset-0.z-modal {
+  background: radial-gradient(ellipse at 50% 40%, rgba(6, 34, 30, 0.72), rgba(2, 14, 13, 0.88)) !important;
+  backdrop-filter: blur(12px) saturate(1.4);
+  -webkit-backdrop-filter: blur(12px) saturate(1.4);
+}
+
+[data-theme="liquidglass"]:not(.dark) .fixed.inset-0[class*="bg-slate-950"],
+[data-theme="liquidglass"]:not(.dark) .fixed.inset-0.z-modal {
+  background: radial-gradient(ellipse at 50% 40%, rgba(225, 245, 242, 0.6), rgba(185, 220, 215, 0.8)) !important;
+  backdrop-filter: blur(12px) saturate(1.2);
+  -webkit-backdrop-filter: blur(12px) saturate(1.2);
+}
+
+/* 模态弹窗外框：通透澄澈深水琉璃晶体 */
+[data-theme="liquidglass"].dark div[role="dialog"],
+[data-theme="liquidglass"].dark .bg-surface.shadow-2xl {
+  background: rgba(5, 24, 22, 0.88) !important;
+  backdrop-filter: blur(24px) saturate(1.6);
+  -webkit-backdrop-filter: blur(24px) saturate(1.6);
+  border: 1px solid rgba(255, 255, 255, 0.28) !important;
+  box-shadow: 
+    inset 0 1.5px 0 0 rgba(255, 255, 255, 0.55),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.12),
+    0 24px 64px -12px rgba(0, 0, 0, 0.75),
+    0 0 32px rgba(116, 236, 224, 0.08) !important;
+}
+
+[data-theme="liquidglass"]:not(.dark) div[role="dialog"],
+[data-theme="liquidglass"]:not(.dark) .bg-surface.shadow-2xl {
+  background: rgba(255, 255, 255, 0.88) !important;
+  backdrop-filter: blur(24px) saturate(1.4);
+  -webkit-backdrop-filter: blur(24px) saturate(1.4);
+  border: 1px solid rgba(255, 255, 255, 0.85) !important;
+  box-shadow: 
+    inset 0 1.5px 0 0 rgba(255, 255, 255, 0.95),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.5),
+    0 24px 64px -12px rgba(18, 70, 64, 0.2) !important;
+}
+
+/* 模态框头部与页脚：清透水质微反光，层次分明 */
+[data-theme="liquidglass"].dark div[role="dialog"] > div:first-child,
+[data-theme="liquidglass"].dark div[role="dialog"] header {
+  background: linear-gradient(180deg, rgba(14, 46, 42, 0.75) 0%, rgba(8, 28, 26, 0.55) 100%) !important;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.16) !important;
+}
+
+[data-theme="liquidglass"].dark div[role="dialog"] > div:last-child {
+  background: rgba(6, 26, 24, 0.65) !important;
+  border-top: 1px solid rgba(255, 255, 255, 0.12) !important;
+}
+
+[data-theme="liquidglass"]:not(.dark) div[role="dialog"] > div:first-child,
+[data-theme="liquidglass"]:not(.dark) div[role="dialog"] header {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.85) 0%, rgba(242, 249, 247, 0.7) 100%) !important;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.8) !important;
+}
+
+[data-theme="liquidglass"]:not(.dark) div[role="dialog"] > div:last-child {
+  background: rgba(245, 250, 249, 0.8) !important;
+  border-top: 1px solid rgba(255, 255, 255, 0.7) !important;
+}
+
+/* 弹窗内的操作卡片与折叠面板：翡翠水滴质感 */
+[data-theme="liquidglass"].dark div[role="dialog"] .rounded-2xl[class*="bg-elevated"],
+[data-theme="liquidglass"].dark div[role="dialog"] div[class*="rounded-2xl"][class*="backdrop-blur"] {
+  background: rgba(12, 38, 35, 0.55) !important;
+  border: 1px solid rgba(255, 255, 255, 0.18) !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.25), 0 4px 16px rgba(0, 0, 0, 0.25) !important;
+}
+
+[data-theme="liquidglass"].dark div[role="dialog"] .rounded-2xl[class*="bg-elevated"]:hover,
+[data-theme="liquidglass"].dark div[role="dialog"] div[class*="rounded-2xl"][class*="backdrop-blur"]:hover {
+  border-color: rgba(142, 225, 217, 0.4) !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35), 0 6px 20px rgba(0, 0, 0, 0.3) !important;
+}
+
+/* 空状态虚线框：微水波底色 */
+[data-theme="liquidglass"].dark div[role="dialog"] .border-dashed {
+  background: rgba(8, 32, 29, 0.4) !important;
+  border-color: rgba(142, 225, 217, 0.25) !important;
+}
+
+/* 弹窗页脚关闭按钮微调：水润晶透效果 */
+[data-theme="liquidglass"].dark div[role="dialog"] > div:last-child button {
+  background: rgba(255, 255, 255, 0.08) !important;
+  border: 1px solid rgba(255, 255, 255, 0.18) !important;
+  color: var(--text-primary) !important;
+  transition: all 0.2s ease;
+}
+[data-theme="liquidglass"].dark div[role="dialog"] > div:last-child button:hover {
+  background: rgba(142, 225, 217, 0.18) !important;
+  border-color: rgba(142, 225, 217, 0.45) !important;
+  color: var(--accent) !important;
+}
+
+/* 下拉浮层面板（操作中心、告警通知、搜索下拉、下拉选择）：
+ * 颜色严格跟随当前主题色系（深幽墨玉碧黑/纯净水白），但保持 100% 纯实底，
+ * 绝不透明透光，彻底根绝下层文字重影透字。 */
+[data-theme="liquidglass"].dark .dropdown-panel {
+  background-color: #0c1918 !important;
+  background: #0c1918 !important;
+  opacity: 1 !important;
+  border: 1px solid rgba(255, 255, 255, 0.18) !important;
+  box-shadow: 
+    0 20px 48px -4px rgba(0, 0, 0, 0.8),
+    0 0 20px rgba(116, 236, 224, 0.06),
+    inset 0 1px 0 rgba(255, 255, 255, 0.15) !important;
+}
+
+[data-theme="liquidglass"].dark .dropdown-panel div[class*="bg-surface"],
+[data-theme="liquidglass"].dark .dropdown-panel div[class*="hover:bg-hovered"],
+[data-theme="liquidglass"].dark .dropdown-panel div[class*="rounded-xl"] {
+  background-color: #122422 !important;
+  border-color: rgba(255, 255, 255, 0.1) !important;
+}
+
+[data-theme="liquidglass"].dark .dropdown-panel div[class*="bg-surface"]:hover,
+[data-theme="liquidglass"].dark .dropdown-panel div[class*="hover:bg-hovered"]:hover,
+[data-theme="liquidglass"].dark .dropdown-panel div[class*="rounded-xl"]:hover {
+  background-color: #162d2a !important;
+  border-color: rgba(142, 225, 217, 0.35) !important;
+}
+
+[data-theme="liquidglass"]:not(.dark) .dropdown-panel {
+  background-color: #ffffff !important;
+  background: #ffffff !important;
+  opacity: 1 !important;
+  border: 1px solid #d7dfdd !important;
+  box-shadow: 
+    0 20px 48px -4px rgba(18, 70, 64, 0.18),
+    inset 0 1px 0 #ffffff !important;
+}
+
+[data-theme="liquidglass"]:not(.dark) .dropdown-panel div[class*="bg-surface"],
+[data-theme="liquidglass"]:not(.dark) .dropdown-panel div[class*="hover:bg-hovered"],
+[data-theme="liquidglass"]:not(.dark) .dropdown-panel div[class*="rounded-xl"] {
+  background-color: #f4f8f7 !important;
+  border-color: #e2ebe9 !important;
+}
+
+[data-theme="liquidglass"]:not(.dark) .dropdown-panel div[class*="bg-surface"]:hover,
+[data-theme="liquidglass"]:not(.dark) .dropdown-panel div[class*="hover:bg-hovered"]:hover,
+[data-theme="liquidglass"]:not(.dark) .dropdown-panel div[class*="rounded-xl"]:hover {
+  background-color: #e9f2f0 !important;
+  border-color: rgba(28, 110, 102, 0.3) !important;
+}
+
+/*
+ * 尊重系统的「减少动效」偏好
+ *
+ * NOTE: 前庭功能障碍用户看到位移/缩放类动画会眩晕。Windows 的「显示动画」关闭、
+ * macOS 的「减弱动态效果」都会置位这个媒体查询。这里把动画时长压到接近 0，
+ * 但不设 display:none —— 动画结束态仍要正常呈现，只是不再有过程。
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/*
+ * 触控设备适配
+ *
+ * NOTE: hover 态在触屏上是"点完粘住"的 —— 手指离开后 :hover 仍然生效，
+ * 于是卡片/按钮会停在位移后的位置，看起来像错位。这里只在没有真实悬停能力的
+ * 设备上取消位移（颜色与阴影保留，仍有按下反馈），桌面完全不受影响。
+ */
+@media (hover: none) {
+  .glass-card:hover,
+  .btn-primary:hover {
+    transform: none;
+  }
+}
+
+/* 去掉触屏点击时的蓝色高亮方块，改由各自的 hover/active 样式表达反馈 */
+@media (hover: none) and (pointer: coarse) {
+  button,
+  a,
+  select,
+  [role="button"] {
+    -webkit-tap-highlight-color: transparent;
+  }
+}
+
+/* 细滚动条（长列表容器用，如批量扫描日志） */
+.scrollbar-thin {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-base) transparent;
+}
+
+.scrollbar-thin::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.scrollbar-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background-color: var(--border-base);
+  border-radius: 3px;
+}
+
+/* 高端玻璃微卡特效
+ *
+ * NOTE: 模糊强度 / 饱和度增益 / 顶部高光三项全部改为读 --glass-* 令牌，
+ * 于是「玻璃有多厚」成为主题可调项：靛蓝/墨玉沿用 12px 的原观感，
+ * 流玻主题则用 20-22px + saturate + 高光做出「液态玻璃」的厚度。
+ * 顶部高光用 ::before 承载（背景图），不影响文字层；::before 只做绘制、
+ * 不参与布局，也不改变卡片尺寸。 */
+.glass-card {
+  position: relative;
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-shadow);
+  /* 仅过渡 transform/border/阴影，避免拖拽重排时逐帧触发全属性过渡导致卡顿 */
+  transition: transform var(--dur-slow) var(--ease-out), border-color var(--dur-slow) ease, box-shadow var(--dur-slow) ease;
+}
+
+/* 顶部高光 —— 玻璃的「反光面」。默认主题里 --glass-highlight 是 transparent，
+ * 这一层完全不可见（零副作用）；只有流玻主题会渲染出从顶部渐隐的亮带。 */
+.glass-card::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--glass-highlight);
+  pointer-events: none;
+}
+
+.glass-card:hover {
+  border-color: rgb(var(--accent-rgb) / 0.25);
+  box-shadow: var(--shadow-lg);
+  transform: translateY(-2px);
+}
+
+/* 霓虹按钮渐变 —— 保留原视觉（这是品牌调性的一部分），仅把时长接入动效令牌 */
+.btn-primary {
+  background: var(--gradient-accent);
+  transition: background var(--dur-base) ease-in-out, box-shadow var(--dur-base) ease-in-out, transform var(--dur-base) ease-in-out;
+}
+
+.btn-primary:hover {
+  background: var(--gradient-accent-hover);
+  box-shadow: 0 0 15px rgb(var(--accent-rgb) / 0.5);
+  transform: translateY(-1px);
+}
+
+/* 表单框阴影 */
+.form-input {
+  background: var(--input-bg);
+  border: 1px solid var(--input-border);
+  color: var(--text-primary);
+  transition: all 0.2s ease;
+}
+
+.form-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgb(var(--accent-rgb) / 0.2);
+  outline: none;
+}
+
+/*
+ * 浮层基类 · dropdown-panel
+ *
+ * WHY 需要它：全站的下拉/气泡/日期面板原先各自拼 className（bg-surface +
+ * shadow-2xl + backdrop-blur-xl + z-50 …），三处问题：
+ * 1) 底色用 bg-surface（卡片底色）而浮层叠在卡片之上，暗色下与底层同色，
+ *    缺少「浮起来」的层次；且半透明底会让下层文字透出，产生双重重影；
+ * 2) z-index 各写各的（z-50），与弹窗同值，嵌套浮层时层序不可控；
+ * 3) 各主题（尤其液态玻璃）要为每种写法分别补一条覆写规则。
+ *
+ * 收敛为一个语义类后：底色统一用 --bg-elevated（比卡片更亮/更暗一档，
+ * 天然分层）、层级引用 --z-dropdown、圆角/边框/阴影全部走令牌；
+ * 液态玻璃主题只需覆写 .dropdown-panel 一处即可统一质感。
+ *
+ * NOTE: 不透明度刻意偏高（0.96 起）——浮层允许通透感，但绝不能让下层正文
+ * 透出来干扰阅读。需要更强的「玻璃」观感时由主题层提高 blur，而非降不透明度。
+ */
+.dropdown-panel {
+  background-color: var(--bg-elevated);
+  border: 1px solid var(--border-base);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg), 0 12px 32px -8px rgba(0, 0, 0, 0.25);
+  z-index: var(--z-dropdown);
+}
+
+/*
+ * 窄屏下把输入框字号提到 16px
+ *
+ * NOTE: iOS Safari 在聚焦 font-size < 16px 的输入框时会强制放大整个页面
+ * （放大后不会自动还原，用户得手动缩回去）。调用处普遍是 text-sm / text-xs /
+ * text-[11px]，所以在这里统一兜底。断点与 Tailwind md 对齐：≥768px 仍用调用处
+ * 的紧凑字号，密集表单（如 DNS 记录表格的行内编辑）在桌面上的观感不变。
+ */
+@media (max-width: 767px) {
+  .form-input {
+    font-size: 16px;
+  }
+}
+
+/*
+ * 全局搜索框用的是 type="search"（为了不被 Chrome 密码管理器当成用户名字段
+ * 自动填充），这里隐藏 WebKit 的原生清除按钮，让外观与普通文本框保持一致。
+ */
+.form-input[type="search"]::-webkit-search-cancel-button,
+.form-input[type="search"]::-webkit-search-decoration {
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+/* 闪烁圆点（表示同步中/状态好） */
+.pulse-green {
+  animation: pulse-green-anim 2s infinite;
+}
+
+@keyframes pulse-green-anim {
+  0% {
+    transform: scale(0.95);
+    box-shadow: 0 0 0 0 var(--state-ok-fg);
+  }
+  70% {
+    transform: scale(1);
+    box-shadow: 0 0 0 6px transparent;
+  }
+  100% {
+    transform: scale(0.95);
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+

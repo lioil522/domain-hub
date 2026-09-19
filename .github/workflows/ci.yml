@@ -1,0 +1,81 @@
+name: CI
+
+# 前端质量门槛（方案 §二十）：每次 push / PR 都跑 typecheck + 两条构建链路，
+# 避免「几十个改动互相污染，最后才发现构建不过」。
+#
+# NOTE: 与 deploy.yml（负责真正上线）分开 —— 本工作流**不需要任何 Secret**，
+# 只做静态校验与构建，可在 fork 的 PR 上安全运行。
+#
+# NOTE: 暂不含 ESLint —— 前端尚未引入 eslint 依赖（见任务 #33 note）。
+# 引入后在此追加一步 `npm run lint` 即可。
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# 同一 ref 上连续推送时取消还在跑的旧任务
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    name: 前端 typecheck + build
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      # wrangler 4 / vite 5 要求 Node >= 22
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
+
+      - name: 安装依赖（前端）
+        run: cd frontend && npm ci
+
+      - name: 类型检查
+        run: cd frontend && npm run typecheck
+
+      # 两条部署链路都要构建：Workers 版与自建版（--mode selfhost）。
+      # 这里显式设 VITE_API_BASE_URL=/ 与 deploy.yml 保持一致（前后端同源）。
+      - name: 构建（Workers 版）
+        env:
+          VITE_API_BASE_URL: /
+        run: cd frontend && npm run build
+
+      - name: 构建（自建版）
+        env:
+          VITE_API_BASE_URL: /
+        run: cd frontend && npm run build:selfhost
+
+  backend:
+    name: 后端类型检查
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: 安装依赖（根）
+        run: npm ci
+
+      # 根 package.json 的 verify:node = tsc --noEmit -p server
+      - name: 类型检查（server）
+        run: npm run verify:node

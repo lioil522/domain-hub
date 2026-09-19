@@ -1,0 +1,150 @@
+/* ═══════════════════════════════════════════════════════════════════
+ * 组件层样式
+ *
+ * NOTE: 这一层只做三件事 —— 聚合既有变量、补全交互状态、保证无障碍。
+ * 不引入新的视觉语言（配色/字体/圆角全部沿用上面的令牌），
+ * 所以它和存量内联 class 混用不会出现两种风格。
+ *
+ * 层级契约（详见 liquid-glass.css 头部的「特异性契约」）：本层**零 !important**，
+ * 选择器保持单类（.ui-card / .ui-badge / .skeleton …），与 Tailwind 工具类同级，
+ * 冲突靠「调用方 className 排在组件 className 之后」的约定解决。不要在这里
+ * 用 !important 去压业务代码 —— 那是玻璃覆写层（liquid-glass.css）才做的事。
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/*
+ * 骨架屏
+ *
+ * NOTE: 域名列表是典型的「一定会在 1-3 秒内加载完，但期间完全空白」的场景。
+ * 空窗期给骨架屏而非 spinner：骨架屏保留了内容将要出现的位置与形状，
+ * 感知等待时间明显短于「转圈 + 空白」，也能避免内容突然撑开导致的布局跳动。
+ *
+ * 用 background-position 位移而非 opacity 呼吸：前者只影响绘制层、
+ * 不触发重排，长列表下开销更低。
+ */
+.skeleton {
+  background-color: var(--bg-elevated);
+  background-image: linear-gradient(
+    90deg,
+    var(--bg-elevated) 0%,
+    var(--bg-hover) 50%,
+    var(--bg-elevated) 100%
+  );
+  background-size: 200% 100%;
+  border-radius: var(--radius-sm);
+  animation: skeleton-shimmer 1.4s ease-in-out infinite;
+}
+
+@keyframes skeleton-shimmer {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+
+/* 减动效时骨架屏不闪，改为静态色块（信息量不变，只是不动） */
+@media (prefers-reduced-motion: reduce) {
+  .skeleton {
+    animation: none;
+    background-image: none;
+  }
+}
+
+/*
+ * 卡片容器 —— 聚合 rounded / border / shadow，取代调用处手写四五个 class。
+ * 三档：flat（无阴影，用于嵌套）/ default（默认卡片）/ raised（可点击、有悬浮反馈）
+ */
+.ui-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-base);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+
+.ui-card--flat {
+  box-shadow: none;
+}
+
+.ui-card--default {
+  box-shadow: var(--shadow-sm);
+}
+
+.ui-card--raised {
+  box-shadow: var(--shadow-sm);
+  transition: box-shadow var(--dur-base) var(--ease-out), transform var(--dur-base) var(--ease-out), border-color var(--dur-base) var(--ease-out);
+}
+
+.ui-card--raised:hover {
+  box-shadow: var(--shadow-md);
+  transform: translateY(-1px);
+}
+
+/* 触屏上取消位移（沿用文件开头的既有约定，避免 hover 粘住造成错位） */
+@media (hover: none) {
+  .ui-card--raised:hover {
+    transform: none;
+  }
+}
+
+/*
+ * 状态徽章 —— 五态语义色，明暗自动切换。
+ * 用 border 而非纯底色：底色块在小字号下对边界感帮助有限，描边能显著提升可辨识度。
+ */
+.ui-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-weight: 500;
+  white-space: nowrap;
+  border-radius: var(--radius-full);
+  border: 1px solid transparent;
+  line-height: 1.35;
+}
+
+/* 状态点 —— 徽章内或列表前的圆形指示 */
+.ui-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-full);
+  flex-shrink: 0;
+  background: currentColor;
+}
+
+/*
+ * 品牌实底（渐变 + 辉光）
+ *
+ * WHY 抽成类而非 Tailwind 工具类：
+ *   调用处原本写的是 `bg-gradient-to-br from-indigo-500 to-indigo-600
+ *   hover:from-indigo-400 hover:to-indigo-500 hover:shadow-accent` —— 六个类
+ *   手写同一件事，且色阶名（indigo-500）把主题焊死在了调用点。这里是
+ *   「主题相关的一次性视觉」，正适合下沉成令牌消费方：换主题只需改
+ *   --gradient-accent / --accent-rgb，调用处一个字都不用动。
+ *
+ * NOTE: 前景色用 --accent-contrast 而非写死 text-white —— 墨玉主题在暗色下
+ * 强调色被提亮到 #4ec9ac（明度很高），压白字只有 1.9:1；必须用深墨绿前景。
+ */
+.bg-accent-gradient {
+  background-image: var(--gradient-accent);
+  color: var(--accent-contrast);
+}
+
+.bg-accent-gradient:hover {
+  background-image: var(--gradient-accent-hover);
+}
+
+/*
+ * 触控目标提升
+ *
+ * NOTE: WCAG 2.5.8 要求交互目标至少 24x24 CSS 像素，移动端实践推荐 44x44。
+ * 存量图标按钮普遍是 p-2 + 16px 图标 = 32px，桌面精度够用、手指上偏小。
+ * 这里只在粗指针（触摸）设备上撑到 44px，桌面观感完全不变。
+ */
+@media (pointer: coarse) {
+  .touch-target {
+    min-width: 44px;
+    min-height: 44px;
+  }
+}
+

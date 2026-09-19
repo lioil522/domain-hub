@@ -1,0 +1,632 @@
+/**
+ * Cloudflare API v4 响应类型定义与客户端封装
+ *
+ * NOTE: 与 DNSHEClient 保持同一套 DNS 记录方法签名（listDnsRecords / createDnsRecord /
+ * updateDnsRecord / deleteDnsRecord），index.ts 路由层按账号 provider 分发时无需关心
+ * 上游差异。认证只支持 API Token（Bearer）—— Global API Key 属于旧式凭据，不做兼容。
+ */
+
+import type {
+  ActionResponse,
+  CreateDnsRecordResponse,
+  DnsRecordInfo,
+  ListDnsRecordsResponse,
+} from "./dnshe";
+import type { UpstreamSubdomain } from "./db";
+
+/**
+ * 把 Cloudflare zone id 映射为 domains_cache 的数值主键
+ *
+ * NOTE: domains_cache.id 直接充当路由里的域名 ID，而 CF zone id 是 32 位十六进制
+ * 字符串，无法做 INTEGER 主键。这里用双 FNV-1a 拼出一个 53 位稳定哈希：
+ * 同一 zone 每次同步得到相同 id（幂等 upsert），不同 zone 几乎不会碰撞；
+ * 哈希值远大于 DNSHE 的小整数 subdomain_id，两个提供商的 id 空间实际不相交。
+ */
+function fnv1a32(input: string, seed: number): number {
+  let hash = seed >>> 0;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash >>> 0;
+}
+
+export function zoneIdToNumericId(zoneId: string): number {
+  const h1 = fnv1a32(zoneId, 0x811c9dc5);
+  const h2 = fnv1a32(zoneId, 0x811c9dc5 ^ 0x9e3779b9);
+  return h1 * 0x200000 + (h2 % 0x200000); // 2^32 * 2^21 = 2^53，落在 JS 安全整数内
+}
+
+/** Cloudflare API v4 统一响应外壳 */
+interface CfResponse<T> {
+  success: boolean;
+  errors: Array<{ code: number; message: string }>;
+  messages?: unknown[];
+  result?: T;
+}
+
+/** zone 信息（listZones 返回，只保留面板需要的字段） */
+export interface CfZoneInfo {
+  id: string;
+  name: string;
+  status: string;
+  created_on?: string;
+  name_servers?: string[];
+  account?: { id?: string; name?: string };
+}
+
+/** Token 校验结果（/user/tokens/verify） */
+export interface CfTokenVerifyInfo {
+  token_id: string;
+  status: string;
+}
+
+/**
+ * listZones 的分页结果
+ *
+ * NOTE: hasMore 是「上游还有没拉完的页」的**统计事实**（本页满员即有下一页），
+ * 而 nextPage 是续拉游标。调用方必须把 hasMore 当作「上游结论是否完整」的唯一依据 ——
+ * 只有 hasMore=false 才能让 syncAccountDomains 执行差集删除。
+ */
+export interface ZonePage {
+  zones: CfZoneInfo[];
+  /** 下一次续拉应请求的页码（本页满员时指向下一页） */
+  nextPage: number;
+  hasMore: boolean;
+}
+
+/** Cloudflare 账号信息（listAccounts 返回） */
+export interface CfAccountInfo {
+  id: string;
+  name: string;
+}
+
+/** DNS 记录写接口参数 —— 路由层从请求体摊平后构造，name 允许相对名/完整名/@ */
+export interface CfDnsWriteParams {
+  zone_id: string;
+  zone_name: string;
+  type: string;
+  name: string;
+  content: string;
+  ttl?: number;
+  priority?: number;
+  proxied?: boolean;
+  record_id?: string | number;
+}
+
+/** Cloudflare 返回的 DNS 记录原始形状（只声明会用到的字段） */
+interface CfDnsRecord {
+  id: string;
+  name: string;
+  type: string;
+  content: string;
+  ttl: number;
+  priority?: number | null;
+  proxied?: boolean;
+}
+
+/** Cloudflare Worker 路由（旧方式，来自 /zones/:id/workers/routes） */
+interface CfWorkerRoute {
+  id: string;
+  pattern: string;
+  /** 绑定的 Worker 名（旧字段 script，新字段 script_name 都可能返回） */
+  script?: string;
+  script_name?: string;
+}
+
+/** Cloudflare Worker 自定义域（新方式，来自 /accounts/:id/workers/domains） */
+interface CfWorkerCustomDomain {
+  id: string;
+  /** 绑定的完整域名（如 yu.930128.xyz） */
+  hostname: string;
+  /** 绑定的 Worker 名（如 domain-truth-d100） */
+  service: string;
+  zone_id?: string;
+  zone_name?: string;
+  environment?: string;
+}
+
+/**
+ * 把主机记录转成 Cloudflare 要求的完整域名
+ *
+ * NOTE: 路由层的 normalizeDnsRecordName 已把输入统一成 @ / 相对名（ASCII 小写），
+ * 这里只需补全 zone 后缀；name 传来时已是完整名（例如批量编辑回填）则原样保留。
+ */
+function toFqdnRecordName(name: string, zoneName: string): string {
+  const zone = String(zoneName || "").trim().replace(/\.+$/, "").toLowerCase();
+  const trimmed = String(name || "").trim().replace(/\.+$/, "").toLowerCase();
+  if (!trimmed || trimmed === "@") {
+    return zone;
+  }
+  if (!zone || trimmed === zone || trimmed.endsWith(`.${zone}`)) {
+    return trimmed;
+  }
+  return `${trimmed}.${zone}`;
+}
+
+/**
+ * 判断 Worker 路由是否匹配某条 DNS 记录
+ *
+ * CF 的 pattern 形如 "yu.930128.xyz/*"（精确主机名 + 路径通配）或
+ * "*.930128.xyz/*"（通配子域 + 路径通配），对应 dns_records 里的 fqdn name
+ * "yu.930128.xyz" 或子域名 "xxx.930128.xyz"。简化处理：把 pattern 去掉
+ * 末尾 /* 与前导 *. 后与 record name 做相等 / endsWith 匹配。
+ */
+function isWorkerRouteForRecord(route: CfWorkerRoute, rec: DnsRecordInfo): boolean {
+  const pattern = String(route.pattern || "").toLowerCase().trim();
+  if (!pattern) return false;
+  const recName = String(rec.name || "").toLowerCase().trim();
+  if (!recName) return false;
+  // 归一 pattern：去掉末尾路径通配与前导子域通配
+  const cleaned = pattern
+    .replace(/\/\*$/, "")        // "yu.930128.xyz/*" → "yu.930128.xyz"
+    .replace(/^\*\./, "");       // "*.930128.xyz/*" → "930128.xyz/*"（再过一次）
+  const target = cleaned.replace(/\/\*$/, ""); // 兼容连续两次替换
+  if (!target) return false;
+  // 精确匹配
+  if (target === recName) return true;
+  // 通配子域模式：recName 是 "xxx.930128.xyz"，target 是 "930128.xyz"
+  // —— 这种"父域等于裸后缀"的情况几乎不会发生（父域本身有 AAAA 100:: 不太可能），
+  // 简化处理：直接 endsWith 兜底，要求 target 比 recName 短一个层级（带 . 边界）。
+  return recName.endsWith("." + target);
+}
+
+/** 把 Cloudflare 记录映射为与 DNSHE 一致的内部形状 */
+function mapCfRecord(rec: CfDnsRecord): DnsRecordInfo {
+  return {
+    id: rec.id,
+    name: rec.name,
+    type: rec.type,
+    content: rec.content,
+    // Cloudflare 以 ttl=1 表示「自动」，前端据此显示「自动」
+    ttl: Number(rec.ttl) || 1,
+    priority: rec.priority ?? null,
+    line: null,
+    proxied: Boolean(rec.proxied),
+  };
+}
+
+/**
+ * 把 Cloudflare zone 映射为 domains_cache 的上游行
+ *
+ * NOTE: status 直接存 zone 的原始状态（active/pending/moved），这些行只在 Cloudflare
+ * 标签页展示，由该页面自己渲染状态徽标，不走 DNSHE 的三态语义。expires_at 用 0000
+ * 前缀占位，前端 formatDate 会显示成「永久」。数值主键由 zoneIdToNumericId（db.ts）产出。
+ * provider_account_id 借存 CF 账号 id —— DNSHE 行用它做线路判定兜底，CF 行用不到
+ * 那套语义，正好复用给前端拼控制台深链（dash.cloudflare.com/{账号id}/{zone名}）。
+ */
+export function mapZoneToUpstream(zone: CfZoneInfo): UpstreamSubdomain {
+  return {
+    id: zoneIdToNumericId(zone.id),
+    subdomain: "",
+    rootdomain: zone.name,
+    full_domain: zone.name,
+    status: zone.status || "active",
+    created_at: zone.created_on || "",
+    expires_at: "0000-00-00 00:00:00",
+    has_dns: 1,
+    dns_provider: "Cloudflare",
+    provider_account_id: zone.account?.id || null,
+    remote_id: zone.id,
+    dns_state_known: true
+  };
+}
+
+/**
+ * Cloudflare API 请求封装类
+ */
+export class CloudflareClient {
+  private apiToken: string;
+  private baseUrl = "https://api.cloudflare.com/client/v4";
+
+  constructor(apiToken: string) {
+    this.apiToken = String(apiToken || "").trim();
+  }
+
+  /**
+   * 通用请求封装 —— 非 2xx 或 success=false 时抛出带 CF 错误信息的异常
+   */
+  private async request<T>(
+    method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE",
+    path: string,
+    query?: Record<string, unknown>,
+    body?: unknown
+  ): Promise<T> {
+    const url = new URL(this.baseUrl + path);
+    if (query) {
+      for (const [key, val] of Object.entries(query)) {
+        if (val !== undefined && val !== null && val !== "") {
+          url.searchParams.append(key, String(val));
+        }
+      }
+    }
+
+    const response = await fetch(url.toString(), {
+      method,
+      headers: {
+        Authorization: `Bearer ${this.apiToken}`,
+        "Content-Type": "application/json",
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+
+    let data: CfResponse<T>;
+    try {
+      data = (await response.json()) as CfResponse<T>;
+    } catch {
+      throw new Error(`Cloudflare API 响应异常 (HTTP ${response.status})`);
+    }
+
+    if (!response.ok || !data.success) {
+      const firstCode = (data.errors || [])[0]?.code;
+      const detail = (data.errors || [])
+        .map((err) => err?.message)
+        .filter(Boolean)
+        .join("; ");
+      // NOTE: Cloudflare 对「Token 无效」和「Token 缺少该操作的权限」一律返回
+      // Authentication error (code 10000/9109)。最常见的原因是 Token 只有
+      // Zone:Read（拉 zone 列表够用，一旦读写解析记录就被拒），或 zone 范围
+      // 未覆盖该账号 / 域名，翻译成可操作的中文指引而不是裸的英文原文。
+      const isAuthError =
+        firstCode === 9109 ||
+        firstCode === 10000 ||
+        /authentication error|invalid bearer|not authorized|missing authorization/i.test(detail);
+      if (isAuthError) {
+        throw new Error(
+          "Cloudflare API 认证失败：请到 Cloudflare 控制台编辑该账号绑定的 API Token，确认包含 Zone:Read 与 Zone DNS:Edit 权限，且 zone 范围覆盖此域名（Include 指定账号或 All zones），改完无需重新绑定即可重试"
+        );
+      }
+      throw new Error(`Cloudflare API 错误: ${detail || `HTTP ${response.status}`}`);
+    }
+
+    return data.result as T;
+  }
+
+  /**
+   * 校验 API Token 有效性（返回 Token 自身 id 与 active 状态）
+   */
+  async verifyToken(): Promise<CfTokenVerifyInfo> {
+    const result = await this.request<{ id: string; status: string }>("GET", "/user/tokens/verify");
+    return { token_id: result.id, status: result.status };
+  }
+
+  /**
+   * 列出 Token 可访问的 Cloudflare 账号（用于别名解析与唯一键）
+   */
+  async listAccounts(): Promise<CfAccountInfo[]> {
+    const accounts: CfAccountInfo[] = [];
+    let page = 1;
+    while (page <= 10) {
+      const results = await this.request<CfAccountInfo[]>("GET", "/accounts", { page, per_page: 50 });
+      accounts.push(...(results || []));
+      if (!results || results.length < 50) break;
+      page++;
+    }
+    return accounts;
+  }
+
+  /**
+   * 分页列出账号下全部 zone
+   *
+   * @param opts.startPage 起始页码（默认 1）。配合 maxPages 用于「跨多次 Worker 调用
+   *        断点续拉」—— 上一次调用在子请求配额耗尽前拉到第 N 页，下一次直接从 N 续拉。
+   * @param opts.maxPages  本次调用最多拉取的页数（默认 50，即拉全）。设为 1 即
+   *        「只探一页」，用于在不了解规模时先探明是否还有后续页。
+   *
+   * NOTE: 返回值带 hasMore —— 调用方据此区分「已拉全」与「配额用尽被迫中断」，
+   * 前者才能让 syncAccountDomains 做差集删除（否则会把没拉到的 zone 误删）。
+   */
+  async listZones(opts: { startPage?: number; maxPages?: number } = {}): Promise<ZonePage> {
+    const startPage = Math.max(1, Math.floor(opts.startPage ?? 1) || 1);
+    const maxPages = Math.max(1, Math.floor(opts.maxPages ?? 50) || 1);
+    const perPage = 50;
+    const zones: CfZoneInfo[] = [];
+    let page = startPage;
+    let hasMore = false;
+
+    for (let fetched = 0; fetched < maxPages; fetched++, page++) {
+      const results = await this.request<CfZoneInfo[]>("GET", "/zones", { page, per_page: perPage });
+      zones.push(...(results || []));
+      if (!results || results.length < perPage) {
+        hasMore = false;
+        break;
+      }
+      // 本页满员 —— 可能还有下一页；若已达本次页数上限则标记续拉
+      hasMore = true;
+    }
+
+    return { zones, nextPage: page, hasMore };
+  }
+
+  /**
+   * 列出 zone 下全部 DNS 解析记录（分页拉全，映射为内部形状）
+   *
+   * 合并 Worker 绑定信息：CF 在「Workers 自定义域」设置里绑定 Worker 后，会在
+   * dns_records 里塞一条 AAAA `100::` proxied 记录作为占位。真实身份有两条来源：
+   *   1. Custom Domains：GET /accounts/:account_id/workers/domains（新版，hostname+service）
+   *   2. Routes：GET /zones/:id/workers/routes（旧版，pattern+script_name）
+   * 这里拉完 dns_records 后追加查询，把 AAAA 100:: proxied 行标记成 Worker 绑定，
+   * 前端据此渲染为「Worker」类型而非 AAAA 100::。查询失败不阻塞记录返回。
+   */
+  async listDnsRecords(zoneId: string | number): Promise<ListDnsRecordsResponse> {
+    const records: DnsRecordInfo[] = [];
+    let page = 1;
+    while (page <= 50) {
+      const results = await this.request<CfDnsRecord[]>(
+        "GET",
+        `/zones/${encodeURIComponent(String(zoneId))}/dns_records`,
+        { page, per_page: 100 }
+      );
+      records.push(...(results || []).map(mapCfRecord));
+      if (!results || results.length < 100) break;
+      page++;
+    }
+    // 合并 Worker 绑定信息（失败不阻塞解析记录返回）
+    await this.attachWorkerNames(zoneId, records);
+    return { success: true, records };
+  }
+
+  /**
+   * 把 Worker 绑定信息（Custom Domains / Routes）合并进 records 的 workerName 字段
+   *
+   * 优先 Custom Domains（新版），失败或为空时回退旧 Routes；两者都拿不到则保持
+   * records 原样（前端降级显示 AAAA 100::）。
+   */
+  private async attachWorkerNames(zoneId: string | number, records: DnsRecordInfo[]): Promise<void> {
+    // 只有 AAAA 100:: proxied 行才可能是 Worker 占位，先筛出来
+    const candidates = records.filter(
+      (r) => r.type === "AAAA" && r.proxied && r.content === "100::"
+    );
+    if (candidates.length === 0) return;
+    // 诊断日志：方便定位权限/接口不匹配
+    console.log(`[Worker 识别] zone=${zoneId} 候选 AAAA 100:: 行数=${candidates.length}`);
+
+    // 1) Custom Domains（新版）：需要 account_id，先从 zone 详情拿
+    try {
+      const customDomains = await this.listWorkerCustomDomains(zoneId);
+      console.log(`[Worker 识别] Custom Domains 拉取到 ${customDomains.length} 条`);
+      if (customDomains.length > 0) {
+        for (const r of candidates) {
+          const recName = String(r.name || "").toLowerCase().trim();
+          const match = customDomains.find(
+            (d) => String(d.hostname || "").toLowerCase().trim() === recName
+          );
+          if (match?.service) r.workerName = match.service;
+        }
+      }
+    } catch (e) {
+      console.error("[Worker 识别] listWorkerCustomDomains 失败:", e instanceof Error ? e.message : e);
+    }
+
+    // 2) 旧 Routes 兜底（只处理还没匹配到 workerName 的行）
+    try {
+      const stillEmpty = candidates.filter((r) => !r.workerName);
+      if (stillEmpty.length > 0) {
+        const routes = await this.listWorkerRoutes(zoneId);
+        console.log(`[Worker 识别] 旧 Routes 拉取到 ${routes.length} 条（兜底 ${stillEmpty.length} 行未匹配）`);
+        for (const r of stillEmpty) {
+          const match = routes.find((rt) => isWorkerRouteForRecord(rt, r));
+          const wname = match?.script_name || match?.script;
+          if (wname) r.workerName = wname;
+        }
+      }
+    } catch (e) {
+      console.error("[Worker 识别] listWorkerRoutes 失败:", e instanceof Error ? e.message : e);
+    }
+
+    // 最终统计
+    const matched = candidates.filter((r) => r.workerName).length;
+    console.log(`[Worker 识别] 最终匹配 ${matched}/${candidates.length} 条`);
+  }
+
+  /**
+   * 列出 zone 的 Worker 自定义域（新版 Custom Domains）
+   *
+   * 需要 account_id：先 GET /zones/:id 拿 account.id，再 GET
+   * /accounts/:account_id/workers/domains。返回 [{ hostname, service }] 数组。
+   * 失败时抛错，由调用方（attachWorkerNames）捕获打印并降级。
+   */
+  async listWorkerCustomDomains(zoneId: string | number): Promise<CfWorkerCustomDomain[]> {
+    const zone = await this.request<{ id: string; account?: { id?: string } }>(
+      "GET",
+      `/zones/${encodeURIComponent(String(zoneId))}`
+    );
+    const accountId = zone?.account?.id;
+    // 诊断日志：精确记录 accountId 是否拿到，便于定位权限/接口问题
+    console.log(`[Worker 识别] /zones/${zoneId} → account.id = ${accountId || "(空)"}`);
+    if (!accountId) return [];
+    const results = await this.request<CfWorkerCustomDomain[]>(
+      "GET",
+      `/accounts/${encodeURIComponent(accountId)}/workers/domains`
+    );
+    // 诊断日志：打印返回的原始形状 + 前 2 条关键字段
+    const arr = Array.isArray(results) ? results : [];
+    const sample = arr.slice(0, 2).map((d) => ({
+      hostname: d.hostname,
+      service: d.service,
+      zone_id: d.zone_id
+    }));
+    console.log(
+      `[Worker 识别] /accounts/${accountId}/workers/domains → 数量=${arr.length}，前 2 条=${JSON.stringify(sample)}`
+    );
+    return arr;
+  }
+
+  /**
+   * 列出 zone 下全部 Worker 路由
+   *
+   * 返回 [{ id, pattern, script_name }] 数组。失败时返回空数组，
+   * 便于调用方在 dns_records 合并时降级到「按 AAAA 100::」兜底。
+   */
+  async listWorkerRoutes(zoneId: string | number): Promise<CfWorkerRoute[]> {
+    const results = await this.request<CfWorkerRoute[]>(
+      "GET",
+      `/zones/${encodeURIComponent(String(zoneId))}/workers/routes`
+    );
+    return Array.isArray(results) ? results : [];
+  }
+
+  /**
+   * 结构化类型的内容 → Cloudflare data 对象
+   *
+   * NOTE: Cloudflare 对 SRV / LOC / DNSKEY / DS / SVCB / HTTPS / TLSA / SSHFP 等
+   * 结构化类型要求通过 data 对象提交。面板上用户按 RFC 惯例用空格分隔填写内容
+   * （如 SRV「10 5 8080 example.com」、DS「2371 13 2 <摘要>」），这里按类型拆解
+   * 字段；字段数不符等无法解析的情形返回 null，调用方保留原 content 提交，
+   * 由 Cloudflare 返回明确的错误信息。
+   */
+  private buildStructuredData(type: string, content: string, priorityParam?: number): Record<string, unknown> | null {
+    const parts = content.split(/\s+/).filter(Boolean);
+    const unquote = (v: string) => v.replace(/^"(.*)"$/, "$1");
+    const stripM = (v: string) => Number(String(v).replace(/m$/i, ""));
+    const isNum = (v: string) => Number.isFinite(Number(v));
+
+    switch (type) {
+      case "SRV":
+        if (parts.length !== 4 || !parts.slice(0, 3).every(isNum)) return null;
+        return {
+          priority: priorityParam ?? Number(parts[0]),
+          weight: Number(parts[1]),
+          port: Number(parts[2]),
+          target: parts[3],
+        };
+      case "URI":
+        if (parts.length < 3 || !isNum(parts[0]) || !isNum(parts[1])) return null;
+        return { priority: priorityParam ?? Number(parts[0]), weight: Number(parts[1]), target: parts.slice(2).join(" ") };
+      case "SSHFP":
+        if (parts.length < 3 || !isNum(parts[0]) || !isNum(parts[1])) return null;
+        return { algorithm: Number(parts[0]), type: Number(parts[1]), fingerprint: parts.slice(2).join("") };
+      case "TLSA":
+      case "SMIMEA":
+        if (parts.length < 4 || !parts.slice(0, 3).every(isNum)) return null;
+        return { usage: Number(parts[0]), selector: Number(parts[1]), matching_type: Number(parts[2]), certificate: parts.slice(3).join("") };
+      case "DS":
+        if (parts.length < 4 || !parts.slice(0, 3).every(isNum)) return null;
+        return { key_tag: Number(parts[0]), algorithm: Number(parts[1]), digest_type: Number(parts[2]), digest: parts.slice(3).join("") };
+      case "DNSKEY":
+        if (parts.length < 4 || !parts.slice(0, 3).every(isNum)) return null;
+        return { flags: Number(parts[0]), protocol: Number(parts[1]), algorithm: Number(parts[2]), public_key: parts.slice(3).join("") };
+      case "CERT":
+        if (parts.length < 4 || !isNum(parts[1]) || !isNum(parts[2])) return null;
+        return { type: isNum(parts[0]) ? Number(parts[0]) : parts[0], key_tag: Number(parts[1]), algorithm: Number(parts[2]), certificate: parts.slice(3).join("") };
+      case "NAPTR":
+        if (parts.length < 6 || !isNum(parts[0]) || !isNum(parts[1])) return null;
+        return { order: Number(parts[0]), preference: Number(parts[1]), flags: unquote(parts[2]), service: unquote(parts[3]), regexp: unquote(parts[4]), replacement: parts.slice(5).join(" ") };
+      case "SVCB":
+      case "HTTPS":
+        if (parts.length < 2 || !isNum(parts[0])) return null;
+        return {
+          priority: priorityParam ?? Number(parts[0]),
+          target: parts[1],
+          ...(parts.length > 2 ? { value: parts.slice(2).join(" ") } : {}),
+        };
+      case "LOC": {
+        // RFC 1876：「纬度1 纬度2 纬秒 N 经度1 经度2 经秒 E 海拔 [尺寸 水平精度 垂直精度]」
+        if (parts.length < 9 || !isNum(parts[0]) || !isNum(parts[1]) || !isNum(parts[2]) || !isNum(parts[4]) || !isNum(parts[5]) || !isNum(parts[6])) return null;
+        const data: Record<string, unknown> = {
+          lat_degrees: Number(parts[0]),
+          lat_minutes: Number(parts[1]),
+          lat_seconds: Number(parts[2]),
+          lat_direction: parts[3].toUpperCase(),
+          long_degrees: Number(parts[4]),
+          long_minutes: Number(parts[5]),
+          long_seconds: Number(parts[6]),
+          long_direction: parts[7].toUpperCase(),
+          altitude: stripM(parts[8]),
+        };
+        if (parts[9] !== undefined) data.size = stripM(parts[9]);
+        if (parts[10] !== undefined) data.precision_horz = stripM(parts[10]);
+        if (parts[11] !== undefined) data.precision_vert = stripM(parts[11]);
+        return data;
+      }
+      default:
+        return null;
+    }
+  }
+
+  /**
+   * 根据写参数构造 CF 请求体：相对名转完整域名、代理记录强制自动 TTL、
+   * MX 缺省优先级时从内容前缀解析、结构化类型转为 data 对象
+   */
+  private buildWritePayload(params: CfDnsWriteParams): Record<string, unknown> {
+    const type = String(params.type || "").trim().toUpperCase();
+    const name = toFqdnRecordName(params.name, params.zone_name);
+    let content = String(params.content || "").trim();
+
+    const payload: Record<string, unknown> = {
+      type,
+      name,
+      content,
+      // 开启代理（橙色云）时 Cloudflare 只接受自动 TTL (1)
+      ttl: params.proxied ? 1 : (Number(params.ttl) > 0 ? Number(params.ttl) : 1),
+      proxied: Boolean(params.proxied),
+    };
+
+    if (type === "MX") {
+      let priority = Number(params.priority);
+      // 兼容「10 mail.example.com」写法：内容前缀的数字视作优先级
+      if (!Number.isFinite(priority) || priority < 0) {
+        const match = content.match(/^(\d+)\s+(.+)$/);
+        if (match) {
+          priority = Number(match[1]);
+          content = match[2];
+        }
+      }
+      payload.content = content;
+      if (Number.isFinite(priority) && priority >= 0) {
+        payload.priority = priority;
+      }
+      return payload;
+    }
+
+    // 结构化类型：内容自动转 data 对象；解析不出则保留 content，由 Cloudflare 报具体错误
+    const structured = this.buildStructuredData(
+      type,
+      content,
+      Number.isFinite(Number(params.priority)) ? Number(params.priority) : undefined
+    );
+    if (structured) {
+      payload.data = structured;
+      delete payload.content;
+    }
+
+    return payload;
+  }
+
+  /**
+   * 创建 DNS 解析记录
+   */
+  async createDnsRecord(params: CfDnsWriteParams): Promise<CreateDnsRecordResponse> {
+    const record = await this.request<CfDnsRecord>(
+      "POST",
+      `/zones/${encodeURIComponent(params.zone_id)}/dns_records`,
+      undefined,
+      this.buildWritePayload(params)
+    );
+    return { success: true, record: mapCfRecord(record) };
+  }
+
+  /**
+   * 修改 DNS 解析记录（PUT 整条覆盖，与 DNSHE 上游的整条覆盖语义一致）
+   */
+  async updateDnsRecord(params: CfDnsWriteParams): Promise<ActionResponse> {
+    await this.request(
+      "PUT",
+      `/zones/${encodeURIComponent(params.zone_id)}/dns_records/${encodeURIComponent(String(params.record_id))}`,
+      undefined,
+      this.buildWritePayload(params)
+    );
+    return { success: true };
+  }
+
+  /**
+   * 删除 DNS 解析记录
+   */
+  async deleteDnsRecord(zoneId: string | number, recordId: string | number): Promise<ActionResponse> {
+    await this.request(
+      "DELETE",
+      `/zones/${encodeURIComponent(String(zoneId))}/dns_records/${encodeURIComponent(String(recordId))}`
+    );
+    return { success: true };
+  }
+}

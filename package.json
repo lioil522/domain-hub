@@ -1,0 +1,47 @@
+{
+  "name": "domain-hub",
+  "version": "2.0.0",
+  "description": "Domain Hub - multi-provider domain management panel (Cloudflare Worker & self-hosted)",
+  "main": "src/index.ts",
+  "scripts": {
+    "clean:local": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/clean-local.ps1 -Force",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "build:node": "esbuild server/index.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/server.mjs",
+    "start:node": "node dist-node/server.mjs",
+    "verify:node": "tsc --noEmit -p server",
+    "test:node": "esbuild server/d1-sqlite.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/d1-sqlite.test.mjs && node dist-node/d1-sqlite.test.mjs",
+    "test:signature": "esbuild server/huaweicloud-signature.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/huaweicloud-signature.test.mjs && node dist-node/huaweicloud-signature.test.mjs",
+    "test:credentials": "esbuild server/credentials.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/credentials.test.mjs && node dist-node/credentials.test.mjs",
+    "check:contrast": "node contrast-check.mjs",
+    "check:cascade": "node cascade-check.mjs",
+    "check:theme": "node cascade-check.mjs && node contrast-check.mjs",
+    "test": "npm run test:node && npm run test:signature && npm run test:credentials",
+    "verify:all": "npm run check:architecture && npm run verify:worker && npm run build:worker && npm run test:invariants && npm run verify:node && npm test && npm run check:theme && npm --prefix frontend run typecheck && npm --prefix frontend run build",
+    "check:architecture": "node architecture-check.mjs",
+    "verify:worker": "tsc --noEmit -p tsconfig.json",
+    "build:worker": "esbuild src/index.ts --bundle --platform=neutral --target=es2022 --format=esm --outfile=dist-worker/index.mjs",
+    "test:invariants": "npm run test:unit:state && npm run test:unit:search && npm run test:unit:provider && npm run test:unit:scanner && npm run test:unit:backup && npm run test:integration:architecture",
+    "test:unit:state": "esbuild tests/unit/dns-state-machine.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/dns-state-machine.test.mjs && node --test dist-node/dns-state-machine.test.mjs",
+    "test:unit:search": "esbuild tests/unit/search-ranking.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/search-ranking.test.mjs && node --test dist-node/search-ranking.test.mjs",
+    "test:unit:provider": "esbuild tests/unit/provider-registry.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/provider-registry.test.mjs && node --test dist-node/provider-registry.test.mjs",
+    "test:unit:scanner": "esbuild tests/unit/scanner-worker.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/scanner-worker.test.mjs && node --test dist-node/scanner-worker.test.mjs",
+    "test:unit:backup": "esbuild tests/unit/backup-diff.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/backup-diff.test.mjs && node --test dist-node/backup-diff.test.mjs",
+    "test:integration:architecture": "esbuild tests/integration/architecture.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/architecture.test.mjs && node --test dist-node/architecture.test.mjs",
+    "verify:architecture": "npm run check:architecture && npm run check:theme"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.1.1",
+    "hono": "^4.1.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260828.1",
+    "@types/node": "^26.2.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.4.3",
+    "wrangler": "^4.127.0"
+  }
+}

@@ -1,0 +1,11 @@
+/*
+ * Tailwind 三层指令 —— 必须排在所有自定义样式之前。
+ *
+ * NOTE: 本文件被 index.css 以 @import 放在第一位引入，从而保证编译产物里
+ * Tailwind 的 preflight（base）/ components / utilities 三层先于项目自定义
+ * 样式输出 —— 与拆分前「@tailwind 指令写在 index.css 顶部」的产物顺序完全一致。
+ * 不要把这三行挪到别处，也不要调整 index.css 里本文件 @import 的位次。
+ */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;

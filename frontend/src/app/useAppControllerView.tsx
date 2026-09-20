@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useRef, Suspense } from "react";
+import { useState, useEffect, useMemo, useRef, Suspense } from "react";
 import {
   RefreshCw,
   Settings,
@@ -9,24 +9,13 @@ import { DnsRecordPanel } from "../components/DnsRecordPanel";
 // DNSHE 解析记录弹窗（Phase 4-D 从 App.tsx 抽出；与 DnsRecordPanel 的差异见组件头注释）
 import { DnsheDnsModal } from "../features/dns/components/DnsheDnsModal/index";
 import { useCfDnsPanel } from "../features/dns/hooks/useCfDnsPanel";
-import {
-  applyThemeAttribute,
-  readStoredTheme,
-  DEFAULT_THEME,
-  THEME_STORAGE_KEY,
-  type ThemeId
-} from "../theme";
 // 词库解析：设置页「线路解析支持名单」粘贴多个后缀时用于拆分（Phase 9 后仅此处使用）
-import { parseWords } from "../wordbanks";
 
 // ── 已抽出的类型 / 常量 / 工具 / 纯组件（Phase 1 迁移） ──
 import type { Domain } from "../types/domain";
 import type { Account } from "../types/account";
 import type { MultiProviderKey, JumpSource } from "../types/provider";
 import type { CustomAccount, CustomDomain } from "../types/custom";
-import type { Quota } from "../types/quota";
-import type { DnsRecord } from "../types/dns";
-import type { AppLog } from "../types/log";
 import {
   MULTI_PROVIDER_META,
   MULTI_PROVIDER_ORDER
@@ -70,7 +59,6 @@ import { useSettings } from "../features/settings/hooks/useSettings";
 import { useDataTransfer } from "../features/data/hooks/useDataTransfer";
 import { DataOpModal } from "../features/data/components/DataOpModal";
 import { LoginPage, useAuthSession } from "../features/auth";
-import { DEFAULT_LINE_NS_SUFFIXES, DEFAULT_LINE_PROVIDERS } from "../constants/dns";
 import { sleep } from "../lib/utils";
 // ── Phase 2：API 客户端 / Toast ──
 // NOTE: readSessionToken 原先在此引入；鉴权整体下沉到 useAuthSession 后，
@@ -99,23 +87,20 @@ import { useCfZoneHighlight } from "../features/cloudflare/hooks/useCfZoneHighli
 import { CfEditModal } from "../features/cloudflare/components/CfEditModal";
 import { useDpDomains } from "../features/digitalplat/hooks/useDpDomains";
 import { useDpZoneHighlight } from "../features/digitalplat/hooks/useDpZoneHighlight";
+import { useAppUiState } from "./controller/useAppUiState";
+import { useAppDataState } from "./controller/useAppDataState";
+import { useAppAlerts } from "./controller/useAppAlerts";
+import { useLineDnsSettings } from "../features/dns/hooks/useLineDnsSettings";
 export function useAppControllerView() {
   // 当前处于的选项卡(通过 URL hash 持久化,刷新/前进后退保持所在页面)
   const [activeTab, setActiveTab] = useState<TabKey>(tabFromHash);
 
-  // 主题（明/暗）与侧栏折叠状态
-  const [theme, setTheme] = useState<"light" | "dark">(
-    () => (localStorage.getItem("DNSHE_THEME") as "light" | "dark") || "dark"
-  );
-  /*
-   * 配色主题 —— 与 theme（明暗）正交的第二维度。
-   * NOTE: 初值必须与 theme-init.js 的判定保持一致，否则首帧会出现
-   * 「脚本设了 A、React 首渲染又改回 B」的闪色。两处都读同一个
-   * DNSHE_COLOR_THEME 键、同一个 DEFAULT_THEME 回落值。
-   */
-  const [colorTheme, setColorTheme] = useState<ThemeId>(() =>
-    typeof window === "undefined" ? DEFAULT_THEME : readStoredTheme()
-  );
+  const {
+    theme, setTheme, colorTheme, setColorTheme, globalSearch, setGlobalSearch,
+    notifOpen, setNotifOpen, notifRef, searchFocused, setSearchFocused,
+    dnsheMenuOpen, setDnsheMenuOpen, logCategory, setLogCategory,
+  } = useAppUiState();
+
   // ===== 全局数据上下文（Phase 2.5：账号域 + 横切基础设施） =====
   // NOTE: 这些量原先定义在本组件内；上移到 AppDataProvider 后，本组件仍以同名局部常量
   //       消费，因此内部引用（apiFetch / showToast / toast / sessionToken / backendUrl /
@@ -135,65 +120,13 @@ export function useAppControllerView() {
   // 侧栏 / 抽屉 / 断点状态已随外壳(useAppLayout)下沉到 app/AppShell,
   // App 不再持有这些量 —— 它们在外壳之外没有任何消费点。
 
-  // 顶部全局搜索词与通知下拉开关
-  const [globalSearch, setGlobalSearch] = useState("");
-  const [notifOpen, setNotifOpen] = useState(false);
-  /** 告警面板容器 ref —— 用于检测点击是否在面板之外，实现外部点击自动收起 */
-  const notifRef = useRef<HTMLDivElement | null>(null);
-  // 告警面板全场景自动收起（点击外部、按 Esc、页面外部滚动）
-  useEffect(() => {
-    if (!notifOpen) return;
-    const onPointerDown = (e: Event) => {
-      if (notifRef.current?.contains(e.target as Node)) return;
-      setNotifOpen(false);
-    };
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setNotifOpen(false);
-    };
-    const onScroll = (e: Event) => {
-      if (notifRef.current?.contains(e.target as Node)) return;
-      setNotifOpen(false);
-    };
-    document.addEventListener("pointerdown", onPointerDown);
-    document.addEventListener("keydown", onKeyDown);
-    window.addEventListener("scroll", onScroll, true);
-    return () => {
-      document.removeEventListener("pointerdown", onPointerDown);
-      document.removeEventListener("keydown", onKeyDown);
-      window.removeEventListener("scroll", onScroll, true);
-    };
-  }, [notifOpen]);
-  // 搜索框是否聚焦（控制跨来源聚合下拉的显隐）
-  const [searchFocused, setSearchFocused] = useState(false);
-  // DNSHE 导航子菜单是否展开（「域名列表 / 注册·查重」）
-  const [dnsheMenuOpen, setDnsheMenuOpen] = useState(false);
-  // 日志页当前分类：登录 / API / 操作 / 全部
-  const [logCategory, setLogCategory] = useState<"all" | "auth" | "api" | "operation">("all");
-
-  // 同步主题到 <html> 类并持久化
-  useEffect(() => {
-    document.documentElement.classList.toggle("dark", theme === "dark");
-    localStorage.setItem("DNSHE_THEME", theme);
-  }, [theme]);
-
-  // 同步配色主题到 <html data-theme> 并持久化
-  // NOTE: 与上面的明暗 effect 刻意分开 —— 两个维度独立变化，
-  // 合成一个 effect 会让「只改配色」也重写 DNSHE_THEME，逻辑上说不通。
-  useEffect(() => {
-    applyThemeAttribute(colorTheme);
-    try {
-      localStorage.setItem(THEME_STORAGE_KEY, colorTheme);
-    } catch {
-      /* 隐私模式下写入会抛异常，不影响本次会话内的主题切换 */
-    }
-  }, [colorTheme]);
-
-  // 持久化侧栏折叠（已随 useAppLayout 上移，这里不再重复）
-
-  // 数据列表状态（accounts 已上移到 AppDataProvider，Phase 2.5）
-  const [domains, setDomains] = useState<Domain[]>([]);
-  const [quotas, setQuotas] = useState<Quota[]>([]);
-  const [logs, setLogs] = useState<AppLog[]>([]);
+  const {
+    domains, setDomains, quotas, setQuotas, logs, setLogs,
+    loadingDomains, setLoadingDomains, loadingQuotas, setLoadingQuotas,
+    loadingLogs, setLoadingLogs, actionLoading, setActionLoading,
+    selectedAccountFilter, setSelectedAccountFilter, openActionMenuId, setOpenActionMenuId,
+    bindModalOpen, setBindModalOpen, editingAccount, setEditingAccount,
+  } = useAppDataState();
 
   // DNSHE 域名页的分组 / 搜索 / 折叠状态（实现见 features/domains/hooks/useDnsheDomains）
   // NOTE: 必须在 domains 声明之后调用；accounts 已在 AppDataProvider 解构、globalSearch 在其上方，均可见。
@@ -208,25 +141,8 @@ export function useAppControllerView() {
     toggleAllAccounts,
   } = useDnsheDomains(domains, accounts, globalSearch);
 
-  // 账号筛选与下拉菜单状态
-  const [selectedAccountFilter, setSelectedAccountFilter] = useState<string>("all");
-  const [openActionMenuId, setOpenActionMenuId] = useState<number | null>(null);
-
-  // Loading 状态（loadingAccounts 已上移到 AppDataProvider，Phase 2.5）
-  const [loadingDomains, setLoadingDomains] = useState(false);
-  const [loadingQuotas, setLoadingQuotas] = useState(false);
-  const [loadingLogs, setLoadingLogs] = useState(false);
-  const [actionLoading, setActionLoading] = useState<string | null>(null);
-
   // Toast 提示状态已在 AppDataProvider 内通过 useToast 挂载（Phase 2.5）
 
-
-  // 绑定账号弹窗（统一承载 DNSHE / Cloudflare / DigitalPlat 与四个新托管商，
-  // 各支持 单个 / 批量 两种方式）
-  const [bindModalOpen, setBindModalOpen] = useState(false);
-
-  // 修改账号表单状态
-  const [editingAccount, setEditingAccount] = useState<Account | null>(null);
 
   // 选中的域名与 DNS 记录管理模态框状态
   const [selectedDomain, setSelectedDomain] = useState<Domain | null>(null);
@@ -267,45 +183,6 @@ export function useAppControllerView() {
   // CF zone 注册信息编辑弹窗触发器（字段状态内聚在 CfEditModal，挂载时预填手动值）
   const [cfEditOpen, setCfEditOpen] = useState(false);
   const [cfEditZone, setCfEditZone] = useState<Domain | null>(null);
-
-  // ===== 线路解析支持名单 / 根域 NS 镜像（设置页 line-settings 共享，Phase 9 未随 Scanner 迁移） =====
-  // 支持按线路解析的 NS 后缀名单（可增删，持久化于浏览器本地）。
-  // 判定依据是根域的 NS 记录落在谁家 DNS 上 —— 上游没有「是否支持线路」的字段。
-  const [lineNsSuffixes, setLineNsSuffixes] = useState<string[]>(() => {
-    try {
-      const raw = localStorage.getItem("DNSHE_LINE_NS_SUFFIXES");
-      if (!raw) return DEFAULT_LINE_NS_SUFFIXES;
-      const parsed = JSON.parse(raw);
-      return Array.isArray(parsed) ? parsed.map((v) => String(v)) : DEFAULT_LINE_NS_SUFFIXES;
-    } catch {
-      return DEFAULT_LINE_NS_SUFFIXES;
-    }
-  });
-  // 新增 NS 后缀的输入框
-  const [newLineNsInput, setNewLineNsInput] = useState("");
-
-  // 根域 -> NS 主机名列表的本地镜像（null 表示查过但没查到）。
-  // 后端已经把结论缓存在 D1，这份镜像只为让首屏判定不用等网络往返。
-  const [rootNs, setRootNs] = useState<Record<string, string[] | null>>(() => {
-    try {
-      const raw = localStorage.getItem("DNSHE_ROOT_NS");
-      const parsed = raw ? JSON.parse(raw) : null;
-      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
-    } catch {
-      return {};
-    }
-  });
-
-  // 实测确认支持线路的根域（从解析记录反推而来，优先级高于 NS 判定）
-  const [learnedLineRoots, setLearnedLineRoots] = useState<string[]>(() => {
-    try {
-      const raw = localStorage.getItem("DNSHE_LINE_ROOTS");
-      const parsed = raw ? JSON.parse(raw) : null;
-      return Array.isArray(parsed) ? parsed.map((v) => String(v)) : [];
-    } catch {
-      return [];
-    }
-  });
 
   // ===== 注册查重（Scanner）状态 =====
   // NOTE: 根域名 / WHOIS 查重 / 注册 / 批量扫描 / 顺序检测 / 断点续查 / 保留前缀 /
@@ -1291,203 +1168,30 @@ export function useAppControllerView() {
   // NOTE: handleCheckWhois / handleRegisterSubdomain / 根域名增删 / rulePreview / 顺序模式生成器 /
   //       断点续查 / 保留前缀 / 词库增删改 / handleStartBatchScan / handleExportAvailableTxt
   //       全部抽出到 features/scanner/hooks/useScanner（App 通过 scanner.* 调用）。
-  // ===== 线路解析支持名单（设置页 line-settings 共享，Phase 9 未随 Scanner 迁移） =====
-  // ===== 线路解析支持名单 =====
-  const persistLineNsSuffixes = (next: string[]) => {
-    const cleaned = Array.from(
-      new Set(
-        next
-          .map((v) => String(v).trim().toLowerCase().replace(/^\.+|\.+$/g, ""))
-          .filter(Boolean)
-      )
-    );
-    setLineNsSuffixes(cleaned);
-    localStorage.setItem("DNSHE_LINE_NS_SUFFIXES", JSON.stringify(cleaned));
-  };
-
-  /**
-   * NS 主机名是否落在后缀名单内
-   *
-   * NOTE: 必须按标签边界比对（相等或 `.` + 后缀结尾），裸 endsWith 会让
-   * evilalidns.com 这种域名混进名单。
-   */
-  const nsHostMatchesSuffix = (host: string): boolean => {
-    const h = host.trim().toLowerCase().replace(/\.$/, "");
-    if (!h) return false;
-    return lineNsSuffixes.some((sfx) => h === sfx || h.endsWith(`.${sfx}`));
-  };
-
-  /**
-   * 该域名是否支持按线路（运营商/地域）解析
-   *
-   * 三级优先级：实测已确认的根域 > 根域 NS 命中后缀名单 > provider_account_id 兜底。
-   * 兜底只在 NS 未知（首屏未加载完 / 后端 DoH 出站失败）时生效，见 DEFAULT_LINE_PROVIDERS。
-   */
-  const domainSupportsLine = (dom: Domain | null | undefined): boolean => {
-    const root = String(dom?.rootdomain ?? "").trim().toLowerCase();
-    if (root && learnedLineRoots.includes(root)) return true;
-
-    const ns = root ? rootNs[root] : undefined;
-    if (ns && ns.length > 0) return ns.some(nsHostMatchesSuffix);
-
-    const pid = dom?.provider_account_id;
-    if (pid === undefined || pid === null || String(pid).trim() === "") return false;
-    return DEFAULT_LINE_PROVIDERS.includes(String(pid).trim());
-  };
-
-  /** 根域 NS 单次查询上限，与后端 /api/dns/ns 的 NS_MAX_ROOTS 保持一致 */
-  const NS_LOOKUP_BATCH = 20;
-
-  /**
-   * 批量查询根域 NS 并写入本地镜像
-   *
-   * @param roots 待查根域；非 force 时只查镜像里还没有有效结论的（含上次查失败的 null），
-   *              命中缓存的根域不会产生任何请求，查询失败的下次调用会自动重试
-   * @param force 强制回源（设置页「重新查询 NS」用），会带上 refresh=1 让后端跳过 D1 缓存
-   * @returns 本次真正拿到的结论（键为根域，值为 NS 列表或 null 表示查不到）；
-   *          调用方据此判断成败，全 null 说明后端 DoH 出站失败或该域名确实没有 NS
-   */
-  const fetchRootNs = async (roots: string[], force = false): Promise<Record<string, string[] | null>> => {
-    const normalized = Array.from(
-      new Set(roots.map((r) => String(r || "").trim().toLowerCase()).filter(Boolean))
-    );
-    // NOTE: 判据是「有没有有效结论」而不是「键在不在」—— 上次查失败留下的 null 必须能
-    //       重试，否则一次网络抖动会把该根域永久钉死在「未知」上（镜像进了 localStorage）。
-    const pending = force
-      ? normalized
-      : normalized.filter((r) => {
-          const cur = rootNs[r];
-          return !(Array.isArray(cur) && cur.length > 0);
-        });
-    if (pending.length === 0) return {};
-
-    const merged: Record<string, string[] | null> = {};
-    for (let i = 0; i < pending.length; i += NS_LOOKUP_BATCH) {
-      const batch = pending.slice(i, i + NS_LOOKUP_BATCH);
-      try {
-        const res = await apiFetch(
-          `/api/dns/ns?roots=${encodeURIComponent(batch.join(","))}${force ? "&refresh=1" : ""}`
-        );
-        const data = await res.json();
-        if (data.success && data.ns && typeof data.ns === "object") {
-          Object.assign(merged, data.ns as Record<string, string[] | null>);
-        }
-      } catch (e) {
-        // 查不到就让判定走 provider_account_id 兜底，不打扰用户
-      }
-    }
-    if (Object.keys(merged).length === 0) return {};
-
-    // NOTE: 函数式更新 —— 域名列表刷新与设置页手动重查可能并发，闭包里的 rootNs 会过期
-    setRootNs((prev) => {
-      const next = { ...prev, ...merged };
-      localStorage.setItem("DNSHE_ROOT_NS", JSON.stringify(next));
-      return next;
-    });
-    return merged;
-  };
-
-  /**
-   * 从解析记录反推「该根域支持线路」并记住
-   *
-   * NOTE: 只加不减。支持线路的域名如果所有记录都留在默认线路，line 全是空值，
-   * 据此判「不支持」会误杀 —— 所以这里是单向补充。这是唯一的实测信号（用户确实在
-   * 上面设成了非默认线路且上游收下了），比 NS 推断更硬，因此判定时优先级最高。
-   * 数据来自本来就要读的解析记录，零额外上游调用。
-   */
-  const learnLineRootFrom = (dom: Domain, records: DnsRecord[]) => {
-    const root = String(dom.rootdomain ?? "").trim().toLowerCase();
-    if (!root || learnedLineRoots.includes(root)) return;
-    const usesLine = records.some((r) => {
-      const v = String(r.line || "").trim().toLowerCase();
-      return v !== "" && v !== "default";
-    });
-    if (!usesLine) return;
-
-    // NOTE: 走函数式更新而不是 persist([...learnedLineRoots, root]) ——
-    // 闭包里的 learnedLineRoots 可能已过期（连续打开两个域名时后一次会覆盖前一次的补充）。
-    setLearnedLineRoots((prev) => {
-      if (prev.includes(root)) return prev;
-      const next = [...prev, root];
-      localStorage.setItem("DNSHE_LINE_ROOTS", JSON.stringify(next));
-      return next;
-    });
-    showToast("info", `检测到 ${dom.full_domain} 使用了线路解析，已确认根域 ${root} 支持线路`);
-  };
-
-  // 添加 NS 后缀（支持一次粘贴多个）
-  const handleAddLineNsSuffix = (e?: React.FormEvent) => {
-    if (e) e.preventDefault();
-    const incoming = parseWords(newLineNsInput).map((w) => w.toLowerCase());
-    if (incoming.length === 0) return;
-    const merged = Array.from(new Set([...lineNsSuffixes, ...incoming]));
-    const added = merged.length - lineNsSuffixes.length;
-    persistLineNsSuffixes(merged);
-    setNewLineNsInput("");
-    showToast(added > 0 ? "success" : "info", added > 0 ? `已添加 ${added} 个 NS 后缀` : "输入的后缀都已在名单中");
-  };
-
-  const handleRemoveLineNsSuffix = (sfx: string) => {
-    persistLineNsSuffixes(lineNsSuffixes.filter((s) => s !== sfx));
-  };
-
-  const handleRestoreLineNsSuffixes = () => {
-    persistLineNsSuffixes(DEFAULT_LINE_NS_SUFFIXES);
-    showToast("success", "已恢复默认 NS 后缀名单");
-  };
-
-  // 清空「实测已确认」的根域（判定优先级最高，误判时需要能撤掉）
-  const handleClearLearnedLineRoots = () => {
-    setLearnedLineRoots([]);
-    localStorage.removeItem("DNSHE_LINE_ROOTS");
-    showToast("info", "已清空实测确认的根域");
-  };
-
-  // 设置页「重新查询 NS」仅在 DNSHE 子菜单可见时使用。
-  // 无 DNSHE 账号时不执行回源查询，也不额外提示；后端同样会拒绝无账号的 NS 查询。
-  const handleRefreshRootNs = async () => {
-    if (dnsheAccounts.length === 0) {
-      return;
-    }
-    setActionLoading("ns-lookup");
-    try {
-      const result = await fetchRootNs(knownRootDomains, true);
-      const total = Object.keys(result).length;
-      const resolved = Object.values(result).filter((v) => Array.isArray(v) && v.length > 0).length;
-      // 一条都没查到通常是后端 DoH 出站被拦（运行日志里会有一条 warning），
-      // 报成功会让用户对着满屏「NS 未知」怀疑面板坏了
-      if (total === 0) {
-        showToast("error", "NS 查询没有返回任何结果，请检查后端连通性");
-      } else if (resolved === 0) {
-        showToast("error", `${total} 个根域全部查询失败，判定已回退到服务商 ID（详见运行日志）`);
-      } else if (resolved < total) {
-        showToast("info", `已查到 ${resolved}/${total} 个根域的 NS，其余保持「未知」`);
-      } else {
-        showToast("success", `${resolved} 个根域的 NS 已刷新`);
-      }
-    } finally {
-      setActionLoading(null);
-    }
-  };
-
-  /**
-   * 所有已知根域名：已缓存域名用到的 ∪ 注册页的根域列表
-   *
-   * NOTE: 给设置页对照表和 NS 批量查询共用。取并集是为了让用户在还没同步任何域名时
-   * 也能先看到判定结论，同时覆盖 allRootDomains 里手工添加的新根域。
-   */
-  const knownRootDomains = useMemo(() => {
-    const set = new Set<string>();
-    for (const d of domains) {
-      const root = String(d.rootdomain ?? "").trim().toLowerCase();
-      if (root) set.add(root);
-    }
-    for (const root of scanner.allRootDomains) {
-      const r = String(root || "").trim().toLowerCase();
-      if (r) set.add(r);
-    }
-    return Array.from(set).sort();
-  }, [domains, scanner.allRootDomains]);
+  const {
+    lineNsSuffixes,
+    newLineNsInput,
+    setNewLineNsInput,
+    rootNs,
+    learnedLineRoots,
+    nsHostMatchesSuffix,
+    domainSupportsLine,
+    fetchRootNs,
+    learnLineRootFrom,
+    handleAddLineNsSuffix,
+    handleRemoveLineNsSuffix,
+    handleRestoreLineNsSuffixes,
+    handleClearLearnedLineRoots,
+    handleRefreshRootNs,
+    knownRootDomains,
+  } = useLineDnsSettings({
+    domains,
+    scannerRootDomains: scanner.allRootDomains,
+    dnsheAccountCount: dnsheAccounts.length,
+    apiFetch,
+    showToast,
+    setActionLoading,
+  });
 
   // 动态服务商菜单项：按该服务商账号的「最早添加时间」动态排序
   // 只有真正绑定了账号的服务商才会显示，且不再受 loadingAccounts 影响，杜绝刷新时一闪而过的闪烁。
@@ -1520,44 +1224,7 @@ export function useAppControllerView() {
     [providerNavItems, customDomains.length, accounts.length]
   );
 
-  // 通知铃铛数据源:最近的告警/错误日志
-  const alertLogs = useMemo(
-    () => logs.filter((l) => l.type === "error" || l.type === "warning").slice(0, 6),
-    [logs]
-  );
-
-  // 已读告警标记：持久化最近查看过的告警 ID，用于小铃铛红点显隐
-  const [lastAlertSeenId, setLastAlertSeenId] = useState<number>(
-    () => Number(localStorage.getItem("DNSHE_LAST_SEEN_ALERT_ID") || 0)
-  );
-  // 是否存在比上次已读更新/更高的未读告警
-  const unreadAlert = useMemo(() => {
-    const newest = alertLogs[0];
-    return !!newest && newest.id > lastAlertSeenId;
-  }, [alertLogs, lastAlertSeenId]);
-  // 将当前全部告警标记为已读
-  const markAlertsRead = () => {
-    const newest = alertLogs[0];
-    if (newest) {
-      setLastAlertSeenId(newest.id);
-      localStorage.setItem("DNSHE_LAST_SEEN_ALERT_ID", String(newest.id));
-    }
-  };
-
-  // 日志分类映射（兼容历史 category 值）
-  //   登录 ← auth
-  //   API  ← api / sync / renew
-  //   操作 ← operation / system
-  const filteredLogs = useMemo(() => {
-    if (logCategory === "all") return logs;
-    const groupMap: Record<string, string[]> = {
-      auth: ["auth"],
-      api: ["api", "sync", "renew"],
-      operation: ["operation", "system"],
-    };
-    const allowed = groupMap[logCategory] || [];
-    return logs.filter((l) => allowed.includes(l.category));
-  }, [logs, logCategory]);
+  const { alertLogs, unreadAlert, markAlertsRead, filteredLogs } = useAppAlerts(logs, logCategory);
 
   // Dashboard 概览统计（实现见 features/dashboard/hooks/useDashboardStats）
   const dashboardStats = useDashboardStats({

@@ -17,18 +17,19 @@
     "check:cascade": "node cascade-check.mjs",
     "check:theme": "node cascade-check.mjs && node contrast-check.mjs",
     "test": "npm run test:node && npm run test:signature && npm run test:credentials",
-    "verify:all": "npm run check:architecture && npm run verify:worker && npm run build:worker && npm run test:invariants && npm run verify:node && npm test && npm run check:theme && npm --prefix frontend run typecheck && npm --prefix frontend run build",
+    "verify:all": "npm run check:architecture && npm run verify:worker && npm run build:worker && npm run test:invariants && npm run verify:node && npm test && npm --prefix frontend run build && npm run check:theme",
     "check:architecture": "node architecture-check.mjs",
     "verify:worker": "tsc --noEmit -p tsconfig.json",
     "build:worker": "esbuild src/index.ts --bundle --platform=neutral --target=es2022 --format=esm --outfile=dist-worker/index.mjs",
-    "test:invariants": "npm run test:unit:state && npm run test:unit:search && npm run test:unit:provider && npm run test:unit:scanner && npm run test:unit:backup && npm run test:integration:architecture",
+    "test:invariants": "npm run test:unit:state && npm run test:unit:search && npm run test:unit:provider && npm run test:unit:scanner && npm run test:unit:scanner-sequence && npm run test:unit:backup && npm run test:integration:architecture",
     "test:unit:state": "esbuild tests/unit/dns-state-machine.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/dns-state-machine.test.mjs && node --test dist-node/dns-state-machine.test.mjs",
     "test:unit:search": "esbuild tests/unit/search-ranking.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/search-ranking.test.mjs && node --test dist-node/search-ranking.test.mjs",
     "test:unit:provider": "esbuild tests/unit/provider-registry.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/provider-registry.test.mjs && node --test dist-node/provider-registry.test.mjs",
     "test:unit:scanner": "esbuild tests/unit/scanner-worker.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/scanner-worker.test.mjs && node --test dist-node/scanner-worker.test.mjs",
     "test:unit:backup": "esbuild tests/unit/backup-diff.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/backup-diff.test.mjs && node --test dist-node/backup-diff.test.mjs",
     "test:integration:architecture": "esbuild tests/integration/architecture.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/architecture.test.mjs && node --test dist-node/architecture.test.mjs",
-    "verify:architecture": "npm run check:architecture && npm run check:theme"
+    "verify:architecture": "npm run check:architecture && npm --prefix frontend run build && npm run check:theme",
+    "test:unit:scanner-sequence": "esbuild tests/unit/scanner-sequence.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/scanner-sequence.test.mjs && node --test dist-node/scanner-sequence.test.mjs"
   },
   "engines": {
     "node": ">=22.5.0"

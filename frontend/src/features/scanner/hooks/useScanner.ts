@@ -2,201 +2,71 @@
  * useScanner —— 「规则多域名查重 / WHOIS 查重与注册」标签页（register）的状态 / 派生 / 动作。
  *
  * 由 App.tsx 纯搬运抽出（Phase 9）。DOM / className / 接口路径 / localStorage 键逐字未改，
- * 行为保持一致。词库（wordBanks）与保留前缀名单仅被本页消费，故一并迁入；
- * 而「线路解析支持名单 / 根域 NS 镜像」被设置页（line-settings）共享，留在 App。
+ * 行为保持一致。Phase 3 将扫描状态、词库管理与顺序生成逻辑进一步拆出；
+ * 本文件保留扫描编排、WHOIS/注册动作以及批量扫描执行流程。
  *
  * App 侧注入的依赖：
  *   - fetchDomains / setActiveTab：注册成功后刷新域名列表并跳转（App 本地状态与动作）
  *   - dnsheAccounts：DNSHE 账号列表（来自 useDnsheDomains(domains, accounts, ...)）
  * apiFetch / showToast 直接从 useAppData 取得。
  */
-import { useMemo, useRef, useState } from "react";
+import { useMemo } from "react";
+import type { FormEvent } from "react";
 import { toASCII } from "../../../punycode";
-import {
-  loadWordBanks,
-  saveWordBanks,
-  makeBankId,
-  buildDefaultBanks,
-  parseWords,
-  BANK_KIND_META,
-  type WordBank,
-  type BankKind
-} from "../../../wordbanks";
-import {
-  parseRule,
-  countCombos,
-  generateCombos,
-  BUILTIN_TOKENS
-} from "../../../rulegen";
+import { parseWords } from "../../../wordbanks";
+import { parseRule, countCombos, generateCombos } from "../../../rulegen";
 import { useAppData } from "../../../state/AppDataContext";
 import type { Account } from "../../../types/account";
+import { useScannerState } from "./useScannerState";
+import { useScannerWordBanks } from "./useScannerWordBanks";
+import { generateSeqPrefixes } from "../utils/scanner-sequence";
+import type { AvailableDomain, ScanCursor, ScanStatus } from "../utils/scanner-types";
 
-const DEFAULT_ROOT_DOMAINS = [
-  "us.ci", "l.cd", "cc.cd", "cn.mt", "bot.cd", "de5.net", "ccwu.cc", "ddns.ge", "bbroot.com"
-];
-
-export type WhoisResult = {
-  searchedDomain?: string;
-  success?: boolean;
-  registered?: boolean;
-  status?: string;
-  registered_at?: string;
-  expires_at?: string;
-  registrant_email?: string;
-  nameservers?: string[];
-  message?: string;
-};
-
-export type AvailableDomain = {
-  fullDomain: string;
-  subdomain: string;
-  rootdomain: string;
-  time: string;
-};
-
-export type ScanLog = {
-  id: number;
-  time: string;
-  text: string;
-  status: "available" | "registered" | "error" | "info";
-};
-
-export type ScanCursor = {
-  seqMode: boolean;
-  charset: string;
-  length: number;
-  lastCandidate: string;
-  taskIndex: number;
-  checked: number;
-  savedAt: string;
-};
-
-export type ScanStatus = "idle" | "running" | "paused" | "completed";
-
-export type ScannerParams = { total: number; checked: number; available: number };
+const MAX_PREFIXES = 300000;
 
 export interface UseScannerOptions {
-  /** 注册成功后刷新 DNSHE 域名列表（App 本地动作） */
   fetchDomains: () => void;
-  /** 注册成功后跳转到域名标签页 */
   setActiveTab: (tab: "domains") => void;
-  /** DNSHE 账号列表（用于注册目标账号选择与多流水线并发） */
   dnsheAccounts: Account[];
-  /** App 级 actionLoading：注册按钮的 loading 态复用它，保持一致（纯搬运） */
   actionLoading: string | null;
   setActionLoading: (v: string | null) => void;
 }
 
 export function useScanner({
-  fetchDomains,
-  setActiveTab,
-  dnsheAccounts,
-  actionLoading,
-  setActionLoading
+  fetchDomains, setActiveTab, dnsheAccounts, actionLoading, setActionLoading
 }: UseScannerOptions) {
   const { apiFetch, showToast } = useAppData();
-
-  const [allRootDomains, setAllRootDomains] = useState<string[]>(() => {
-    const saved = localStorage.getItem("DNSHE_CUSTOM_ROOT_DOMAINS");
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
-      } catch (e) {}
-    }
-    return DEFAULT_ROOT_DOMAINS;
-  });
-  const [newRootInput, setNewRootInput] = useState("");
-
-  // 域名注册与查重状态
-  const [searchSubdomain, setSearchSubdomain] = useState("");
-  const [searchRootdomain, setSearchRootdomain] = useState("us.ci");
-  const [whoisLoading, setWhoisLoading] = useState(false);
-  const [whoisResult, setWhoisResult] = useState<WhoisResult | null>(null);
-  const [registerAccountId, setRegisterAccountId] = useState<number | "">("");
-
-  // 规则多域名查重状态
-  const [regMode, setRegMode] = useState<"single" | "batch">("single");
-  const [batchRules, setBatchRules] = useState<string>("");
-  const [excludeChars, setExcludeChars] = useState<string>("");
-  const [selectedRoots, setSelectedRoots] = useState<string[]>([]);
-  const [batchLength, setBatchLength] = useState<number>(2);
-  const [scanStatus, setScanStatus] = useState<ScanStatus>("idle");
-  const scanControlRef = useRef<ScanStatus>("idle");
+  const {
+    DEFAULT_ROOT_DOMAINS, DEFAULT_RESERVED_PREFIXES,
+    allRootDomains, setAllRootDomains, newRootInput, setNewRootInput,
+    searchSubdomain, setSearchSubdomain, searchRootdomain, setSearchRootdomain,
+    whoisLoading, setWhoisLoading, whoisResult, setWhoisResult, registerAccountId, setRegisterAccountId,
+    regMode, setRegMode, batchRules, setBatchRules, excludeChars, setExcludeChars,
+    selectedRoots, setSelectedRoots, batchLength, setBatchLength,
+    scanStatus, setScanStatus, scanControlRef, scanProgress, setScanProgress,
+    availableDomainsList, setAvailableDomainsList, scanLogs, setScanLogs,
+    seqMode, setSeqMode, seqCharset, setSeqCharset, seqLength, setSeqLength, seqStart, setSeqStart,
+    scanCursor, setScanCursor, scanCursorRef, ignorePool, setIgnorePool,
+    reservedPrefixes, setReservedPrefixes, enableReservedFilter, setEnableReservedFilter, newReservedInput, setNewReservedInput,
+    wordBanks, setWordBanks, bankModalOpen, setBankModalOpen, editingBank, setEditingBank,
+    bankFormName, setBankFormName, bankFormKind, setBankFormKind, bankFormWords, setBankFormWords
+  } = useScannerState();
 
   const updateScanStatus = (status: ScanStatus) => {
     scanControlRef.current = status;
     setScanStatus(status);
   };
-  const [scanProgress, setScanProgress] = useState<ScannerParams>({ total: 0, checked: 0, available: 0 });
-  const [availableDomainsList, setAvailableDomainsList] = useState<AvailableDomain[]>([]);
-  const [scanLogs, setScanLogs] = useState<ScanLog[]>([]);
 
-  // ===== 顺序检测（进位递增）与断点续查状态 =====
-  // 顺序模式开关：开启后忽略规则框，按字符集进位顺序惰性生成候选（如 aaa→aab→...）
-  const [seqMode, setSeqMode] = useState(false);
-  // 顺序模式的字符集与长度
-  const [seqCharset, setSeqCharset] = useState<"字母" | "数字" | "字母数字">("字母");
-  const [seqLength, setSeqLength] = useState<number>(3);
-  // 顺序模式的起始串（留空则从最小串开始，如 aaa）
-  const [seqStart, setSeqStart] = useState<string>("");
-  // 已保存的断点光标（从 localStorage 恢复，供「继续上次」提示使用）
-  const [scanCursor, setScanCursor] = useState<ScanCursor | null>(() => {
-    try {
-      const raw = localStorage.getItem("DNSHE_SCAN_CURSOR");
-      return raw ? JSON.parse(raw) : null;
-    } catch {
-      return null;
-    }
-  });
-  // 扫描运行期间实时记录当前进度，供暂停/限流时落盘
-  const scanCursorRef = useRef<{ lastCandidate: string; taskIndex: number; checked: number }>({
-    lastCandidate: "",
-    taskIndex: 0,
-    checked: 0
-  });
-
-  // 查重池：是否忽略池子强制全部重查（用于刷新可能已过期的结论）
-  const [ignorePool, setIgnorePool] = useState(false);
-
-  // ===== 官方保留前缀排除名单 =====
-  // DNSHE 官方设置为不可注册的前缀（整词匹配，如 ai 不可注册但 ailu 可以）。
-  // 查重前直接剔除，避免浪费 API 配额。名单可编辑并持久化。
-  const DEFAULT_RESERVED_PREFIXES = ["ai", "jd", "qq", "mail"];
-  const [reservedPrefixes, setReservedPrefixes] = useState<string[]>(() => {
-    try {
-      const raw = localStorage.getItem("DNSHE_RESERVED_PREFIXES");
-      if (!raw) return DEFAULT_RESERVED_PREFIXES;
-      const parsed = JSON.parse(raw);
-      return Array.isArray(parsed) ? parsed : DEFAULT_RESERVED_PREFIXES;
-    } catch {
-      return DEFAULT_RESERVED_PREFIXES;
-    }
-  });
-  // 是否启用保留前缀排除
-  const [enableReservedFilter, setEnableReservedFilter] = useState(
-    () => localStorage.getItem("DNSHE_RESERVED_FILTER_OFF") !== "1"
-  );
-  // 新增保留前缀的输入框
-  const [newReservedInput, setNewReservedInput] = useState("");
-
-  // ===== 可编辑词库状态 =====
-  // 词库分组列表（首次从内置种子导入，之后持久化在 localStorage）
-  const [wordBanks, setWordBanks] = useState<WordBank[]>(() =>
-    loadWordBanks(new Set(BUILTIN_TOKENS))
-  );
-  // 词库管理弹窗开关
-  const [bankModalOpen, setBankModalOpen] = useState(false);
-  // 正在编辑的分组（null 表示新建）
-  const [editingBank, setEditingBank] = useState<WordBank | null>(null);
-  // 编辑表单字段
-  const [bankFormName, setBankFormName] = useState("");
-  const [bankFormKind, setBankFormKind] = useState<BankKind>("cn");
-  const [bankFormWords, setBankFormWords] = useState("");
+  const { openCreateBank, openEditBank, handleSaveBank, handleDeleteBank, handleResetBanks, appendWordbank } =
+    useScannerWordBanks({
+      wordBanks, setWordBanks, bankFormName, bankFormKind, bankFormWords, editingBank,
+      setBankModalOpen, setEditingBank, setBankFormName, setBankFormKind, setBankFormWords,
+      setBatchRules, showToast
+    });
 
   // 执行 WHOIS 域名查重
   const handleCheckWhois = async (
-    e?: React.FormEvent,
+    e?: FormEvent,
     overrideSub?: string,
     overrideRoot?: string
   ) => {
@@ -281,7 +151,7 @@ export function useScanner({
   };
 
   // 添加与删除自定义根域名 handler
-  const handleAddCustomRootDomain = (e?: React.FormEvent) => {
+  const handleAddCustomRootDomain = (e?: FormEvent) => {
     if (e) e.preventDefault();
     const cleanRoot = toASCII(newRootInput.trim().replace(/^\./, ""));
     if (!cleanRoot) return;
@@ -304,12 +174,6 @@ export function useScanner({
     localStorage.setItem("DNSHE_CUSTOM_ROOT_DOMAINS", JSON.stringify(updated));
     showToast("info", `已移除根域名 [.${rootToRemove}]`);
   };
-
-  // 批量规则生成：解析与组合逻辑见 rulegen.ts（花括号槽位模型）
-  //
-  // 生成上限对齐 west.cn 在线版的 30 万条。注意这只是「生成」上限，
-  // 实际扫描速度受单账号 1.2s 限频约束（见 handleStartBatchScan 的 RATE_LIMIT_MS）。
-  const MAX_PREFIXES = 300000;
 
   // 让用户自建词库也能作为 {词库名} 标签参与组合 —— 比 west.cn 固定的「我的字典1-6」更灵活
   const resolveBank = useMemo(
@@ -352,55 +216,7 @@ export function useScanner({
   };
 
   // ===== 顺序检测：进位递增生成器 =====
-  // 取顺序模式对应的字符集
-  const getSeqCharset = (name: string): string[] => {
-    const letters = "abcdefghijklmnopqrstuvwxyz".split("");
-    const digits = "0123456789".split("");
-    if (name === "数字") return digits;
-    if (name === "字母数字") return [...letters, ...digits];
-    return letters;
-  };
-
-  // 进位递增：给定当前串返回下一个串（qwe→qwf，qwz→qxa）；已到最大串则返回 null
-  const nextSeqCandidate = (current: string, charset: string[]): string | null => {
-    const idxMap = new Map(charset.map((c, i) => [c, i]));
-    const chars = current.split("");
-    let pos = chars.length - 1;
-    while (pos >= 0) {
-      const cur = idxMap.get(chars[pos]);
-      if (cur === undefined) return null; // 出现字符集外的字符
-      if (cur < charset.length - 1) {
-        chars[pos] = charset[cur + 1];
-        return chars.join("");
-      }
-      chars[pos] = charset[0]; // 进位：本位归零，继续向前进位
-      pos--;
-    }
-    return null; // 全部进位完毕，空间穷尽
-  };
-
-  // 惰性生成顺序候选：从 start 开始最多取 limit 个（避免 26^4 一次性撑爆内存）
-  const generateSeqPrefixes = (
-    charsetName: string,
-    length: number,
-    start: string,
-    limit: number
-  ): string[] => {
-    const charset = getSeqCharset(charsetName);
-    const min = charset[0].repeat(length);
-    let cur = start && start.length === length ? start.toLowerCase() : min;
-    // 起始串含字符集外字符时回退到最小串
-    if (cur.split("").some(c => !charset.includes(c))) cur = min;
-
-    const out: string[] = [];
-    while (out.length < limit) {
-      out.push(cur);
-      const nxt = nextSeqCandidate(cur, charset);
-      if (nxt === null) break;
-      cur = nxt;
-    }
-    return out;
-  };
+  // 纯生成逻辑已抽离到 utils/scanner-sequence.ts。
 
   // 保存/清除断点光标
   const saveScanCursor = (lastCandidate: string, taskIndex: number, checked: number) => {
@@ -427,21 +243,16 @@ export function useScanner({
     setReservedPrefixes(next);
     localStorage.setItem("DNSHE_RESERVED_PREFIXES", JSON.stringify(next));
   };
-  // 添加保留前缀（支持一次粘贴多个，逗号/空格/换行分隔）
-  const handleAddReserved = (e?: React.FormEvent) => {
+
+  const handleAddReserved = (e?: FormEvent) => {
     if (e) e.preventDefault();
     const incoming = parseWords(newReservedInput).map(w => w.toLowerCase());
     if (incoming.length === 0) return;
-
     const merged = Array.from(new Set([...reservedPrefixes, ...incoming]));
     const added = merged.length - reservedPrefixes.length;
     persistReserved(merged);
     setNewReservedInput("");
-    if (added > 0) {
-      showToast("success", `已添加 ${added} 个保留前缀`);
-    } else {
-      showToast("info", "输入的前缀均已在名单中");
-    }
+    showToast(added > 0 ? "success" : "info", added > 0 ? `已添加 ${added} 个保留前缀` : "输入的前缀均已在名单中");
   };
 
   const handleRemoveReserved = (prefix: string) => {
@@ -454,104 +265,9 @@ export function useScanner({
     showToast("success", "已恢复官方默认保留前缀名单");
   };
 
-  // 切换启用状态并持久化
   const toggleReservedFilter = (enabled: boolean) => {
     setEnableReservedFilter(enabled);
     localStorage.setItem("DNSHE_RESERVED_FILTER_OFF", enabled ? "0" : "1");
-  };
-
-  // ===== 词库增删改 =====
-  // 统一落盘：状态与 localStorage 同步更新
-  const persistBanks = (next: WordBank[]) => {
-    setWordBanks(next);
-    saveWordBanks(next);
-  };
-
-  // 打开新建分组弹窗
-  const openCreateBank = () => {
-    setEditingBank(null);
-    setBankFormName("");
-    setBankFormKind("cn");
-    setBankFormWords("");
-    setBankModalOpen(true);
-  };
-
-  // 打开编辑分组弹窗
-  const openEditBank = (bank: WordBank) => {
-    setEditingBank(bank);
-    setBankFormName(bank.name);
-    setBankFormKind(bank.kind);
-    setBankFormWords(bank.words.join(", "));
-    setBankModalOpen(true);
-  };
-
-  // 保存（新建或更新）分组
-  const handleSaveBank = () => {
-    const name = bankFormName.trim();
-    if (!name) {
-      showToast("error", "请填写词库名称！");
-      return;
-    }
-    // 词库名会作为 {名称} 标签写进规则，含花括号或逗号会破坏规则解析
-    if (/[{},]/.test(name)) {
-      showToast("error", "词库名称不能包含 { } 或逗号，否则无法作为规则标签使用！");
-      return;
-    }
-    // 与内置标签重名会被内置定义遮蔽，导致点击词库标签却取到内置候选集
-    if ((BUILTIN_TOKENS as readonly string[]).includes(name)) {
-      showToast("error", `[${name}] 与内置标签同名，请换一个词库名称！`);
-      return;
-    }
-    const words = parseWords(bankFormWords);
-    if (words.length === 0) {
-      showToast("error", "请至少填写一个词条！");
-      return;
-    }
-
-    // 同类型下不允许重名（编辑自身除外）
-    const dup = wordBanks.some(
-      b => b.kind === bankFormKind && b.name === name && b.id !== editingBank?.id
-    );
-    if (dup) {
-      showToast("error", `「${BANK_KIND_META[bankFormKind].label}」下已存在同名词库 [${name}]！`);
-      return;
-    }
-
-    if (editingBank) {
-      persistBanks(
-        wordBanks.map(b =>
-          b.id === editingBank.id ? { ...b, name, kind: bankFormKind, words } : b
-        )
-      );
-      showToast("success", `词库 [${name}] 已更新（${words.length} 个词）`);
-    } else {
-      persistBanks([...wordBanks, { id: makeBankId(), kind: bankFormKind, name, words }]);
-      showToast("success", `已新建词库 [${name}]（${words.length} 个词）`);
-    }
-    setBankModalOpen(false);
-  };
-
-  // 删除分组
-  const handleDeleteBank = (bank: WordBank) => {
-    if (!confirm(`确定要删除词库 [${bank.name}] 吗？该分组下 ${bank.words.length} 个词条将一并移除。`)) return;
-    persistBanks(wordBanks.filter(b => b.id !== bank.id));
-    showToast("info", `已删除词库 [${bank.name}]`);
-  };
-
-  // 恢复内置默认词库（覆盖当前全部自定义内容）
-  const handleResetBanks = () => {
-    if (!confirm("确定要恢复内置默认词库吗？您当前所有的自定义词库分组与修改都将被覆盖！")) return;
-    const defaults = buildDefaultBanks();
-    persistBanks(defaults);
-    showToast("success", `已恢复内置默认词库（${defaults.length} 个分组）`);
-  };
-
-  // 把词库作为 {词库名} 标签插入规则框。
-  // 早先是把整类词逗号展开进输入框，几百个词会把框挤满、完全看不清规则结构；
-  // 改插占位符后词库还能与其它标签组合（如 {地名城市}{数字}）。
-  const appendWordbank = (words: string[], label: string) => {
-    setBatchRules(prev => `${prev}{${label}}`);
-    showToast("success", `已插入「${label}」词库标签（${words.length} 个词）`);
   };
 
   // 执行批量扫域名引擎（resumeFrom 非空时表示从断点续查）
@@ -987,4 +703,3 @@ export function useScanner({
 }
 
 export type UseScannerReturn = ReturnType<typeof useScanner>;
-export { DEFAULT_ROOT_DOMAINS };

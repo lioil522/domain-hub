@@ -123,54 +123,58 @@
  * 专门覆写 border-color 和 box-shadow，用主题 accent 色的光环替代默认
  * 的玻璃边框，保留内高光折射等玻璃质感。
  *
- * 三种卡片的高亮色分别为：
+ * ⚠ 特异性契约：
+ *   基础玻璃规则选择器为 `[data-theme] .bg-surface[class*=...]:not():not()`
+ *   → 特异性 0,5,0。高亮规则必须 > 0,5,0 才能在两者都带 !important 时赢。
+ *   做法：在基础选择器上追加 `.card-highlighted`，达到 0,6,0。
+ *
+ * 三种卡片的高亮色：
  *   · DNSHE DomainCard  → accent（主题色）
  *   · DpDomainCard      → emerald-400（翡翠绿）
- *   · CfZoneCard        → sky-400（天蓝）
- * 这里只做统一的 accent 覆写；emerald / sky 的 Tailwind 类本身特异性够高，
- * 被 !important 压的是 border 简写属性，所以用 border-color 单属性 + ring
- * 的 box-shadow 合并覆写即可。 */
+ *   · CfZoneCard        → sky-400（天蓝） */
 
-/* DNSHE 域名卡片高亮 */
-[data-theme="liquidglass"] .card-highlighted[id^="dnshe-domain-card-"] {
+/* DNSHE 域名卡片高亮（特异性 0,6,0 > 基础 0,5,0） */
+[data-theme="liquidglass"] .bg-surface.card-highlighted[class*="rounded-2xl"]:not(.absolute):not(.fixed) {
   border-color: var(--accent) !important;
   box-shadow:
     0 0 0 2px rgb(var(--accent-rgb) / 0.4),
-    var(--glass-shadow) !important;
+    inset 0 1.5px 0 0 rgba(255, 255, 255, 0.65),
+    0 8px 28px -4px rgba(18, 70, 64, 0.1) !important;
 }
 
-/* DigitalPlat 域名卡片高亮 */
-[data-theme="liquidglass"]:not(.dark) .card-highlighted[id^="dp-domain-card-"] {
+/* DigitalPlat 域名卡片高亮（翡翠绿，特异性 0,7,0） */
+[data-theme="liquidglass"] .bg-surface.card-highlighted[class*="rounded-2xl"]:not(.absolute):not(.fixed)[id^="dp-domain-card-"] {
   border-color: #34d399 !important;
   box-shadow:
     0 0 0 2px rgba(52, 211, 153, 0.5),
-    var(--glass-shadow) !important;
-}
-[data-theme="liquidglass"].dark .card-highlighted[id^="dp-domain-card-"] {
-  border-color: #34d399 !important;
-  box-shadow:
-    0 0 0 2px rgba(52, 211, 153, 0.45),
-    var(--glass-shadow) !important;
+    inset 0 1.5px 0 0 rgba(255, 255, 255, 0.65),
+    0 8px 28px -4px rgba(18, 70, 64, 0.1) !important;
 }
 
-/* Cloudflare zone 卡片高亮 */
-[data-theme="liquidglass"]:not(.dark) .card-highlighted[id^="cf-zone-card-"] {
+/* Cloudflare zone 卡片高亮（天蓝，特异性 0,7,0） */
+[data-theme="liquidglass"] .bg-surface.card-highlighted[class*="rounded-2xl"]:not(.absolute):not(.fixed)[id^="cf-zone-card-"] {
   border-color: #38bdf8 !important;
   box-shadow:
     0 0 0 2px rgba(56, 189, 248, 0.5),
-    var(--glass-shadow) !important;
-}
-[data-theme="liquidglass"].dark .card-highlighted[id^="cf-zone-card-"] {
-  border-color: #38bdf8 !important;
-  box-shadow:
-    0 0 0 2px rgba(56, 189, 248, 0.4),
-    var(--glass-shadow) !important;
+    inset 0 1.5px 0 0 rgba(255, 255, 255, 0.65),
+    0 8px 28px -4px rgba(18, 70, 64, 0.1) !important;
 }
 
 /* 高亮态动画：呼吸脉冲光环，引导用户视线聚焦到目标卡片 */
 @keyframes highlight-pulse {
-  0%, 100% { box-shadow: 0 0 0 2px rgb(var(--accent-rgb) / 0.4), var(--glass-shadow); }
-  50% { box-shadow: 0 0 0 4px rgb(var(--accent-rgb) / 0.25), 0 0 20px rgb(var(--accent-rgb) / 0.15), var(--glass-shadow); }
+  0%, 100% {
+    box-shadow:
+      0 0 0 2px rgb(var(--accent-rgb) / 0.4),
+      inset 0 1.5px 0 0 rgba(255, 255, 255, 0.65),
+      0 8px 28px -4px rgba(18, 70, 64, 0.1);
+  }
+  50% {
+    box-shadow:
+      0 0 0 4px rgb(var(--accent-rgb) / 0.25),
+      0 0 20px rgb(var(--accent-rgb) / 0.15),
+      inset 0 1.5px 0 0 rgba(255, 255, 255, 0.65),
+      0 8px 28px -4px rgba(18, 70, 64, 0.1);
+  }
 }
 
 [data-theme="liquidglass"] .card-highlighted {

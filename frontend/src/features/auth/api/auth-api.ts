@@ -1,4 +1,5 @@
 import type { ApiFetch } from "../../../api/client";
+import { apiJson } from "../../../api/request";
 import type {
   AccountResponse,
   AuthStatusResponse,
@@ -24,8 +25,7 @@ import type {
 
 /** 查询鉴权状态（是否已初始化 / 是否已开启 2FA） */
 export async function fetchAuthStatus(apiFetch: ApiFetch): Promise<AuthStatusResponse> {
-  const res = await apiFetch("/api/auth/status");
-  return (await res.json()) as AuthStatusResponse;
+  return apiJson<AuthStatusResponse>(apiFetch, "/api/auth/status");
 }
 
 /** 提交登录（用户名 + 密码，若后端要求则附带 2FA 动态码） */
@@ -33,12 +33,11 @@ export async function login(
   apiFetch: ApiFetch,
   payload: { username: string; password: string; token?: string }
 ): Promise<LoginResponse> {
-  const res = await apiFetch("/api/auth/login", {
+  return apiJson<LoginResponse>(apiFetch, "/api/auth/login", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-  return (await res.json()) as LoginResponse;
 }
 
 /** 首次初始化（自行设置管理员用户名与密码） */
@@ -46,12 +45,11 @@ export async function setup(
   apiFetch: ApiFetch,
   payload: { username: string; password: string }
 ): Promise<SetupResponse> {
-  const res = await apiFetch("/api/auth/setup", {
+  return apiJson<SetupResponse>(apiFetch, "/api/auth/setup", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-  return (await res.json()) as SetupResponse;
 }
 
 /**
@@ -61,7 +59,7 @@ export async function setup(
  * （后端拿不到凭据），原实现即在 `readSessionToken()` 为空时跳过这一步。
  */
 export async function logout(apiFetch: ApiFetch): Promise<void> {
-  await apiFetch("/api/auth/logout", {
+  await apiJson(apiFetch, "/api/auth/logout", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
   });
@@ -69,6 +67,5 @@ export async function logout(apiFetch: ApiFetch): Promise<void> {
 
 /** 读取账户安全信息（用户名 + 2FA 状态） */
 export async function fetchAccount(apiFetch: ApiFetch): Promise<AccountResponse> {
-  const res = await apiFetch("/api/auth/account");
-  return (await res.json()) as AccountResponse;
+  return apiJson<AccountResponse>(apiFetch, "/api/auth/account");
 }

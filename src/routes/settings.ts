@@ -4,7 +4,7 @@ import { successRes, errorRes } from "./response";
 import type { WebhookType } from "../cron";
 
 interface SettingsDeps {
-  sendTelegramNotification: (botToken: string, chatId: string, message: string) => Promise<void>;
+  sendTelegramNotification: (botToken: string, chatId: string, message: string) => Promise<{ ok: boolean; status?: number; detail?: string }>;
   sendWebhookNotification: (url: string, message: string, type: WebhookType) => Promise<{ ok: boolean; status?: number; detail?: string }>;
 }
 
@@ -62,7 +62,10 @@ export function registerSettingsRoutes(app: Hono<AppEnv>, deps: SettingsDeps) {
       const token = body.tg_token && !String(body.tg_token).startsWith("****") ? String(body.tg_token) : cfg.tg_token;
       const chatId = String(body.tg_chat_id || cfg.tg_chat_id || "");
       if (!token || !chatId) return c.json(errorRes("请先填写 Telegram Bot Token 与 Chat ID", "bad_request"), 400);
-      await deps.sendTelegramNotification(token, chatId, "🎉 Domain Hub 测试推送：Telegram 通知配置成功！");
+      const result = await deps.sendTelegramNotification(token, chatId, "🎉 Domain Hub 测试推送：Telegram 通知配置成功！");
+      if (!result.ok) {
+        return c.json(errorRes(result.detail || `Telegram 推送失败（HTTP ${result.status ?? "?"}）`), 400);
+      }
       return c.json(successRes({ message: "测试消息已发送，请检查 Telegram" }));
     } catch (e: unknown) {
       return c.json(errorRes(e instanceof Error ? e.message : "未知错误"), 400);

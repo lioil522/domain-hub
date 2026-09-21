@@ -1,4 +1,6 @@
 import { useState } from "react";
+import type { ApiFetch } from "../../../api/client";
+import { apiJson } from "../../../api/request";
 
 /**
  * useSettings —— 设置页的状态与动作
@@ -15,9 +17,20 @@ import { useState } from "react";
  * 注意 `fetchSettings` 需要被 App 的「切页按需拉取」effect 调用，故必须从
  * 本 hook 的返回值暴露出去。
  */
+export interface AppSettings {
+  webhook_url: string;
+  webhook_type: string;
+  tg_token: string;
+  tg_chat_id: string;
+  renew_threshold_days: string;
+  auto_renew: string;
+  /** 定时任务的解析记录缓存策略：scheduled=只读缓存 / always=每次全额回源 */
+  dns_records_cache_mode: string;
+}
+
 export interface UseSettingsOptions {
   /** 带鉴权的 fetch 封装（来自 AppDataProvider） */
-  apiFetch: (url: string, init?: RequestInit) => Promise<Response>;
+  apiFetch: ApiFetch;
   /** 全局 Toast */
   showToast: (type: "success" | "error" | "info" | "warning", msg: string) => void;
   /** 全局动作 loading 指示（与其它页面共用） */
@@ -43,16 +56,14 @@ export function useSettings(opts: UseSettingsOptions) {
   } = opts;
 
   // 应用设置状态
-  interface AppSettings {
-    webhook_url: string;
-    webhook_type: string;
-    tg_token: string;
-    tg_chat_id: string;
-    renew_threshold_days: string;
-    auto_renew: string;
-    /// 定时任务的解析记录缓存策略："scheduled"=只读缓存（默认，省子请求）/ "always"=每次全额回源
-    dns_records_cache_mode: string;
-  }
+  type SettingsApiResponse = {
+    success?: boolean;
+    message?: string;
+    settings?: Partial<AppSettings>;
+    configured?: { tg_token: boolean; webhook_url: boolean };
+    secret: string;
+    otpauth_uri: string;
+  };
   const [settings, setSettings] = useState<AppSettings>({
     webhook_url: "",
     webhook_type: "custom",
@@ -84,8 +95,7 @@ export function useSettings(opts: UseSettingsOptions) {
   const fetchSettings = async () => {
     setLoadingSettings(true);
     try {
-      const res = await apiFetch("/api/settings");
-      const data = await res.json();
+      const data = await apiJson<SettingsApiResponse>(apiFetch, "/api/settings");
       if (data.success && data.settings) {
         setSettings((prev) => ({ ...prev, ...data.settings }));
         if (data.configured) setSettingsConfigured(data.configured);
@@ -112,12 +122,11 @@ export function useSettings(opts: UseSettingsOptions) {
       if (settings.tg_token && !settings.tg_token.startsWith("****")) payload.tg_token = settings.tg_token;
       if (settings.webhook_url && !settings.webhook_url.startsWith("****")) payload.webhook_url = settings.webhook_url;
 
-      const res = await apiFetch("/api/settings", {
+      const data = await apiJson<SettingsApiResponse>(apiFetch, "/api/settings", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
-      const data = await res.json();
       if (data.success) {
         showToast("success", "✅ 设置已保存");
         fetchSettings();
@@ -137,12 +146,11 @@ export function useSettings(opts: UseSettingsOptions) {
     try {
       const payload: Record<string, string> = { tg_chat_id: settings.tg_chat_id };
       if (settings.tg_token && !settings.tg_token.startsWith("****")) payload.tg_token = settings.tg_token;
-      const res = await apiFetch("/api/settings/test-telegram", {
+      const data = await apiJson<SettingsApiResponse>(apiFetch, "/api/settings/test-telegram", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
-      const data = await res.json();
       if (data.success) {
         showToast("success", data.message || "测试消息已发送");
       } else {
@@ -164,12 +172,11 @@ export function useSettings(opts: UseSettingsOptions) {
       if (settings.webhook_url && !settings.webhook_url.startsWith("****")) {
         payload.webhook_url = settings.webhook_url;
       }
-      const res = await apiFetch("/api/settings/test-webhook", {
+      const data = await apiJson<SettingsApiResponse>(apiFetch, "/api/settings/test-webhook", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
-      const data = await res.json();
       if (data.success) {
         showToast("success", data.message || "测试消息已发送");
       } else {
@@ -225,12 +232,11 @@ export function useSettings(opts: UseSettingsOptions) {
       if (wantUsername && wantUsername !== (accountInfo.username || "")) {
         payload.username = wantUsername;
       }
-      const res = await apiFetch("/api/auth/change-password", {
+      const data = await apiJson<SettingsApiResponse>(apiFetch, "/api/auth/change-password", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
-      const data = await res.json();
       if (data.success) {
         showToast("success", data.message || "密码修改成功，请重新登录");
         setPwOld(""); setPwNew(""); setPwNew2(""); setPwNewUsername("");
@@ -250,8 +256,7 @@ export function useSettings(opts: UseSettingsOptions) {
   const handleStart2faSetup = async () => {
     setActionLoading("2fa-setup");
     try {
-      const res = await apiFetch("/api/auth/2fa/setup", { method: "POST" });
-      const data = await res.json();
+      const data = await apiJson<SettingsApiResponse>(apiFetch, "/api/auth/2fa/setup", { method: "POST" });
       if (data.success) {
         setTwoFaSetup({ secret: data.secret, otpauth_uri: data.otpauth_uri });
         setTwoFaEnableToken("");
@@ -273,12 +278,11 @@ export function useSettings(opts: UseSettingsOptions) {
     }
     setActionLoading("2fa-enable");
     try {
-      const res = await apiFetch("/api/auth/2fa/enable", {
+      const data = await apiJson<SettingsApiResponse>(apiFetch, "/api/auth/2fa/enable", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token: twoFaEnableToken.trim() }),
       });
-      const data = await res.json();
       if (data.success) {
         showToast("success", data.message || "两步验证已开启");
         setTwoFaSetup(null);
@@ -302,12 +306,11 @@ export function useSettings(opts: UseSettingsOptions) {
     }
     setActionLoading("2fa-disable");
     try {
-      const res = await apiFetch("/api/auth/2fa/disable", {
+      const data = await apiJson<SettingsApiResponse>(apiFetch, "/api/auth/2fa/disable", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token: twoFaDisableToken }),
       });
-      const data = await res.json();
       if (data.success) {
         showToast("success", data.message || "两步验证已关闭");
         setTwoFaDisableToken("");

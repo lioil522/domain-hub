@@ -82,6 +82,7 @@ export function ThemePicker({ value, onChange, className }: ThemePickerProps) {
             type="button"
             role="radio"
             aria-checked={selected}
+            data-selected={selected ? "true" : "false"}
             /* roving tabindex：选中项可 Tab 进入，其余靠方向键到达 */
             tabIndex={selected ? 0 : -1}
             onClick={() => onChange(theme.id)}
@@ -99,6 +100,13 @@ export function ThemePicker({ value, onChange, className }: ThemePickerProps) {
                 临时切换全局主题属性来采样，会造成可见的闪烁。三个色块足够
                 传达色相与明度倾向，且零副作用。
                 内联 style 读 theme.swatch（写死在 theme.ts），而非 CSS 变量。 */}
+            {selected && (
+              <span
+                className="pointer-events-none absolute inset-0 rounded-lg border-2 border-accent z-10"
+                aria-hidden="true"
+              />
+            )}
+
             <div className="flex items-center gap-2 mb-2.5" aria-hidden="true">
               <span
                 className="h-7 flex-1 rounded-sm"
@@ -130,15 +138,27 @@ export function ThemePicker({ value, onChange, className }: ThemePickerProps) {
               </div>
 
               {/* 选中标记。用图标 + 边框双通道表达选中，不单靠颜色（色盲用户） */}
-              <span
-                className={cn(
-                  "w-4 h-4 rounded-full flex items-center justify-center flex-shrink-0 mt-0.5",
-                  selected ? "bg-accent" : "border border-border-base"
+              <div className="flex items-center gap-1.5 flex-shrink-0 mt-0.5">
+                {selected && (
+                  <span className="text-[10px] leading-none font-bold px-1.5 py-1 rounded-full bg-accent text-[color:var(--accent-contrast)] whitespace-nowrap">
+                    当前
+                  </span>
                 )}
-                aria-hidden="true"
-              >
-                {selected && <Check className="w-3 h-3 text-white" strokeWidth={3} />}
-              </span>
+                <span
+                  className={cn(
+                    "w-4 h-4 rounded-full flex items-center justify-center flex-shrink-0",
+                    selected ? "bg-accent" : "border border-border-base"
+                  )}
+                  aria-hidden="true"
+                >
+                  {selected && (
+                    <Check
+                      className="w-3 h-3 text-[color:var(--accent-contrast)]"
+                      strokeWidth={3}
+                    />
+                  )}
+                </span>
+              </div>
             </div>
           </button>
         );

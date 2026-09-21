@@ -101,7 +101,7 @@ export function DomainCard({
       id={`dnshe-domain-card-${dom.id}`}
       className={`bg-surface border rounded-2xl p-5 flex flex-col justify-between transition-all duration-200 shadow-xl ${
         highlighted
-          ? "border-accent ring-2 ring-accent/40"
+          ? "card-highlighted border-accent ring-2 ring-accent/40"
           : "border-border-base hover:border-border-base"
       }`}
     >

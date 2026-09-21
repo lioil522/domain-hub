@@ -84,7 +84,7 @@ export function CfZoneCard({
         id={`cf-zone-card-${zone.id}`}
         className={`bg-surface border rounded-2xl p-5 flex flex-col justify-between transition-all duration-300 shadow-xl ${
           highlighted
-            ? "border-sky-400 ring-2 ring-sky-400/50"
+            ? "card-highlighted border-sky-400 ring-2 ring-sky-400/50"
             : "border-border-base"
         }`}
       >

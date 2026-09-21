@@ -88,15 +88,20 @@ export async function sendWebhookNotification(
     return { ok: true, status: res.status, detail: bodyText };
   } catch (e) {
     console.error("Failed to send Webhook notification:", e);
-    return { ok: false, detail: e instanceof Error ? e.message : "请求异常" };
+    return { ok: false, detail: `无法连接 Webhook：${e instanceof Error ? e.message : "请求异常"}` };
   }
 }
 
 /**
  * 推送 Telegram 通知
  */
-export async function sendTelegramNotification(botToken: string, chatId: string, message: string): Promise<void> {
-  if (!botToken || !chatId) return;
+export async function sendTelegramNotification(
+  botToken: string,
+  chatId: string,
+  message: string
+): Promise<WebhookSendResult> {
+  if (!botToken || !chatId) return { ok: false, detail: "未配置 Telegram Bot Token 或 Chat ID" };
+
   try {
     const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
     const res = await fetch(url, {
@@ -108,10 +113,33 @@ export async function sendTelegramNotification(botToken: string, chatId: string,
         disable_web_page_preview: true,
       }),
     });
+
+    const bodyText = (await res.text().catch(() => "")).slice(0, 500);
+
     if (!res.ok) {
       console.error(`Telegram push failed with status: ${res.status}`);
+      return { ok: false, status: res.status, detail: bodyText || `HTTP ${res.status}` };
     }
+
+    // Telegram may return HTTP 200 with { ok: false, ... } when the API rejects the request.
+    try {
+      const parsed = JSON.parse(bodyText) as Record<string, unknown>;
+      if (parsed.ok !== true) {
+        const errorCode = parsed.error_code;
+        const description = String(parsed.description ?? parsed.message ?? bodyText ?? "Telegram API 返回失败");
+        return {
+          ok: false,
+          status: res.status,
+          detail: errorCode !== undefined ? `Telegram API ${errorCode}：${description}` : description,
+        };
+      }
+    } catch {
+      // Telegram normally returns JSON. Keep HTTP 2xx as success if a proxy returns a non-JSON body.
+    }
+
+    return { ok: true, status: res.status, detail: bodyText };
   } catch (e) {
     console.error("Failed to send Telegram notification:", e);
+    return { ok: false, detail: `无法连接 Telegram API：${e instanceof Error ? e.message : "请求异常"}` };
   }
 }

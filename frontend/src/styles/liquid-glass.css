@@ -114,6 +114,69 @@
   z-index: 2;
 }
 
+/* ── ⑤-高亮 跳转定位高亮 · 玻璃光环 ───────────────────────────────────
+ * 卡片的 border + box-shadow 被上面的 ⑤ 用 !important 统一覆写为玻璃质感，
+ * 导致 Tailwind 的 border-accent / ring-2 ring-accent/40 等高亮类被吞掉，
+ * 跳转后卡片无任何视觉反馈。
+ *
+ * 修复方式：为 .card-highlighted（由 TSX 在 highlighted=true 时挂载）
+ * 专门覆写 border-color 和 box-shadow，用主题 accent 色的光环替代默认
+ * 的玻璃边框，保留内高光折射等玻璃质感。
+ *
+ * 三种卡片的高亮色分别为：
+ *   · DNSHE DomainCard  → accent（主题色）
+ *   · DpDomainCard      → emerald-400（翡翠绿）
+ *   · CfZoneCard        → sky-400（天蓝）
+ * 这里只做统一的 accent 覆写；emerald / sky 的 Tailwind 类本身特异性够高，
+ * 被 !important 压的是 border 简写属性，所以用 border-color 单属性 + ring
+ * 的 box-shadow 合并覆写即可。 */
+
+/* DNSHE 域名卡片高亮 */
+[data-theme="liquidglass"] .card-highlighted[id^="dnshe-domain-card-"] {
+  border-color: var(--accent) !important;
+  box-shadow:
+    0 0 0 2px rgb(var(--accent-rgb) / 0.4),
+    var(--glass-shadow) !important;
+}
+
+/* DigitalPlat 域名卡片高亮 */
+[data-theme="liquidglass"]:not(.dark) .card-highlighted[id^="dp-domain-card-"] {
+  border-color: #34d399 !important;
+  box-shadow:
+    0 0 0 2px rgba(52, 211, 153, 0.5),
+    var(--glass-shadow) !important;
+}
+[data-theme="liquidglass"].dark .card-highlighted[id^="dp-domain-card-"] {
+  border-color: #34d399 !important;
+  box-shadow:
+    0 0 0 2px rgba(52, 211, 153, 0.45),
+    var(--glass-shadow) !important;
+}
+
+/* Cloudflare zone 卡片高亮 */
+[data-theme="liquidglass"]:not(.dark) .card-highlighted[id^="cf-zone-card-"] {
+  border-color: #38bdf8 !important;
+  box-shadow:
+    0 0 0 2px rgba(56, 189, 248, 0.5),
+    var(--glass-shadow) !important;
+}
+[data-theme="liquidglass"].dark .card-highlighted[id^="cf-zone-card-"] {
+  border-color: #38bdf8 !important;
+  box-shadow:
+    0 0 0 2px rgba(56, 189, 248, 0.4),
+    var(--glass-shadow) !important;
+}
+
+/* 高亮态动画：呼吸脉冲光环，引导用户视线聚焦到目标卡片 */
+@keyframes highlight-pulse {
+  0%, 100% { box-shadow: 0 0 0 2px rgb(var(--accent-rgb) / 0.4), var(--glass-shadow); }
+  50% { box-shadow: 0 0 0 4px rgb(var(--accent-rgb) / 0.25), 0 0 20px rgb(var(--accent-rgb) / 0.15), var(--glass-shadow); }
+}
+
+[data-theme="liquidglass"] .card-highlighted {
+  animation: highlight-pulse 2s ease-in-out 2;
+}
+
 /* 悬停微动：水面涟漪光感反馈 */
 [data-theme="liquidglass"] .glass-card:hover,
 [data-theme="liquidglass"] button.glass-card:hover {
@@ -301,6 +364,24 @@ select option {
   color: var(--accent) !important;
   border: 1px solid rgb(var(--accent-rgb) / 0.35) !important;
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.25), 0 2px 8px rgb(var(--accent-rgb) / 0.15) !important;
+}
+
+/* ThemePicker 选中态：不能只依赖 button 自身的 border。
+ * 流玻主题的 .bg-elevated 使用 !important 边框覆写，选中卡片另外渲染
+ * 一个独立的 inset 边框层，保证「当前主题」在亮/暗模式都始终可见。 */
+[data-theme="liquidglass"] .theme-picker-option[aria-checked="true"],
+[data-theme="liquidglass"] .theme-picker-option[data-selected="true"] {
+  border-color: transparent !important;
+  box-shadow:
+    0 0 0 1px rgb(var(--accent-rgb) / 0.22),
+    inset 0 1px 0 rgba(255, 255, 255, 0.48),
+    0 4px 16px rgb(var(--accent-rgb) / 0.14) !important;
+}
+
+[data-theme="liquidglass"] .theme-picker-option[aria-checked="true"]:focus-visible,
+[data-theme="liquidglass"] .theme-picker-option[data-selected="true"]:focus-visible {
+  outline: 2px solid rgb(var(--accent-rgb) / 0.78);
+  outline-offset: 2px;
 }
 
 /* ── ⑧ 模态遮罩、弹窗、下拉浮层与交互面板 · 深邃水凝琉璃立体感 ─────

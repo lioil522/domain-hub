@@ -76,7 +76,7 @@ export function DpDomainCard({
       id={`dp-domain-card-${dom.id}`}
       className={`bg-surface border rounded-2xl p-5 flex flex-col justify-between transition-all duration-300 shadow-xl ${
         highlighted
-          ? "border-emerald-400 ring-2 ring-emerald-400/50"
+          ? "card-highlighted border-emerald-400 ring-2 ring-emerald-400/50"
           : "border-border-base hover:border-border-base"
       }`}
     >

@@ -185,55 +185,63 @@
 
 /* ── ② 液态玻璃覆写（特异性 0,6,0 > 基础玻璃 0,5,0） ────────────── */
 
-/* 默认：accent 色全卡发光 + 背景微染色 */
+/* 默认：accent 色全卡发光 —— 背景染色 + 内发光 + 大面积外发光 + 微抬升 */
 [data-theme="liquidglass"] .bg-surface.card-highlighted[class*="rounded-2xl"]:not(.absolute):not(.fixed) {
   border-color: var(--accent) !important;
-  background: rgb(var(--accent-rgb) / 0.08) !important;
+  background: rgb(var(--accent-rgb) / 0.18) !important;
   box-shadow:
-    0 0 0 1px rgb(var(--accent-rgb) / 0.35),
-    0 0 32px -4px rgb(var(--accent-rgb) / 0.28),
-    0 0 64px -8px rgb(var(--accent-rgb) / 0.12),
-    inset 0 1.5px 0 0 rgba(255, 255, 255, 0.55) !important;
+    inset 0 0 20px 0 rgb(var(--accent-rgb) / 0.15),
+    0 0 0 1.5px rgb(var(--accent-rgb) / 0.5),
+    0 0 20px 0 rgb(var(--accent-rgb) / 0.25),
+    0 0 48px 0 rgb(var(--accent-rgb) / 0.15),
+    0 8px 24px -4px rgba(0, 0, 0, 0.2) !important;
+  transform: translateY(-2px);
   animation: card-highlight-glass 2s ease-in-out 2;
 }
 
 /* DP 卡片（翡翠绿，特异性 0,7,0） */
 [data-theme="liquidglass"] .bg-surface.card-highlighted[class*="rounded-2xl"]:not(.absolute):not(.fixed)[id^="dp-domain-card-"] {
   border-color: #34d399 !important;
-  background: rgba(52, 211, 153, 0.08) !important;
+  background: rgba(52, 211, 153, 0.18) !important;
   box-shadow:
-    0 0 0 1px rgba(52, 211, 153, 0.4),
-    0 0 32px -4px rgba(52, 211, 153, 0.28),
-    0 0 64px -8px rgba(52, 211, 153, 0.12),
-    inset 0 1.5px 0 0 rgba(255, 255, 255, 0.55) !important;
+    inset 0 0 20px 0 rgba(52, 211, 153, 0.15),
+    0 0 0 1.5px rgba(52, 211, 153, 0.5),
+    0 0 20px 0 rgba(52, 211, 153, 0.25),
+    0 0 48px 0 rgba(52, 211, 153, 0.15),
+    0 8px 24px -4px rgba(0, 0, 0, 0.2) !important;
 }
 
 /* CF 卡片（天蓝，特异性 0,7,0） */
 [data-theme="liquidglass"] .bg-surface.card-highlighted[class*="rounded-2xl"]:not(.absolute):not(.fixed)[id^="cf-zone-card-"] {
   border-color: #38bdf8 !important;
-  background: rgba(56, 189, 248, 0.08) !important;
+  background: rgba(56, 189, 248, 0.18) !important;
   box-shadow:
-    0 0 0 1px rgba(56, 189, 248, 0.4),
-    0 0 32px -4px rgba(56, 189, 248, 0.28),
-    0 0 64px -8px rgba(56, 189, 248, 0.12),
-    inset 0 1.5px 0 0 rgba(255, 255, 255, 0.55) !important;
+    inset 0 0 20px 0 rgba(56, 189, 248, 0.15),
+    0 0 0 1.5px rgba(56, 189, 248, 0.5),
+    0 0 20px 0 rgba(56, 189, 248, 0.25),
+    0 0 48px 0 rgba(56, 189, 248, 0.15),
+    0 8px 24px -4px rgba(0, 0, 0, 0.2) !important;
 }
 
-/* 液态玻璃专属呼吸脉冲：发光范围更广、强度更高 */
+/* 液态玻璃专属呼吸脉冲：内外发光同步收放 */
 @keyframes card-highlight-glass {
   0%, 100% {
     box-shadow:
-      0 0 0 1px rgb(var(--accent-rgb) / 0.35),
-      0 0 32px -4px rgb(var(--accent-rgb) / 0.28),
-      0 0 64px -8px rgb(var(--accent-rgb) / 0.12),
-      inset 0 1.5px 0 0 rgba(255, 255, 255, 0.55);
+      inset 0 0 20px 0 rgb(var(--accent-rgb) / 0.15),
+      0 0 0 1.5px rgb(var(--accent-rgb) / 0.5),
+      0 0 20px 0 rgb(var(--accent-rgb) / 0.25),
+      0 0 48px 0 rgb(var(--accent-rgb) / 0.15),
+      0 8px 24px -4px rgba(0, 0, 0, 0.2);
+    transform: translateY(-2px);
   }
   50% {
     box-shadow:
-      0 0 0 2px rgb(var(--accent-rgb) / 0.45),
-      0 0 44px -4px rgb(var(--accent-rgb) / 0.38),
-      0 0 80px -8px rgb(var(--accent-rgb) / 0.18),
-      inset 0 1.5px 0 0 rgba(255, 255, 255, 0.65);
+      inset 0 0 30px 0 rgb(var(--accent-rgb) / 0.22),
+      0 0 0 2.5px rgb(var(--accent-rgb) / 0.6),
+      0 0 32px 4px rgb(var(--accent-rgb) / 0.35),
+      0 0 64px 4px rgb(var(--accent-rgb) / 0.2),
+      0 8px 24px -4px rgba(0, 0, 0, 0.2);
+    transform: translateY(-3px);
   }
 }
 

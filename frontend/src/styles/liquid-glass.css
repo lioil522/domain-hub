@@ -114,71 +114,127 @@
   z-index: 2;
 }
 
-/* ── ⑤-高亮 跳转定位高亮 · 玻璃光环 ───────────────────────────────────
- * 卡片的 border + box-shadow 被上面的 ⑤ 用 !important 统一覆写为玻璃质感，
- * 导致 Tailwind 的 border-accent / ring-2 ring-accent/40 等高亮类被吞掉，
- * 跳转后卡片无任何视觉反馈。
+/* ── ⑤-高亮 跳转定位高亮 · 全卡发光 ────────────────────────────────────
+ * 跳转后目标卡片「整张发光」而非仅边框变色——
+ * accent 色多层外发光 + 背景微染色 + 呼吸脉冲动画，视觉引导更强。
  *
- * 修复方式：为 .card-highlighted（由 TSX 在 highlighted=true 时挂载）
- * 专门覆写 border-color 和 box-shadow，用主题 accent 色的光环替代默认
- * 的玻璃边框，保留内高光折射等玻璃质感。
+ * 分两层：
+ *   ① 基础样式（.bg-surface.card-highlighted）→ 所有主题通用，特异性 0,2,0
+ *   ② 液态玻璃覆写 → 特异性 0,6,0，压过基础玻璃规则 0,5,0
  *
- * ⚠ 特异性契约：
- *   基础玻璃规则选择器为 `[data-theme] .bg-surface[class*=...]:not():not()`
- *   → 特异性 0,5,0。高亮规则必须 > 0,5,0 才能在两者都带 !important 时赢。
- *   做法：在基础选择器上追加 `.card-highlighted`，达到 0,6,0。
- *
- * 三种卡片的高亮色：
+ * 三种卡片的发光色：
  *   · DNSHE DomainCard  → accent（主题色）
- *   · DpDomainCard      → emerald-400（翡翠绿）
- *   · CfZoneCard        → sky-400（天蓝） */
+ *   · DpDomainCard      → emerald（翡翠绿）
+ *   · CfZoneCard        → sky（天蓝） */
 
-/* DNSHE 域名卡片高亮（特异性 0,6,0 > 基础 0,5,0） */
-[data-theme="liquidglass"] .bg-surface.card-highlighted[class*="rounded-2xl"]:not(.absolute):not(.fixed) {
+/* ── ① 基础高亮（所有主题通用） ──────────────────────────────────── */
+.bg-surface.card-highlighted {
   border-color: var(--accent) !important;
   box-shadow:
-    0 0 0 2px rgb(var(--accent-rgb) / 0.4),
-    inset 0 1.5px 0 0 rgba(255, 255, 255, 0.65),
-    0 8px 28px -4px rgba(18, 70, 64, 0.1) !important;
+    0 0 0 1px rgb(var(--accent-rgb) / 0.25),
+    0 0 24px -4px rgb(var(--accent-rgb) / 0.22),
+    0 0 48px -8px rgb(var(--accent-rgb) / 0.1),
+    0 4px 16px -4px rgba(0, 0, 0, 0.1) !important;
+  animation: card-highlight-glow 2s ease-in-out 2;
 }
 
-/* DigitalPlat 域名卡片高亮（翡翠绿，特异性 0,7,0） */
-[data-theme="liquidglass"] .bg-surface.card-highlighted[class*="rounded-2xl"]:not(.absolute):not(.fixed)[id^="dp-domain-card-"] {
+.dark .bg-surface.card-highlighted {
+  box-shadow:
+    0 0 0 1px rgb(var(--accent-rgb) / 0.35),
+    0 0 28px -4px rgb(var(--accent-rgb) / 0.3),
+    0 0 56px -8px rgb(var(--accent-rgb) / 0.15),
+    0 4px 16px -4px rgba(0, 0, 0, 0.25) !important;
+}
+
+/* DP 卡片（翡翠绿） */
+.bg-surface.card-highlighted[id^="dp-domain-card-"] {
   border-color: #34d399 !important;
   box-shadow:
-    0 0 0 2px rgba(52, 211, 153, 0.5),
-    inset 0 1.5px 0 0 rgba(255, 255, 255, 0.65),
-    0 8px 28px -4px rgba(18, 70, 64, 0.1) !important;
+    0 0 0 1px rgba(52, 211, 153, 0.3),
+    0 0 24px -4px rgba(52, 211, 153, 0.22),
+    0 0 48px -8px rgba(52, 211, 153, 0.1),
+    0 4px 16px -4px rgba(0, 0, 0, 0.1) !important;
 }
 
-/* Cloudflare zone 卡片高亮（天蓝，特异性 0,7,0） */
-[data-theme="liquidglass"] .bg-surface.card-highlighted[class*="rounded-2xl"]:not(.absolute):not(.fixed)[id^="cf-zone-card-"] {
+/* CF 卡片（天蓝） */
+.bg-surface.card-highlighted[id^="cf-zone-card-"] {
   border-color: #38bdf8 !important;
   box-shadow:
-    0 0 0 2px rgba(56, 189, 248, 0.5),
-    inset 0 1.5px 0 0 rgba(255, 255, 255, 0.65),
-    0 8px 28px -4px rgba(18, 70, 64, 0.1) !important;
+    0 0 0 1px rgba(56, 189, 248, 0.3),
+    0 0 24px -4px rgba(56, 189, 248, 0.22),
+    0 0 48px -8px rgba(56, 189, 248, 0.1),
+    0 4px 16px -4px rgba(0, 0, 0, 0.1) !important;
 }
 
-/* 高亮态动画：呼吸脉冲光环，引导用户视线聚焦到目标卡片 */
-@keyframes highlight-pulse {
+@keyframes card-highlight-glow {
   0%, 100% {
     box-shadow:
-      0 0 0 2px rgb(var(--accent-rgb) / 0.4),
-      inset 0 1.5px 0 0 rgba(255, 255, 255, 0.65),
-      0 8px 28px -4px rgba(18, 70, 64, 0.1);
+      0 0 0 1px rgb(var(--accent-rgb) / 0.25),
+      0 0 24px -4px rgb(var(--accent-rgb) / 0.22),
+      0 0 48px -8px rgb(var(--accent-rgb) / 0.1),
+      0 4px 16px -4px rgba(0, 0, 0, 0.1);
   }
   50% {
     box-shadow:
-      0 0 0 4px rgb(var(--accent-rgb) / 0.25),
-      0 0 20px rgb(var(--accent-rgb) / 0.15),
-      inset 0 1.5px 0 0 rgba(255, 255, 255, 0.65),
-      0 8px 28px -4px rgba(18, 70, 64, 0.1);
+      0 0 0 2px rgb(var(--accent-rgb) / 0.35),
+      0 0 36px -4px rgb(var(--accent-rgb) / 0.32),
+      0 0 64px -8px rgb(var(--accent-rgb) / 0.16),
+      0 4px 16px -4px rgba(0, 0, 0, 0.1);
   }
 }
 
-[data-theme="liquidglass"] .card-highlighted {
-  animation: highlight-pulse 2s ease-in-out 2;
+/* ── ② 液态玻璃覆写（特异性 0,6,0 > 基础玻璃 0,5,0） ────────────── */
+
+/* 默认：accent 色全卡发光 + 背景微染色 */
+[data-theme="liquidglass"] .bg-surface.card-highlighted[class*="rounded-2xl"]:not(.absolute):not(.fixed) {
+  border-color: var(--accent) !important;
+  background: rgb(var(--accent-rgb) / 0.08) !important;
+  box-shadow:
+    0 0 0 1px rgb(var(--accent-rgb) / 0.35),
+    0 0 32px -4px rgb(var(--accent-rgb) / 0.28),
+    0 0 64px -8px rgb(var(--accent-rgb) / 0.12),
+    inset 0 1.5px 0 0 rgba(255, 255, 255, 0.55) !important;
+  animation: card-highlight-glass 2s ease-in-out 2;
+}
+
+/* DP 卡片（翡翠绿，特异性 0,7,0） */
+[data-theme="liquidglass"] .bg-surface.card-highlighted[class*="rounded-2xl"]:not(.absolute):not(.fixed)[id^="dp-domain-card-"] {
+  border-color: #34d399 !important;
+  background: rgba(52, 211, 153, 0.08) !important;
+  box-shadow:
+    0 0 0 1px rgba(52, 211, 153, 0.4),
+    0 0 32px -4px rgba(52, 211, 153, 0.28),
+    0 0 64px -8px rgba(52, 211, 153, 0.12),
+    inset 0 1.5px 0 0 rgba(255, 255, 255, 0.55) !important;
+}
+
+/* CF 卡片（天蓝，特异性 0,7,0） */
+[data-theme="liquidglass"] .bg-surface.card-highlighted[class*="rounded-2xl"]:not(.absolute):not(.fixed)[id^="cf-zone-card-"] {
+  border-color: #38bdf8 !important;
+  background: rgba(56, 189, 248, 0.08) !important;
+  box-shadow:
+    0 0 0 1px rgba(56, 189, 248, 0.4),
+    0 0 32px -4px rgba(56, 189, 248, 0.28),
+    0 0 64px -8px rgba(56, 189, 248, 0.12),
+    inset 0 1.5px 0 0 rgba(255, 255, 255, 0.55) !important;
+}
+
+/* 液态玻璃专属呼吸脉冲：发光范围更广、强度更高 */
+@keyframes card-highlight-glass {
+  0%, 100% {
+    box-shadow:
+      0 0 0 1px rgb(var(--accent-rgb) / 0.35),
+      0 0 32px -4px rgb(var(--accent-rgb) / 0.28),
+      0 0 64px -8px rgb(var(--accent-rgb) / 0.12),
+      inset 0 1.5px 0 0 rgba(255, 255, 255, 0.55);
+  }
+  50% {
+    box-shadow:
+      0 0 0 2px rgb(var(--accent-rgb) / 0.45),
+      0 0 44px -4px rgb(var(--accent-rgb) / 0.38),
+      0 0 80px -8px rgb(var(--accent-rgb) / 0.18),
+      inset 0 1.5px 0 0 rgba(255, 255, 255, 0.65);
+  }
 }
 
 /* 悬停微动：水面涟漪光感反馈 */

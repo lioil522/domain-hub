@@ -37,13 +37,13 @@
  * 亮色叠加晨光水影径向微光，暗色叠加深海冷碧波光，
  * 让底层水波纹理与反光光斑清澈灵动地贯穿全屏。 */
 [data-theme="liquidglass"] body {
-  background: 
+  background:
     radial-gradient(ellipse 90% 40% at 50% 0%, rgba(255, 255, 255, 0.45), transparent 70%),
     var(--bg-base) url("/liquid-glass-bg.jpg") center / cover no-repeat fixed;
 }
 
 [data-theme="liquidglass"].dark body {
-  background: 
+  background:
     radial-gradient(ellipse 80% 50% at 50% -10%, rgba(116, 236, 224, 0.2), transparent 70%),
     linear-gradient(rgba(4, 20, 18, 0.58), rgba(2, 14, 12, 0.75)),
     url("/liquid-glass-bg.jpg") center / cover no-repeat fixed;
@@ -106,10 +106,10 @@
 }
 
 /* 保证卡片内部所有文字、图标和操作按钮在反光层之上，清晰锐利 */
-[data-theme="liquidglass"] .bg-surface[class*="rounded-2xl"]:not(.absolute):not(.fixed) > *,
-[data-theme="liquidglass"] .bg-surface[class*="rounded-xl"]:not(.absolute):not(.fixed) > *,
-[data-theme="liquidglass"] .glass-card:not(.absolute):not(.fixed) > *,
-[data-theme="liquidglass"] .ui-card:not(.absolute):not(.fixed) > * {
+[data-theme="liquidglass"] .bg-surface[class*="rounded-2xl"]:not(.absolute):not(.fixed)>*,
+[data-theme="liquidglass"] .bg-surface[class*="rounded-xl"]:not(.absolute):not(.fixed)>*,
+[data-theme="liquidglass"] .glass-card:not(.absolute):not(.fixed)>*,
+[data-theme="liquidglass"] .ui-card:not(.absolute):not(.fixed)>* {
   position: relative;
   z-index: 2;
 }
@@ -167,13 +167,16 @@
 }
 
 @keyframes card-highlight-glow {
-  0%, 100% {
+
+  0%,
+  100% {
     box-shadow:
       0 0 0 1px rgb(var(--accent-rgb) / 0.25),
       0 0 24px -4px rgb(var(--accent-rgb) / 0.22),
       0 0 48px -8px rgb(var(--accent-rgb) / 0.1),
       0 4px 16px -4px rgba(0, 0, 0, 0.1);
   }
+
   50% {
     box-shadow:
       0 0 0 2px rgb(var(--accent-rgb) / 0.35),
@@ -225,7 +228,9 @@
 
 /* 液态玻璃专属呼吸脉冲：内外发光同步收放 */
 @keyframes card-highlight-glass {
-  0%, 100% {
+
+  0%,
+  100% {
     box-shadow:
       inset 0 0 20px 0 rgb(var(--accent-rgb) / 0.15),
       0 0 0 1.5px rgb(var(--accent-rgb) / 0.5),
@@ -234,6 +239,7 @@
       0 8px 24px -4px rgba(0, 0, 0, 0.2);
     transform: translateY(-2px);
   }
+
   50% {
     box-shadow:
       inset 0 0 30px 0 rgb(var(--accent-rgb) / 0.22),
@@ -249,15 +255,16 @@
 [data-theme="liquidglass"] .glass-card:hover,
 [data-theme="liquidglass"] button.glass-card:hover {
   border-color: rgba(255, 255, 255, 0.85) !important;
-  box-shadow: 
+  box-shadow:
     inset 0 2px 2px 0 rgba(255, 255, 255, 0.9),
     inset 0 -1.5px 2px 0 rgba(10, 60, 52, 0.08),
     0 16px 40px -6px rgba(18, 70, 64, 0.16) !important;
 }
+
 [data-theme="liquidglass"].dark .glass-card:hover,
 [data-theme="liquidglass"].dark button.glass-card:hover {
   border-color: rgba(255, 255, 255, 0.42) !important;
-  box-shadow: 
+  box-shadow:
     inset 0 2px 2px 0 rgba(255, 255, 255, 0.55),
     inset 0 0 2px 1px rgba(255, 255, 255, 0.12),
     0 18px 48px -4px rgba(0, 0, 0, 0.6) !important;
@@ -294,6 +301,7 @@
   background: rgba(255, 255, 255, 0.035) !important;
   border-color: rgba(255, 255, 255, 0.18) !important;
 }
+
 [data-theme="liquidglass"]:not(.dark) .bg-hovered .bg-surface[class*="rounded-2xl"],
 [data-theme="liquidglass"]:not(.dark) div[class*="bg-hovered"] .bg-surface[class*="rounded-2xl"],
 [data-theme="liquidglass"]:not(.dark) .bg-hovered .bg-surface[class*="rounded-xl"],
@@ -311,16 +319,19 @@
   border: 1px solid var(--glass-border) !important;
   box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.2), 0 2px 8px -2px rgba(0, 0, 0, 0.1);
 }
+
 [data-theme="liquidglass"].dark .filter-chip:not([aria-pressed="true"]) {
   background: rgba(4, 24, 21, 0.42) !important;
   border: 1px solid rgba(255, 255, 255, 0.18) !important;
   box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.3), 0 2px 8px -2px rgba(0, 0, 0, 0.25);
 }
+
 [data-theme="liquidglass"] .filter-chip:not([aria-pressed="true"]):hover {
   background: rgba(255, 255, 255, 0.25) !important;
   border-color: var(--accent) !important;
   box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.4), 0 0 10px 0 rgba(var(--accent-rgb) / 0.2) !important;
 }
+
 [data-theme="liquidglass"].dark .filter-chip:not([aria-pressed="true"]):hover {
   background: rgba(8, 38, 34, 0.6) !important;
   border-color: var(--accent) !important;
@@ -340,6 +351,7 @@
   backdrop-filter: blur(6px);
   -webkit-backdrop-filter: blur(6px);
 }
+
 [data-theme="liquidglass"] .form-input:focus,
 [data-theme="liquidglass"] input.form-input:focus,
 [data-theme="liquidglass"] select.form-input:focus,
@@ -363,10 +375,12 @@
 .dark select {
   color-scheme: dark;
 }
+
 :root:not(.dark) select.form-input,
 :root:not(.dark) select {
   color-scheme: light;
 }
+
 select.form-input option,
 select option {
   background-color: var(--bg-elevated, #1a2433);
@@ -479,7 +493,7 @@ select option {
   backdrop-filter: blur(24px) saturate(1.6);
   -webkit-backdrop-filter: blur(24px) saturate(1.6);
   border: 1px solid rgba(255, 255, 255, 0.28) !important;
-  box-shadow: 
+  box-shadow:
     inset 0 1.5px 0 0 rgba(255, 255, 255, 0.55),
     inset 0 0 0 1px rgba(255, 255, 255, 0.12),
     0 24px 64px -12px rgba(0, 0, 0, 0.75),
@@ -492,31 +506,31 @@ select option {
   backdrop-filter: blur(24px) saturate(1.4);
   -webkit-backdrop-filter: blur(24px) saturate(1.4);
   border: 1px solid rgba(255, 255, 255, 0.85) !important;
-  box-shadow: 
+  box-shadow:
     inset 0 1.5px 0 0 rgba(255, 255, 255, 0.95),
     inset 0 0 0 1px rgba(255, 255, 255, 0.5),
     0 24px 64px -12px rgba(18, 70, 64, 0.2) !important;
 }
 
 /* 模态框头部与页脚：清透水质微反光，层次分明 */
-[data-theme="liquidglass"].dark div[role="dialog"] > div:first-child,
+[data-theme="liquidglass"].dark div[role="dialog"]>div:first-child,
 [data-theme="liquidglass"].dark div[role="dialog"] header {
   background: linear-gradient(180deg, rgba(14, 46, 42, 0.75) 0%, rgba(8, 28, 26, 0.55) 100%) !important;
   border-bottom: 1px solid rgba(255, 255, 255, 0.16) !important;
 }
 
-[data-theme="liquidglass"].dark div[role="dialog"] > div:last-child {
+[data-theme="liquidglass"].dark div[role="dialog"]>div:last-child {
   background: rgba(6, 26, 24, 0.65) !important;
   border-top: 1px solid rgba(255, 255, 255, 0.12) !important;
 }
 
-[data-theme="liquidglass"]:not(.dark) div[role="dialog"] > div:first-child,
+[data-theme="liquidglass"]:not(.dark) div[role="dialog"]>div:first-child,
 [data-theme="liquidglass"]:not(.dark) div[role="dialog"] header {
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.85) 0%, rgba(242, 249, 247, 0.7) 100%) !important;
   border-bottom: 1px solid rgba(255, 255, 255, 0.8) !important;
 }
 
-[data-theme="liquidglass"]:not(.dark) div[role="dialog"] > div:last-child {
+[data-theme="liquidglass"]:not(.dark) div[role="dialog"]>div:last-child {
   background: rgba(245, 250, 249, 0.8) !important;
   border-top: 1px solid rgba(255, 255, 255, 0.7) !important;
 }
@@ -542,13 +556,14 @@ select option {
 }
 
 /* 弹窗页脚关闭按钮微调：水润晶透效果 */
-[data-theme="liquidglass"].dark div[role="dialog"] > div:last-child button {
+[data-theme="liquidglass"].dark div[role="dialog"]>div:last-child button {
   background: rgba(255, 255, 255, 0.08) !important;
   border: 1px solid rgba(255, 255, 255, 0.18) !important;
   color: var(--text-primary) !important;
   transition: all 0.2s ease;
 }
-[data-theme="liquidglass"].dark div[role="dialog"] > div:last-child button:hover {
+
+[data-theme="liquidglass"].dark div[role="dialog"]>div:last-child button:hover {
   background: rgba(142, 225, 217, 0.18) !important;
   border-color: rgba(142, 225, 217, 0.45) !important;
   color: var(--accent) !important;
@@ -562,7 +577,7 @@ select option {
   background: #0c1918 !important;
   opacity: 1 !important;
   border: 1px solid rgba(255, 255, 255, 0.18) !important;
-  box-shadow: 
+  box-shadow:
     0 20px 48px -4px rgba(0, 0, 0, 0.8),
     0 0 20px rgba(116, 236, 224, 0.06),
     inset 0 1px 0 rgba(255, 255, 255, 0.15) !important;
@@ -587,7 +602,7 @@ select option {
   background: #ffffff !important;
   opacity: 1 !important;
   border: 1px solid #d7dfdd !important;
-  box-shadow: 
+  box-shadow:
     0 20px 48px -4px rgba(18, 70, 64, 0.18),
     inset 0 1px 0 #ffffff !important;
 }
@@ -614,6 +629,7 @@ select option {
  * 但不设 display:none —— 动画结束态仍要正常呈现，只是不再有过程。
  */
 @media (prefers-reduced-motion: reduce) {
+
   *,
   *::before,
   *::after {
@@ -632,6 +648,7 @@ select option {
  * 设备上取消位移（颜色与阴影保留，仍有按下反馈），桌面完全不受影响。
  */
 @media (hover: none) {
+
   .glass-card:hover,
   .btn-primary:hover {
     transform: none;
@@ -640,6 +657,7 @@ select option {
 
 /* 去掉触屏点击时的蓝色高亮方块，改由各自的 hover/active 样式表达反馈 */
 @media (hover: none) and (pointer: coarse) {
+
   button,
   a,
   select,
@@ -788,13 +806,14 @@ select option {
     transform: scale(0.95);
     box-shadow: 0 0 0 0 var(--state-ok-fg);
   }
+
   70% {
     transform: scale(1);
     box-shadow: 0 0 0 6px transparent;
   }
+
   100% {
     transform: scale(0.95);
     box-shadow: 0 0 0 0 transparent;
   }
 }
-

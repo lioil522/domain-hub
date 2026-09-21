@@ -295,9 +295,11 @@
   border-color: rgba(255, 255, 255, 0.18) !important;
 }
 [data-theme="liquidglass"]:not(.dark) .bg-hovered .bg-surface[class*="rounded-2xl"],
-[data-theme="liquidglass"]:not(.dark) div[class*="bg-hovered"] .bg-surface[class*="rounded-2xl"] {
-  background: rgba(255, 255, 255, 0.5) !important;
-  border-color: rgba(255, 255, 255, 0.8) !important;
+[data-theme="liquidglass"]:not(.dark) div[class*="bg-hovered"] .bg-surface[class*="rounded-2xl"],
+[data-theme="liquidglass"]:not(.dark) .bg-hovered .bg-surface[class*="rounded-xl"],
+[data-theme="liquidglass"]:not(.dark) div[class*="bg-hovered"] .bg-surface[class*="rounded-xl"] {
+  background: rgba(255, 255, 255, 0.22) !important;
+  border-color: rgba(255, 255, 255, 0.75) !important;
 }
 
 /* ── ⑤-2 筛选胶囊（FilterChip）· 透亮流玻水滴胶囊 ──────────────────

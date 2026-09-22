@@ -50,13 +50,21 @@ export const CF_DNS_TYPE_OPTIONS: Array<{ value: string; label: string }> = [
 /** Cloudflare 记录类型集合（批量添加解析行首类型令牌时使用） */
 export const CF_DNS_TYPE_SET: ReadonlySet<string> = new Set(CF_DNS_TYPE_OPTIONS.map((o) => o.value));
 
-/** DigitalPlat 支持的基础 5 种类型 */
+/** DigitalPlat 支持的全部 13 种记录类型（与控制台下拉列表一致） */
 export const DP_DNS_TYPE_OPTIONS: Array<{ value: string; label: string }> = [
   { value: "A", label: "A (IPv4地址)" },
   { value: "AAAA", label: "AAAA (IPv6地址)" },
   { value: "CNAME", label: "CNAME (别名指向)" },
   { value: "TXT", label: "TXT (文本记录)" },
   { value: "MX", label: "MX (邮件服务器)" },
+  { value: "CAA", label: "CAA (证书签发限制)" },
+  { value: "SRV", label: "SRV (服务定位)" },
+  { value: "NS", label: "NS (域名服务器)" },
+  { value: "HTTPS", label: "HTTPS (HTTPS 服务绑定)" },
+  { value: "SVCB", label: "SVCB (通用服务绑定)" },
+  { value: "TLSA", label: "TLSA (TLS 证书校验)" },
+  { value: "NAPTR", label: "NAPTR (命名权威指针)" },
+  { value: "SSHFP", label: "SSHFP (SSH 指纹)" },
 ];
 
 /** 阿里云 / 华为云支持的基础 8 种 + PTR */
@@ -340,9 +348,22 @@ export function buildDnsEditTargets(
       priority === originPriority &&
       proxied === originProxied;
 
+    let changeDesc = "";
+    if (name !== originName && content !== rec.content) {
+      changeDesc = `主机记录: ${originName} → ${name}，记录值: ${rec.content} → ${content}`;
+    } else if (name !== originName) {
+      changeDesc = `主机记录: ${originName} → ${name}（记录值: ${rec.content}）`;
+    } else if (content !== rec.content) {
+      changeDesc = `${originName}（记录值: ${rec.content} → ${content}）`;
+    } else if (normalizedTtl !== rec.ttl) {
+      changeDesc = `${originName}（TTL: ${rec.ttl}s → ${normalizedTtl}s）`;
+    } else {
+      changeDesc = `${rec.name} → ${rec.content}`;
+    }
+
     return {
       record_id: key,
-      label: `${rec.type} ${rec.name} → ${rec.content}`,
+      label: `${type} ${changeDesc}`,
       origin_content: rec.content,
       unchanged,
       type,

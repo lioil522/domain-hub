@@ -142,7 +142,7 @@ export function DnsheDnsModal({
     () =>
       parseDnsBatchInput(dnsBatchInput, {
         type: dnsBatchType,
-        name: dnsBatchName,
+        name: dnsBatchName.trim() || "@",
         ttl: dnsBatchTtl,
         priority: dnsBatchPriority
       }).map((r) =>

@@ -31,6 +31,23 @@ export class HuaweiCloudDnsAdapter implements DnsProviderAdapter {
     return { success: Boolean(res?.success), message: res?.message, record: res?.record };
   }
 
+  async batchCreateRecords({ domain, client }: DnsProviderContext, inputs: DnsRecordInput[]) {
+    const hwClient = client as HuaweiCloudClient;
+    const items = inputs.map((input) => ({
+      type: input.type,
+      name: normalizeDnsRecordName(String(input.name || ""), domain.full_domain),
+      content: input.content,
+      ttl: input.ttl,
+      priority: input.priority,
+      line: input.line,
+    }));
+    return hwClient.batchCreateDnsRecords({
+      zoneId: String(domain.remote_id || ""),
+      zoneName: domain.full_domain,
+      items,
+    });
+  }
+
   async updateRecord({ domain, client }: DnsProviderContext, recordId: string, input: DnsRecordInput) {
     const hwClient = client as HuaweiCloudClient;
     const name = normalizeDnsRecordName(String(input.name || ""), domain.full_domain);
@@ -41,6 +58,7 @@ export class HuaweiCloudDnsAdapter implements DnsProviderAdapter {
       type: input.type,
       name,
       content: input.content,
+      originContent: (input as any).origin_content,
       ttl: input.ttl,
       priority: input.priority,
       line: input.line,

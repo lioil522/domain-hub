@@ -101,18 +101,18 @@ export function DnsRecordCreateForm({
                 autoComplete="off"
                 value={newName}
                 onChange={(e) => setNewName(e.target.value)}
-                placeholder="@ 或 www"
+                placeholder="例如 @ 或 www"
                 className="w-full text-content-secondary rounded-xl"
               />
             </div>
             <div>
-              <span className="block text-xs font-semibold text-content-muted mb-1.5">TTL</span>
+              <span className="block text-xs font-semibold text-content-muted mb-1.5">TTL (秒)</span>
               <CustomSelect
-                value={String(meta.isCloudflare && newProxied ? 1 : newTtl)}
+                value={String(meta.isCloudflare ? (newProxied ? 1 : (newTtl || 1)) : (newTtl && newTtl > 1 ? newTtl : 300))}
                 onChange={(v) => setNewTtl(Number(v))}
                 disabled={meta.isCloudflare && newProxied}
                 title={meta.isCloudflare && newProxied ? "开启代理时 Cloudflare 固定使用自动 TTL" : undefined}
-                ariaLabel="TTL"
+                ariaLabel="TTL (秒)"
                 options={ttlSelectOptions(meta.isCloudflare)}
                 className="w-full px-3.5 py-2 rounded-xl text-sm text-content-secondary"
               />

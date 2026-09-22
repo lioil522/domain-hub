@@ -129,8 +129,10 @@ export interface DnsRecordPanelProps {
   editPanelOpen: boolean;
   setEditPanelOpen: Dispatch<SetStateAction<boolean>>;
   onOpenEditPanel: () => void;
-  editFields: { content: boolean; ttl: boolean; proxied: boolean };
-  setEditFields: Dispatch<SetStateAction<{ content: boolean; ttl: boolean; proxied: boolean }>>;
+  editFields: { name: boolean; content: boolean; ttl: boolean; proxied: boolean };
+  setEditFields: Dispatch<SetStateAction<{ name: boolean; content: boolean; ttl: boolean; proxied: boolean }>>;
+  batchEditName: string;
+  setBatchEditName: (v: string) => void;
   batchEditTtl: number;
   setBatchEditTtl: (v: number) => void;
   batchEditProxied: boolean;

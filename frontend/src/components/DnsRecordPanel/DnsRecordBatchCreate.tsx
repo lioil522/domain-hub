@@ -13,10 +13,13 @@ import { Button } from "../Button";
 import { CustomSelect } from "../form/CustomSelect";
 import { DnsLineSelect } from "../dns/DnsLineSelect";
 import type { DnsBatchResult, DnsPanelMeta } from "./types";
+import type { Domain } from "../../types/domain";
+import { displayDomainSmart } from "../../lib/display-domain";
 import { PROXIED_TYPES, ttlSelectOptions } from "./options";
 import { DnsBatchResults } from "./DnsBatchResults";
 
 export interface DnsRecordBatchCreateProps {
+  zone?: Domain | null;
   meta: DnsPanelMeta;
   actionLoading: string | null;
 
@@ -45,6 +48,7 @@ export interface DnsRecordBatchCreateProps {
 }
 
 export function DnsRecordBatchCreate({
+  zone,
   meta,
   actionLoading,
   batchOpen,
@@ -70,6 +74,7 @@ export function DnsRecordBatchCreate({
   onBatchCreate,
 }: DnsRecordBatchCreateProps) {
   const typeOptions = getDnsTypeOptionsForProvider(meta.provider);
+  const zoneDomain = zone?.full_domain || "";
 
   return (
     <div className="bg-elevated/60 backdrop-blur-sm border border-border-base rounded-2xl overflow-hidden">
@@ -86,91 +91,112 @@ export function DnsRecordBatchCreate({
         {batchOpen ? <ChevronDown className="w-4 h-4 text-accent" /> : <ChevronRight className="w-4 h-4 text-accent" />}
       </button>
       {batchOpen && (
-        <div className="px-4 pb-4 space-y-3 border-t border-border-base/60 pt-3">
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <div className="p-4 sm:p-5 space-y-4 border-t border-border-base/60">
+          <p className="text-xs text-content-muted leading-relaxed">
+            每行一条记录，支持 <span className="font-mono text-accent">记录值</span> /{" "}
+            <span className="font-mono text-accent">主机记录 记录值</span> /{" "}
+            <span className="font-mono text-accent">类型 主机记录 记录值 [TTL] [优先级]</span>；
+            字段分隔符优先级为 <span className="font-mono">竖线 &gt; 逗号 &gt; 空格</span>
+            （TXT 记录值本身含空格时请改用竖线或逗号分隔），<span className="font-mono">#</span> 开头的行会被忽略。
+            未写明的字段取下方默认值，单次最多 50 条。
+            主机记录只能是相对名 —— <span className="font-mono text-accent">@</span> 代表{" "}
+            <span className="font-mono">{displayDomainSmart(zoneDomain)}</span>，
+            填完整域名会自动剥成相对名。
+          </p>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-4">
             <div>
-              <span className="block text-xs font-semibold text-content-muted mb-1.5">默认类型</span>
+              <span className="block text-xs font-semibold text-content-muted mb-1.5">记录类型</span>
               <CustomSelect
                 value={batchType}
                 onChange={setBatchType}
-                ariaLabel="默认类型"
+                ariaLabel="记录类型"
                 options={typeOptions}
                 className="w-full px-3.5 py-2 rounded-xl text-sm text-content-secondary"
               />
             </div>
+
             <div>
-              <label htmlFor="dnsrecordbatchcreate-fld1" className="block text-xs font-semibold text-content-muted mb-1.5">默认主机记录</label>
+              <label htmlFor="dnsrecordbatchcreate-fld1" className="block text-xs font-semibold text-content-muted mb-1.5">主机记录</label>
               <Input id="dnsrecordbatchcreate-fld1" size="sm" mono
                 type="text"
                 name="cf-batch-name"
                 autoComplete="off"
                 value={batchName}
                 onChange={(e) => setBatchName(e.target.value)}
-                placeholder="@（留空按 @ 处理）"
+                placeholder="例如 @ 或 www"
                 className="w-full text-content-secondary rounded-xl"
               />
             </div>
+
             <div>
-              <span className="block text-xs font-semibold text-content-muted mb-1.5">默认 TTL</span>
+              <span className="block text-xs font-semibold text-content-muted mb-1.5">TTL (秒)</span>
               <CustomSelect
                 value={String(meta.isCloudflare && batchProxied ? 1 : batchTtl)}
                 onChange={(v) => setBatchTtl(Number(v))}
                 disabled={meta.isCloudflare && batchProxied}
-                ariaLabel="默认 TTL"
+                ariaLabel="TTL (秒)"
                 options={ttlSelectOptions(meta.isCloudflare)}
                 className="w-full px-3.5 py-2 rounded-xl text-sm text-content-secondary"
               />
             </div>
-            {meta.isDp ? (
-              <div>
-                <span className="block text-xs font-semibold text-content-muted mb-1.5">默认优先级</span>
-                <p className="text-[11px] text-content-muted leading-relaxed pt-1.5">
-                  DigitalPlat 无独立优先级字段，MX/SRV 请在每行写在记录值前缀（如{" "}
-                  <span className="font-mono">10 mail.example.com</span>）
-                </p>
-              </div>
-            ) : (
-              <div>
-                <label htmlFor="dnsrecordbatchcreate-fld2" className="block text-xs font-semibold text-content-muted mb-1.5">
-                  默认优先级 {needsDnsPriority(batchType) ? "" : "(无需)"}
-                </label>
-                <Input id="dnsrecordbatchcreate-fld2" size="sm"
-                  type="number"
-                  name="cf-batch-priority"
-                  autoComplete="off"
-                  value={batchPriority}
-                  onChange={(e) => setBatchPriority(Number(e.target.value))}
-                  disabled={!needsDnsPriority(batchType)}
-                  className="w-full text-content-secondary disabled:opacity-50 disabled:cursor-not-allowed rounded-xl"
-                />
-              </div>
+
+            {needsDnsPriority(batchType) && (
+              meta.isDp ? (
+                <div>
+                  <span className="block text-xs font-semibold text-content-muted mb-1.5">优先级</span>
+                  <p className="text-[11px] text-content-muted leading-relaxed pt-1.5">
+                    DigitalPlat 无独立优先级字段，MX/SRV 请在每行写在记录值前缀（如{" "}
+                    <span className="font-mono">10 mail.example.com</span>）
+                  </p>
+                </div>
+              ) : (
+                <div>
+                  <label htmlFor="dnsrecordbatchcreate-fld2" className="block text-xs font-semibold text-content-muted mb-1.5">
+                    优先级
+                  </label>
+                  <Input id="dnsrecordbatchcreate-fld2" size="sm"
+                    type="number"
+                    name="cf-batch-priority"
+                    autoComplete="off"
+                    value={batchPriority}
+                    onChange={(e) => setBatchPriority(Number(e.target.value))}
+                    className="w-full text-content-secondary rounded-xl"
+                  />
+                </div>
+              )
             )}
-          </div>
-          <Textarea
-            id="cf-batch-input"
-            rows={4}
-            name="cf-batch-records"
-            autoComplete="off"
-            value={batchInput}
-            onChange={(e) => setBatchInput(e.target.value)}
-            ref={batchTextareaRef}
-            placeholder={
-              "每行一条，字段分隔符：竖线 | 逗号 , 或空格\n示例：\n192.0.2.1            仅记录值（默认类型/主机记录）\nwww 192.0.2.2        主机记录 + 记录值\nMX @ mail.example.com 600 10"
-            }
-            className="w-full text-content-secondary min-h-[96px] rounded-xl"
-          />
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            {meta.supportsLine && batchLine !== undefined && setBatchLine ? (
-              <div className="flex items-center gap-2 text-xs">
-                <span className="font-semibold text-content-muted whitespace-nowrap">默认解析线路:</span>
+
+            {meta.supportsLine && batchLine !== undefined && setBatchLine && (
+              <div>
+                <span className="block text-xs font-semibold text-content-muted mb-1.5">解析线路</span>
                 <DnsLineSelect
                   value={batchLine}
                   onChange={setBatchLine}
                   supported={true}
-                  className="px-3.5 py-1.5 rounded-xl text-xs text-content-secondary min-w-[120px]"
+                  className="w-full form-input px-3.5 py-2 rounded-xl text-sm text-content-secondary"
                 />
               </div>
-            ) : meta.isCloudflare && PROXIED_TYPES.includes(batchType) ? (
+            )}
+          </div>
+
+          <Textarea
+            id="cf-batch-input"
+            rows={6}
+            mono
+            resizable
+            name="cf-batch-records"
+            autoComplete="off"
+            spellCheck={false}
+            value={batchInput}
+            onChange={(e) => setBatchInput(e.target.value)}
+            ref={batchTextareaRef}
+            placeholder={"2001:db8::5010:e191\n2001:db8::527:8a4e\nAAAA ipv6 2001:db8::e095:d9aa\nA www 192.0.2.1 600\nMX @ mail.example.com 600 10"}
+            className="w-full text-content-primary rounded-xl text-sm font-mono"
+          />
+
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            {meta.isCloudflare && PROXIED_TYPES.includes(batchType) ? (
               <label htmlFor="dnsrecordbatchcreate-fld3" className="flex items-center gap-2 text-xs text-content-secondary cursor-pointer select-none">
                 <input id="dnsrecordbatchcreate-fld3"
                   type="checkbox"
@@ -191,7 +217,7 @@ export function DnsRecordBatchCreate({
               size="sm"
               icon={<Plus className="w-4 h-4" />}
             >
-              批量添加{validBatchLines.length > 0 ? `（已识别 ${validBatchLines.length} 条）` : ""}
+              开始批量添加{validBatchLines.length > 0 ? `（已识别 ${validBatchLines.length} 条）` : ""}
             </Button>
           </div>
           {batchResults && <DnsBatchResults results={batchResults} />}

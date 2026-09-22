@@ -24,17 +24,38 @@ export class DigitalPlatDnsAdapter implements DnsProviderAdapter {
       name,
       content: input.content,
       ttl: input.ttl || 300,
+      priority: input.priority,
     });
     return { success: Boolean(res?.success), message: res?.message, record: res?.record };
   }
 
+  async batchCreateRecords({ domain, client }: DnsProviderContext, inputs: DnsRecordInput[]) {
+    const dpClient = client as DigitalPlatClient;
+    const items = inputs.map((input) => ({
+      type: input.type,
+      name: normalizeDnsRecordName(String(input.name || ""), domain.full_domain),
+      content: input.content,
+      ttl: input.ttl,
+      priority: input.priority,
+    }));
+    return dpClient.batchCreateDnsRecords({
+      domain: String(domain.remote_id || domain.full_domain),
+      items,
+    });
+  }
+
   async updateRecord({ domain, client }: DnsProviderContext, recordId: string, input: DnsRecordInput) {
     const dpClient = client as DigitalPlatClient;
+    const name = normalizeDnsRecordName(String(input.name || ""), domain.full_domain);
     const res = await dpClient.updateDnsRecord({
       domain: String(domain.remote_id || domain.full_domain),
       record_id: recordId,
+      type: input.type,
+      name,
       content: input.content,
+      originContent: (input as any).origin_content,
       ttl: input.ttl,
+      priority: input.priority,
     });
     return { success: Boolean(res?.success), message: res?.message };
   }

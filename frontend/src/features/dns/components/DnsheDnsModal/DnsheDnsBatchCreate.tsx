@@ -111,11 +111,11 @@ export function DnsheDnsBatchCreate({
             填完整域名会自动剥成相对名。
           </p>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
+          <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-4">
             <div>
-              <span className="block text-xs font-semibold text-content-muted mb-1.5">默认类型</span>
+              <span className="block text-xs font-semibold text-content-muted mb-1.5">记录类型</span>
               <CustomSelect
-                ariaLabel="默认类型"
+                ariaLabel="记录类型"
                 value={dnsBatchType}
                 onChange={setDnsBatchType}
                 options={DNS_TYPE_OPTIONS}
@@ -124,13 +124,13 @@ export function DnsheDnsBatchCreate({
             </div>
 
             <div>
-              <label htmlFor="dnshednsbatchcreate-fld1" className="block text-xs font-semibold text-content-muted mb-1.5">默认主机记录</label>
+              <label htmlFor="dnshednsbatchcreate-fld1" className="block text-xs font-semibold text-content-muted mb-1.5">主机记录</label>
               <input
                 id="dnshednsbatchcreate-fld1"
                 type="text"
                 name="dns-batch-name"
                 autoComplete="off"
-                placeholder="@ 或 www"
+                placeholder="例如 @ 或 www"
                 value={dnsBatchName}
                 onChange={(e) => setDnsBatchName(e.target.value)}
                 className="w-full form-input px-3.5 py-2.5 rounded-xl text-sm text-content-primary"
@@ -138,7 +138,7 @@ export function DnsheDnsBatchCreate({
             </div>
 
             <div>
-              <label htmlFor="dnshednsbatchcreate-fld2" className="block text-xs font-semibold text-content-muted mb-1.5">默认 TTL (秒)</label>
+              <label htmlFor="dnshednsbatchcreate-fld2" className="block text-xs font-semibold text-content-muted mb-1.5">TTL (秒)</label>
               <input
                 id="dnshednsbatchcreate-fld2"
                 type="number"
@@ -154,7 +154,7 @@ export function DnsheDnsBatchCreate({
 
             {needsDnsPriority(dnsBatchType) && (
               <div>
-                <label htmlFor="dnshednsbatchcreate-fld3" className="block text-xs font-semibold text-content-muted mb-1.5">默认优先级</label>
+                <label htmlFor="dnshednsbatchcreate-fld3" className="block text-xs font-semibold text-content-muted mb-1.5">优先级</label>
                 <input
                   id="dnshednsbatchcreate-fld3"
                   type="number"

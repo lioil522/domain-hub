@@ -21,7 +21,7 @@ export function useDnsheDnsModalState() {
   const [dnsBatchOpen, setDnsBatchOpen] = useState(false);
   const [dnsBatchInput, setDnsBatchInput] = useState("");
   const [dnsBatchType, setDnsBatchType] = useState("A");
-  const [dnsBatchName, setDnsBatchName] = useState("@");
+  const [dnsBatchName, setDnsBatchName] = useState("");
   const [dnsBatchTtl, setDnsBatchTtl] = useState(600);
   const [dnsBatchPriority, setDnsBatchPriority] = useState<number>(10);
   const [dnsBatchLine, setDnsBatchLine] = useState("");

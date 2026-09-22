@@ -72,26 +72,38 @@ interface DpDnsRecord {
 }
 
 /** 记录值展开为面板通用的记录形状（一条 RRset 值 = 一行）
-
+ *
  * NOTE: DigitalPlat 服务管理的只读记录（protected，典型如 apex 的 SOA/NS）
  * 会被列表接口一并返回，但面板无法修改它们（更新需 If-Match、删除被拒），
  * 这里直接滤掉，避免给用户提供注定失败的编辑/删除入口。
+ * 多值展开追加 #idx 下标，与华为云精准定位机制保持一致，避免 React key 冲突。
  */
 function mapDpRecord(rec: DpDnsRecord): DnsRecordInfo[] {
   if (rec.protected) return [];
-  const values = Array.isArray(rec.values) && rec.values.length > 0 ? rec.values : [rec.value ?? ""];
-  return values
-    .filter((v) => v !== "")
-    .map((value) => ({
-      id: rec.id,
+  const rawValues = Array.isArray(rec.values) && rec.values.length > 0 ? rec.values : [rec.value ?? ""];
+  const values = rawValues.filter((v) => v !== "");
+  const isMulti = values.length > 1;
+  const type = String(rec.type || "").toUpperCase();
+
+  return values.map((value, idx) => {
+    let priority: number | null = null;
+    const strVal = String(value);
+    if (type === "MX" || type === "SRV") {
+      const m = strVal.match(/^(\d+)\s+(.+)$/);
+      if (m) priority = Number(m[1]);
+    }
+
+    return {
+      id: isMulti ? `${rec.id}#${idx}` : rec.id,
       name: rec.name,
-      type: rec.type,
-      content: String(value),
+      type,
+      content: strVal,
       ttl: Number(rec.ttl) || 300,
-      priority: null,
+      priority,
       line: null,
       proxied: false,
-    }));
+    };
+  });
 }
 
 /**
@@ -146,6 +158,31 @@ export function mapDomainToUpstream(domain: DpDomainInfo): UpstreamSubdomain {
     remote_id: domainName,
     dns_state_known: true
   };
+}
+
+/**
+ * 将 DigitalPlat 主机记录名称归一化为相对主机名
+ *
+ * NOTE: 抹平相对名（如 "cf"）、完整 FQDN（如 "cf.domain.com"）、根域（"domain.com" / "@" / ""）、
+ * 尾部点号以及大小写的差异，统一输出小写的相对名（根域统一为 "@"）。
+ */
+export function normalizeDpName(name: string | undefined | null, domain: string): string {
+  const trimmed = String(name || "").trim().toLowerCase().replace(/\.+$/, "");
+  const baseDomain = String(domain || "").trim().toLowerCase().replace(/\.+$/, "");
+  if (!trimmed || trimmed === "@") {
+    return "@";
+  }
+  if (!baseDomain) {
+    return trimmed;
+  }
+  if (trimmed === baseDomain) {
+    return "@";
+  }
+  if (trimmed.endsWith(`.${baseDomain}`)) {
+    const sub = trimmed.slice(0, -(baseDomain.length + 1));
+    return sub || "@";
+  }
+  return trimmed;
 }
 
 /**
@@ -283,8 +320,14 @@ export class DigitalPlatClient {
     return { success: true, records };
   }
 
+
   /**
-   * 创建 DNS 解析记录（创建或扩展 RRset；单值走 values 数组提交）
+   * 创建 DNS 解析记录
+   *
+   * 逻辑：
+   * 1. 重复检查：若同名同类型且记录值完全相同，直接抛出异常提醒用户，绝不静默假装成功；
+   * 2. 优先直接发 POST 创建新记录（请求体同时兼容 value 与 values 格式）；
+   * 3. 若上游返回冲突或特定错误，再降级尝试并入同名同类型的现有记录中。
    */
   async createDnsRecord(params: {
     domain: string;
@@ -292,37 +335,266 @@ export class DigitalPlatClient {
     name: string;
     content: string;
     ttl?: number;
+    priority?: number;
+    record_id?: string | number;
   }): Promise<CreateDnsRecordResponse> {
-    await this.request("POST", `/domains/${encodeURIComponent(params.domain)}/dns/records`, {
-      idempotencyKey: crypto.randomUUID(),
-      body: {
-        type: params.type,
-        name: params.name,
-        ttl: Number(params.ttl) > 0 ? Number(params.ttl) : 300,
-        values: [params.content],
-      },
+    const type = String(params.type || "").trim().toUpperCase();
+    const rawName = String(params.name || "").trim();
+    const normalizedTargetName = normalizeDpName(rawName, params.domain);
+    let content = String(params.content || "").trim();
+    const priority = Number(params.priority);
+    if ((type === "MX" || type === "SRV") && Number.isFinite(priority) && priority >= 0 && !/^\d+\s+/.test(content)) {
+      content = `${priority} ${content}`;
+    }
+
+    const raw = await this.listRawDnsRecords(params.domain);
+
+    // 1. 严格查重：若已有同名同类型且内容完全一致的记录，抛出明确错误，杜绝假成功欺骗前端
+    const duplicate = raw.find((rec) => {
+      if (normalizeDpName(rec.name, params.domain) !== normalizedTargetName || rec.type.toUpperCase() !== type) {
+        return false;
+      }
+      const vals = Array.isArray(rec.values) && rec.values.length > 0 ? rec.values : [rec.value ?? ""];
+      return vals.map((v) => String(v).trim()).includes(content);
     });
-    return { success: true };
+    if (duplicate) {
+      throw new Error(`该解析记录已存在（${type} ${normalizedTargetName} → ${content}），无需重复添加`);
+    }
+
+    // 2. 优先直接发送 POST 创建独立记录（DigitalPlat 官方支持同名多条记录各自独立拥有 ID）
+    const safeTtl = Number(params.ttl) > 0 ? Number(params.ttl) : 300;
+    try {
+      await this.request("POST", `/domains/${encodeURIComponent(params.domain)}/dns/records`, {
+        idempotencyKey: crypto.randomUUID(),
+        body: {
+          type,
+          name: normalizedTargetName,
+          ttl: safeTtl,
+          value: content,
+          values: [content],
+        },
+      });
+      return { success: true };
+    } catch (postErr: unknown) {
+      // 3. 若上游 POST 返回同名冲突或不支持独立创建，降级尝试并入同名同类型的现有记录
+      const existing = raw.find(
+        (rec) =>
+          normalizeDpName(rec.name, params.domain) === normalizedTargetName &&
+          rec.type.toUpperCase() === type &&
+          !rec.protected
+      );
+      if (!existing || !existing.etag) {
+        throw postErr;
+      }
+
+      const existingValues = Array.isArray(existing.values) && existing.values.length > 0
+        ? [...existing.values]
+        : existing.value ? [existing.value] : [];
+
+      if (existingValues.length >= 16) {
+        throw new Error("DigitalPlat 单条记录集最多包含 16 个记录值，已达上限");
+      }
+
+      const mergedValues = [...existingValues, content];
+      await this.request("PATCH", `/domains/${encodeURIComponent(params.domain)}/dns/records/${encodeURIComponent(existing.id)}`, {
+        idempotencyKey: crypto.randomUUID(),
+        ifMatchEtag: existing.etag,
+        body: {
+          values: mergedValues,
+          ttl: safeTtl,
+        },
+      });
+
+      return { success: true };
+    }
+  }
+
+  /**
+   * 批量创建/合并 DNS 解析记录
+   *
+   * 按 (name, type) 自动分组聚合，针对同组多值一次性提交，大幅减少 API 请求并避免覆盖。
+   */
+  async batchCreateDnsRecords(params: {
+    domain: string;
+    items: Array<{
+      type: string;
+      name: string;
+      content: string;
+      ttl?: number;
+      priority?: number;
+    }>;
+  }): Promise<{
+    results: Array<{ label: string; success: boolean; message: string }>;
+    successCount: number;
+    failCount: number;
+  }> {
+    const results: Array<{ label: string; success: boolean; message: string }> = [];
+    let successCount = 0;
+    let failCount = 0;
+
+    interface GroupItem {
+      raw: (typeof params.items)[0];
+      formattedVal: string;
+    }
+    const groups = new Map<
+      string,
+      {
+        name: string;
+        type: string;
+        ttl: number;
+        items: GroupItem[];
+      }
+    >();
+
+    for (const item of params.items) {
+      const type = String(item.type || "").trim().toUpperCase();
+      const rawName = String(item.name ?? "").trim();
+      const normalizedName = normalizeDpName(rawName, params.domain);
+      const ttl = Number(item.ttl) > 0 ? Number(item.ttl) : 300;
+      let val = String(item.content || "").trim();
+      const priority = Number(item.priority);
+      if ((type === "MX" || type === "SRV") && Number.isFinite(priority) && priority >= 0 && !/^\d+\s+/.test(val)) {
+        val = `${priority} ${val}`;
+      }
+
+      const groupKey = `${type}:::${normalizedName}`;
+      if (!groups.has(groupKey)) {
+        groups.set(groupKey, {
+          name: normalizedName,
+          type,
+          ttl,
+          items: [],
+        });
+      }
+      groups.get(groupKey)!.items.push({ raw: item, formattedVal: val });
+    }
+
+    const rawRecords = await this.listRawDnsRecords(params.domain);
+
+    for (const group of groups.values()) {
+      try {
+        const existing = rawRecords.find(
+          (rec) =>
+            normalizeDpName(rec.name, params.domain) === group.name &&
+            rec.type.toUpperCase() === group.type.toUpperCase()
+        );
+
+        if (!existing) {
+          // 不存在该 RRset：一次性 POST 创建该组全部记录
+          const uniqueValues: string[] = [];
+          for (const it of group.items) {
+            if (!uniqueValues.includes(it.formattedVal)) {
+              uniqueValues.push(it.formattedVal);
+            }
+          }
+
+          const toAdd = uniqueValues.slice(0, 16);
+          await this.request("POST", `/domains/${encodeURIComponent(params.domain)}/dns/records`, {
+            idempotencyKey: crypto.randomUUID(),
+            body: {
+              type: group.type,
+              name: group.name,
+              ttl: group.ttl,
+              values: toAdd,
+            },
+          });
+
+          for (const it of group.items) {
+            const label = `${it.raw.type || "?"} ${it.raw.name} → ${it.raw.content || "(空)"}`;
+            if (toAdd.includes(it.formattedVal)) {
+              successCount++;
+              results.push({ label, success: true, message: "创建成功" });
+            } else {
+              failCount++;
+              results.push({ label, success: false, message: "DigitalPlat 单条记录集最多包含 16 个记录值，超出上限" });
+            }
+          }
+        } else {
+          // 已存在 RRset：合并现有值与待添加的值
+          const existingValues = Array.isArray(existing.values) && existing.values.length > 0
+            ? [...existing.values]
+            : existing.value ? [existing.value] : [];
+
+          const newToAdd: string[] = [];
+          for (const it of group.items) {
+            if (!existingValues.includes(it.formattedVal) && !newToAdd.includes(it.formattedVal)) {
+              newToAdd.push(it.formattedVal);
+            }
+          }
+
+          const combined = [...existingValues];
+          const acceptedNewValues = new Set<string>();
+
+          for (const val of newToAdd) {
+            if (combined.length < 16) {
+              combined.push(val);
+              acceptedNewValues.add(val);
+            }
+          }
+
+          if (acceptedNewValues.size > 0) {
+            await this.request(
+              "PATCH",
+              `/domains/${encodeURIComponent(params.domain)}/dns/records/${encodeURIComponent(existing.id)}`,
+              {
+                idempotencyKey: crypto.randomUUID(),
+                ifMatchEtag: existing.etag,
+                body: {
+                  values: combined,
+                  ttl: group.ttl || Number(existing.ttl) || 300,
+                },
+              }
+            );
+          }
+
+          for (const it of group.items) {
+            const label = `${it.raw.type || "?"} ${it.raw.name} → ${it.raw.content || "(空)"}`;
+            if (existingValues.includes(it.formattedVal)) {
+              successCount++;
+              results.push({ label, success: true, message: "记录已存在（已自动合并）" });
+            } else if (acceptedNewValues.has(it.formattedVal)) {
+              successCount++;
+              results.push({ label, success: true, message: "已并入现有记录集" });
+            } else {
+              failCount++;
+              results.push({ label, success: false, message: "DigitalPlat 单条记录集最多包含 16 个记录值，超出上限" });
+            }
+          }
+        }
+      } catch (err: unknown) {
+        const errMsg = err instanceof Error ? err.message : "创建失败";
+        for (const it of group.items) {
+          const label = `${it.raw.type || "?"} ${it.raw.name} → ${it.raw.content || "(空)"}`;
+          failCount++;
+          results.push({ label, success: false, message: errMsg });
+        }
+      }
+    }
+
+    return { results, successCount, failCount };
   }
 
   /**
    * 修改 DNS 解析记录
    *
-   * NOTE: DigitalPlat 要求 PATCH 携带 If-Match（上次读取返回的 ETag）防止覆盖其他
-   * 会话的修改。面板不透传 etag，这里先拉一次记录列表找到目标记录取当前 etag；
-   * 找不到说明记录已被删除或 ID 变化，让用户刷新后重试。
-   * 服务管理的只读记录（protected）在列表层已被滤掉，这里再做一层防御，避免
-   * 记录 ID 直接拼 URL 撞上只读记录时静默报错。
+   * NOTE: record_id 若形如 `<uuid>#<idx>`（多值展开产生的行），只更新该下标对应的单项值，
+   * 完整保留同条 RRset 内的其他值，避免覆盖抹除。
    */
   async updateDnsRecord(params: {
     domain: string;
     record_id: string | number;
     content: string;
+    originContent?: string;
     ttl?: number;
+    type?: string;
+    name?: string;
+    priority?: number;
   }): Promise<ActionResponse> {
-    const recordId = String(params.record_id);
+    const rawId = String(params.record_id);
+    const [recordId, idxStr] = rawId.split("#");
+    const targetIdx = idxStr !== undefined && idxStr !== "" ? parseInt(idxStr, 10) : -1;
+
     const raw = await this.listRawDnsRecords(params.domain);
-    // RRset 多值时同一 id 出现多次，任取一条的 etag 即可（同属一个 RRset）
     const target = raw.find((rec) => String(rec.id) === recordId);
     if (!target) {
       throw new Error("未在上游找到该解析记录（可能已被删除），请刷新记录列表后重试");
@@ -330,14 +602,105 @@ export class DigitalPlatClient {
     if (target.protected) {
       throw new Error("该记录由 DigitalPlat 服务管理（只读），无法通过 API 修改");
     }
+
+    const type = String(params.type || target.type || "").toUpperCase();
+    let content = String(params.content || "").trim();
+    const priority = Number(params.priority);
+    if ((type === "MX" || type === "SRV") && Number.isFinite(priority) && priority >= 0 && !/^\d+\s+/.test(content)) {
+      content = `${priority} ${content}`;
+    }
+
+    const rawTargetName = params.name !== undefined ? String(params.name).trim() : target.name;
+    const targetRelative = normalizeDpName(rawTargetName, params.domain);
+    const existingRelative = normalizeDpName(target.name, params.domain);
+    const nameChanged = targetRelative !== existingRelative;
+    const typeChanged = type !== target.type.toUpperCase();
+
+    // 当主机记录 (name) 或记录类型 (type) 改变时，属于 RRset 跨归属迁移
+    if (nameChanged || typeChanged) {
+      // 1. 事务安全铁律：先加后删（Add-Before-Delete）
+      // 先将新记录安全并入目标 (name, type) 下，自动处理已有合并与去重
+      // 若目标添加失败（例如超限 16 条、上游报错等），在此处抛出异常并中断，原记录完好无损！
+      const createRes = await this.createDnsRecord({
+        domain: params.domain,
+        type,
+        name: targetRelative,
+        content: params.content,
+        ttl: Number(params.ttl) > 0 ? Number(params.ttl) : (Number(target.ttl) || 300),
+        priority: params.priority,
+      });
+
+      // 2. 目标确认添加/合并成功后，再从原 RRset 中剥离或删除旧记录
+      try {
+        const existingValues = Array.isArray(target.values) && target.values.length > 0
+          ? [...target.values]
+          : target.value ? [target.value] : [];
+
+        if (existingValues.length > 1) {
+          // 优先按记录值内容比对匹配要移除的项，防止批量连续修改时下标漂移（Index Drift）
+          const valToFind = (params.originContent || params.content).trim();
+          let removeIdx = existingValues.indexOf(valToFind);
+          if (removeIdx === -1 && targetIdx >= 0 && targetIdx < existingValues.length) {
+            removeIdx = targetIdx;
+          }
+
+          if (removeIdx >= 0 && removeIdx < existingValues.length) {
+            existingValues.splice(removeIdx, 1);
+          }
+
+          if (existingValues.length > 0) {
+            // 获取最新 etag 避免并发冲突
+            const latestRaw = await this.listRawDnsRecords(params.domain);
+            const latestTarget = latestRaw.find((rec) => String(rec.id) === recordId);
+            const etagToUse = latestTarget?.etag || target.etag;
+            if (etagToUse) {
+              await this.request("PATCH", `/domains/${encodeURIComponent(params.domain)}/dns/records/${encodeURIComponent(recordId)}`, {
+                idempotencyKey: crypto.randomUUID(),
+                ifMatchEtag: etagToUse,
+                body: { values: existingValues },
+              });
+            }
+          } else {
+            await this.deleteDnsRecord(params.domain, recordId);
+          }
+        } else {
+          // 原 RRset 只有这 1 项或单值，直接删除原 RRset
+          await this.deleteDnsRecord(params.domain, recordId);
+        }
+      } catch (cleanErr) {
+        console.warn("清理原解析记录失败（新记录已成功添加）:", cleanErr);
+      }
+
+      return createRes;
+    }
+
+    // 主机记录未改变（原地修改记录值、TTL 等）
     if (!target.etag) {
       throw new Error("上游未返回该记录的 ETag，无法安全修改（缺少 If-Match）。请刷新记录列表后重试");
     }
 
-    const body: Record<string, unknown> = { value: params.content };
+    const body: Record<string, unknown> = {};
     if (Number(params.ttl) > 0) {
       body.ttl = Number(params.ttl);
     }
+
+    if (targetIdx >= 0) {
+      // 多值展开的某一行：只替换对应下标的值，保留同组其余值
+      const values = Array.isArray(target.values) && target.values.length > 0
+        ? [...target.values]
+        : target.value ? [target.value] : [];
+
+      if (targetIdx < values.length) {
+        values[targetIdx] = content;
+      } else {
+        values.push(content);
+      }
+
+      body.values = values;
+    } else {
+      body.value = content;
+    }
+
     await this.request("PATCH", `/domains/${encodeURIComponent(params.domain)}/dns/records/${encodeURIComponent(recordId)}`, {
       idempotencyKey: crypto.randomUUID(),
       ifMatchEtag: target.etag,
@@ -347,22 +710,49 @@ export class DigitalPlatClient {
   }
 
   /**
-   * 删除 DNS 解析记录（从 RRset 中删除一个值）
+   * 删除 DNS 解析记录
    *
-   * NOTE: 先查一次记录列表确认目标是可删的用户记录（protected 只读记录在列表层
-   * 已滤除，这里再兜一层），再发 DELETE。
+   * NOTE: recordId 若形如 `<uuid>#<idx>` 且 RRset 包含多个记录值时，只剔除对应下标的值，
+   * 剩余值通过 PATCH 保留；只有当记录集仅剩最后 1 个值或无下标时才真正发 DELETE。
    */
   async deleteDnsRecord(domain: string | number, recordId: string | number): Promise<ActionResponse> {
     const domainName = String(domain);
-    const recordIdStr = String(recordId);
+    const rawId = String(recordId);
+    const [realId, idxStr] = rawId.split("#");
+    const targetIdx = idxStr !== undefined && idxStr !== "" ? parseInt(idxStr, 10) : -1;
+
     const raw = await this.listRawDnsRecords(domainName);
-    const target = raw.find((rec) => String(rec.id) === recordIdStr);
+    const target = raw.find((rec) => String(rec.id) === realId);
     if (target?.protected) {
       throw new Error("该记录由 DigitalPlat 服务管理（只读），无法删除");
     }
+
+    if (targetIdx >= 0 && target) {
+      const values = Array.isArray(target.values) && target.values.length > 0
+        ? [...target.values]
+        : target.value ? [target.value] : [];
+
+      if (values.length > 1) {
+        // 多值展开的某一行：只剔除该行对应的值，更新剩余值
+        if (targetIdx < values.length) {
+          values.splice(targetIdx, 1);
+          if (!target.etag) {
+            throw new Error("上游未返回该记录的 ETag，无法安全删除单项值（缺少 If-Match）。请刷新记录列表后重试");
+          }
+          await this.request("PATCH", `/domains/${encodeURIComponent(domainName)}/dns/records/${encodeURIComponent(realId)}`, {
+            idempotencyKey: crypto.randomUUID(),
+            ifMatchEtag: target.etag,
+            body: { values },
+          });
+          return { success: true };
+        }
+      }
+    }
+
+    // 单值或最后一条值：删除整条 RRset
     await this.request(
       "DELETE",
-      `/domains/${encodeURIComponent(domainName)}/dns/records/${encodeURIComponent(recordIdStr)}`,
+      `/domains/${encodeURIComponent(domainName)}/dns/records/${encodeURIComponent(realId)}`,
       { idempotencyKey: crypto.randomUUID() }
     );
     return { success: true };

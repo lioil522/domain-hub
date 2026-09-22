@@ -15,8 +15,8 @@ export function useCfDnsPanelMeta(cfSelectedZone: Domain | null) {
         isCloudflare: false,
         provider,
         supportsLine,
-        // DigitalPlat 的记录类型/主机名由 API 决定，不允许在编辑态改动
-        lockedIdentity: true,
+        // DigitalPlat 现已完整支持跨主机名/类型迁移机制，支持单独修改主机记录与类型
+        lockedIdentity: false,
         label: "DigitalPlat",
         subtitle: `DigitalPlat 托管域名 · ${dpStatusBadge(String(cfSelectedZone?.status || "")).text}`,
         refreshTitle: "强制刷新（忽略缓存，重新从 DigitalPlat 拉取）",
@@ -29,8 +29,8 @@ export function useCfDnsPanelMeta(cfSelectedZone: Domain | null) {
         isCloudflare: false,
         provider,
         supportsLine,
-        // DNSPod / 阿里云 / 华为云 / Vercel 的记录类型与主机名同样由各自 API 固定
-        lockedIdentity: true,
+        // DNSPod / 阿里云 / 华为云 / Vercel 支持在行内编辑中修改主机记录与类型
+        lockedIdentity: false,
         label: MULTI_PROVIDER_META[key].label,
         subtitle: `${MULTI_PROVIDER_META[key].label} 托管域名 · 状态: ${String(cfSelectedZone?.status || "正常")}`,
         refreshTitle: `强制刷新（忽略缓存，重新从 ${MULTI_PROVIDER_META[key].label} 拉取）`,

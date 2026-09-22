@@ -24,12 +24,12 @@ export function useCfDnsPanelActions({ state, meta, apiFetch, showToast, setActi
     cfSelectedZone, cfRecords, cfBatchInput, cfBatchType, cfBatchLine, cfBatchName, cfBatchTtl, cfBatchPriority, cfBatchProxied,
     cfNewType, cfNewLine, cfNewName, cfNewContent, cfNewTtl, cfNewPriority, cfNewProxied,
     cfEditingKey, cfEditType, cfEditLine, cfEditName, cfEditContent, cfEditTtl, cfEditPriority, cfEditProxied,
-    cfSelectedKeys, cfEditFields, cfBatchEditTtl, cfBatchEditProxied, cfBatchEditContents,
+    cfSelectedKeys, cfEditFields, cfBatchEditName, cfBatchEditTtl, cfBatchEditProxied, cfBatchEditContents,
     setCfDnsModalOpen, setCfSelectedZone, setLoadingCfRecords, setCfRecords, setCfRecordsError,
     setCfFormOpen, setCfNewType, setCfNewLine, setCfNewName, setCfNewContent, setCfNewTtl, setCfNewPriority, setCfNewProxied,
     setCfEditingKey, setCfEditType, setCfEditLine, setCfEditName, setCfEditContent, setCfEditTtl, setCfEditPriority, setCfEditProxied,
     setCfBatchOpen, setCfBatchInput, setCfBatchLine, setCfBatchTtl, setCfBatchProxied, setCfBatchResults, setCfSelectedKeys, setCfEditPanelOpen, setCfBatchEditContents, setCfEditResults,
-    setCfBatchEditTtl, setCfBatchEditProxied, setCfEditFields,
+    setCfBatchEditName, setCfBatchEditTtl, setCfBatchEditProxied, setCfEditFields,
   } = state;
   const { dnsPanelMeta, dnsPanelIsDp } = meta;
 
@@ -69,11 +69,26 @@ export function useCfDnsPanelActions({ state, meta, apiFetch, showToast, setActi
     setCfNewLine("default");
     setCfNewName("");
     setCfNewContent("");
-    setCfNewTtl(1);
+
+    // 根据 provider 判断默认 TTL：Cloudflare 为 1（自动），其余托管商（华为云/DP/阿里/腾讯等）为 300
+    const isCloudflare =
+      zone.dns_provider === "Cloudflare" ||
+      zone.account_provider === "cloudflare" ||
+      String(zone.ns1 || "").toLowerCase().includes("cloudflare.com") ||
+      String(zone.ns2 || "").toLowerCase().includes("cloudflare.com");
+    const defaultTtl = isCloudflare ? 1 : 300;
+
+    setCfNewTtl(defaultTtl);
+    setCfEditTtl(defaultTtl);
+    setCfBatchTtl(defaultTtl);
+    setCfBatchEditTtl(defaultTtl);
     setCfNewPriority(10);
     setCfNewProxied(false);
+    setCfEditProxied(false);
+    setCfBatchProxied(false);
     setCfBatchLine("default");
     setCfEditLine("default");
+    setCfEditFields({ name: false, content: false, ttl: false, proxied: false });
     void reloadCfRecords(zone);
   };
 
@@ -88,11 +103,17 @@ export function useCfDnsPanelActions({ state, meta, apiFetch, showToast, setActi
     try {
       const isCf = dnsPanelMeta.isCloudflare;
       const isDp = dnsPanelIsDp;
+      const numTtl = Number(cfNewTtl);
+      const safeTtl = isCf && cfNewProxied
+        ? 1
+        : isCf
+        ? (Number.isFinite(numTtl) && numTtl > 0 ? numTtl : 1)
+        : (Number.isFinite(numTtl) && numTtl >= 300 ? numTtl : 300);
       const payload: Record<string, unknown> = {
         type: cfNewType,
         name: cfNewName.trim() || "@",
         content: cfNewContent.trim(),
-        ttl: isCf && cfNewProxied ? 1 : cfNewTtl,
+        ttl: safeTtl,
       };
       if (dnsPanelMeta.supportsLine) {
         payload.line = cfNewLine || "default";
@@ -118,7 +139,7 @@ export function useCfDnsPanelActions({ state, meta, apiFetch, showToast, setActi
         showToast("error", data.message || "创建解析记录失败");
       }
     } catch (e) {
-      showToast("error", "创建解析记录请求失败");
+      showToast("error", e instanceof Error ? e.message : "创建解析记录请求失败");
     } finally {
       setActionLoading(null);
     }
@@ -149,16 +170,21 @@ export function useCfDnsPanelActions({ state, meta, apiFetch, showToast, setActi
     try {
       const isCf = dnsPanelMeta.isCloudflare;
       const isDp = dnsPanelIsDp;
-      const payload: Record<string, unknown> = isDp
-        ? { content: cfEditContent.trim(), ttl: cfEditTtl }
-        : {
-            type: cfEditType,
-            name: cfEditName.trim() || "@",
-            content: cfEditContent.trim(),
-            ttl: isCf && cfEditProxied ? 1 : cfEditTtl,
-            priority: needsDnsPriority(cfEditType) ? cfEditPriority : undefined,
-            ...(isCf ? { proxied: cfEditProxied } : {})
-          };
+      const numEditTtl = Number(cfEditTtl);
+      const safeEditTtl = isCf && cfEditProxied
+        ? 1
+        : isCf
+        ? (Number.isFinite(numEditTtl) && numEditTtl > 0 ? numEditTtl : 1)
+        : (Number.isFinite(numEditTtl) && numEditTtl >= 300 ? numEditTtl : 300);
+      const payload: Record<string, unknown> = {
+        type: cfEditType,
+        name: cfEditName.trim() || "@",
+        content: cfEditContent.trim(),
+        origin_content: target.content,
+        ttl: safeEditTtl,
+        priority: !isDp && needsDnsPriority(cfEditType) ? cfEditPriority : undefined,
+        ...(isCf ? { proxied: cfEditProxied } : {})
+      };
       if (dnsPanelMeta.supportsLine) {
         payload.line = cfEditLine || "default";
       }
@@ -175,7 +201,7 @@ export function useCfDnsPanelActions({ state, meta, apiFetch, showToast, setActi
         showToast("error", data.message || "更新解析记录失败");
       }
     } catch (e) {
-      showToast("error", "更新解析记录请求失败");
+      showToast("error", e instanceof Error ? e.message : "更新解析记录请求失败");
     } finally {
       setActionLoading(null);
     }
@@ -198,7 +224,7 @@ export function useCfDnsPanelActions({ state, meta, apiFetch, showToast, setActi
         showToast("error", data.message || "删除解析记录失败");
       }
     } catch (e) {
-      showToast("error", "删除解析记录请求失败");
+      showToast("error", e instanceof Error ? e.message : "删除解析记录请求失败");
     } finally {
       setActionLoading(null);
     }
@@ -210,7 +236,7 @@ export function useCfDnsPanelActions({ state, meta, apiFetch, showToast, setActi
     () =>
       parseDnsBatchInput(cfBatchInput, {
         type: cfBatchType,
-        name: cfBatchName,
+        name: cfBatchName.trim() || "@",
         ttl: cfBatchProxied ? 1 : cfBatchTtl,
         priority: cfBatchPriority
       }, CF_DNS_TYPE_SET).map((r) =>
@@ -265,7 +291,7 @@ export function useCfDnsPanelActions({ state, meta, apiFetch, showToast, setActi
         showToast("error", data.message || "批量添加解析记录失败");
       }
     } catch (e) {
-      showToast("error", "批量添加解析记录请求失败");
+      showToast("error", e instanceof Error ? e.message : "批量添加解析记录请求失败");
     } finally {
       setActionLoading(null);
     }
@@ -285,14 +311,14 @@ export function useCfDnsPanelActions({ state, meta, apiFetch, showToast, setActi
     }
   };
 
-  // CF 批量修改目标（复用 buildDnsEditTargets：内容 / TTL / 代理 三个字段可覆盖）
+  // CF 批量修改目标（复用 buildDnsEditTargets：主机记录 / 内容 / TTL / 代理 均可覆盖）
   const cfBatchEditTargets = useMemo(
     () =>
       buildDnsEditTargets(
         cfSelectedRecords,
         {
           type: false,
-          name: false,
+          name: cfEditFields.name,
           content: cfEditFields.content,
           ttl: cfEditFields.ttl,
           line: false,
@@ -301,7 +327,7 @@ export function useCfDnsPanelActions({ state, meta, apiFetch, showToast, setActi
         },
         {
           type: "A",
-          name: "@",
+          name: cfBatchEditName,
           content: "",
           ttl: cfBatchEditTtl,
           line: "",
@@ -311,7 +337,7 @@ export function useCfDnsPanelActions({ state, meta, apiFetch, showToast, setActi
         cfSelectedZone?.full_domain || "",
         cfBatchEditContents
       ),
-    [cfSelectedRecords, cfSelectedZone, cfEditFields, cfBatchEditTtl, cfBatchEditProxied, cfBatchEditContents]
+    [cfSelectedRecords, cfSelectedZone, cfEditFields, cfBatchEditName, cfBatchEditTtl, cfBatchEditProxied, cfBatchEditContents]
   );
 
   const cfBatchEditChanged = useMemo(
@@ -323,6 +349,9 @@ export function useCfDnsPanelActions({ state, meta, apiFetch, showToast, setActi
     setCfBatchEditContents(
       Object.fromEntries(cfSelectedRecords.map((rec) => [dnsRecordKey(rec), rec.content || ""]))
     );
+    if (cfSelectedRecords.length > 0) {
+      setCfBatchEditName(toRelativeRecordName(cfSelectedRecords[0].name, cfSelectedZone?.full_domain || ""));
+    }
     setCfEditResults(null);
     setCfEditPanelOpen(true);
   };
@@ -330,7 +359,7 @@ export function useCfDnsPanelActions({ state, meta, apiFetch, showToast, setActi
   // CF 批量修改已勾选的解析记录
   const handleCfBatchUpdateRecords = async () => {
     if (!cfSelectedZone || cfBatchEditTargets.length === 0) return;
-    if (!cfEditFields.content && !cfEditFields.ttl && !cfEditFields.proxied) {
+    if (!cfEditFields.name && !cfEditFields.content && !cfEditFields.ttl && !cfEditFields.proxied) {
       showToast("error", "请至少勾选一个要修改的字段");
       return;
     }
@@ -348,16 +377,19 @@ export function useCfDnsPanelActions({ state, meta, apiFetch, showToast, setActi
     }
 
     const isCf = dnsPanelMeta.isCloudflare;
-    const records = cfBatchEditChanged.map((t) => ({
-      record_id: t.record_id,
-      label: t.label,
-      type: t.type,
-      name: t.name,
-      content: t.content,
-      // 仅 Cloudflare 支持代理：其余托管商绝不把 TTL 强制写成 1（自动）或把代理位传上去
-      ttl: isCf && cfEditFields.proxied && cfBatchEditProxied ? 1 : t.ttl,
-      proxied: isCf && cfEditFields.proxied ? cfBatchEditProxied : undefined
-    }));
+    const records = cfBatchEditChanged.map((t) => {
+      const safeRecordTtl = isCf && cfEditFields.proxied && cfBatchEditProxied ? 1 : (isCf ? t.ttl : (t.ttl >= 300 ? t.ttl : 300));
+      return {
+        record_id: t.record_id,
+        label: t.label,
+        type: t.type,
+        name: t.name,
+        content: t.content,
+        origin_content: t.origin_content,
+        ttl: safeRecordTtl,
+        proxied: isCf && cfEditFields.proxied ? cfBatchEditProxied : undefined,
+      };
+    });
 
     setActionLoading("cf-batch-update-dns");
     try {
@@ -379,7 +411,7 @@ export function useCfDnsPanelActions({ state, meta, apiFetch, showToast, setActi
         showToast("error", data.message || "批量修改解析记录失败");
       }
     } catch (e) {
-      showToast("error", "批量修改解析记录请求失败");
+      showToast("error", e instanceof Error ? e.message : "批量修改解析记录请求失败");
     } finally {
       setActionLoading(null);
     }
@@ -429,7 +461,7 @@ export function useCfDnsPanelActions({ state, meta, apiFetch, showToast, setActi
         showToast("error", data.message || "批量删除解析记录失败");
       }
     } catch (e) {
-      showToast("error", "批量删除解析记录请求失败");
+      showToast("error", e instanceof Error ? e.message : "批量删除解析记录请求失败");
     } finally {
       setActionLoading(null);
     }
@@ -448,7 +480,7 @@ export function useCfDnsPanelActions({ state, meta, apiFetch, showToast, setActi
     //（会把 DP 记录写成非法 TTL=1）或残留的 proxied=true 强制 TTL=1。
     setCfBatchEditTtl(300);
     setCfBatchEditProxied(false);
-    setCfEditFields({ content: false, ttl: false, proxied: false });
+    setCfEditFields({ name: false, content: false, ttl: false, proxied: false });
     setCfSelectedKeys(new Set());
   };
   return {

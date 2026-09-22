@@ -77,6 +77,7 @@ export function DnsRecordPanel(props: DnsRecordPanelProps) {
 
           {/* ===== 批量添加折叠面板 ===== */}
           <DnsRecordBatchCreate
+            zone={zone}
             meta={meta}
             actionLoading={props.actionLoading}
             batchOpen={props.batchOpen}
@@ -105,12 +106,15 @@ export function DnsRecordPanel(props: DnsRecordPanelProps) {
           {/* ===== 批量修改折叠面板 ===== */}
           {selectedKeys.size > 0 && editPanelOpen && (
             <DnsRecordBatchEdit
+              zone={zone}
               meta={meta}
               actionLoading={props.actionLoading}
               selectedCount={selectedKeys.size}
               setEditPanelOpen={props.setEditPanelOpen}
               editFields={props.editFields}
               setEditFields={props.setEditFields}
+              batchEditName={props.batchEditName}
+              setBatchEditName={props.setBatchEditName}
               batchEditTtl={props.batchEditTtl}
               setBatchEditTtl={props.setBatchEditTtl}
               batchEditProxied={props.batchEditProxied}

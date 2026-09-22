@@ -91,18 +91,23 @@ export function registerDnsRoutes(app: Hono<AppEnv>, deps: DnsRouteDeps) {
       if (items.length > DNS_BATCH_LIMIT) return c.json(errorRes(`单次最多批量添加 ${DNS_BATCH_LIMIT} 条解析记录`, "bad_request"), 400);
       const domain = await domainService(db).get(domainId);
       if (!domain) return c.json(errorRes("未找到域名记录", "not_found"), 404);
-      const results: DnsBatchItemResult[] = [];
-      let successCount = 0, failCount = 0, nsDisabled = false, changed = false;
-      for (const raw of items) {
+
+      const inputs = items.map((raw: unknown) => {
         const item = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
-        const input = normalizedInput(item, domain.full_domain);
-        const label = `${input.type || "?"} ${input.name} → ${input.content || "(空)"}`;
-        if (!input.type || !input.content) { failCount++; results.push({ label, success: false, message: "记录类型与记录值均不能为空" }); continue; }
-        try { await dnsService(db).create(domain, input); successCount++; changed = true; results.push({ label, success: true, message: "创建成功" }); }
-        catch (e: unknown) { const { message, errorCode } = translateDnsWriteError(e instanceof Error ? e.message : "未知错误", input.type); if (errorCode === "ns_management_disabled") nsDisabled = true; failCount++; results.push({ label, success: false, message }); }
-        await deps.sleep(DNS_BATCH_INTERVAL);
-      }
-      if (changed) await dnsService(db).refreshStatus(domain);
+        return normalizedInput(item, domain.full_domain);
+      });
+
+      const batchResult = await dnsService(db).batchCreate(domain, inputs, {
+        fallbackItemHandler: async (input) => {
+          await dnsService(db).create(domain, input);
+        },
+        sleep: deps.sleep,
+      });
+
+      const { results, successCount, failCount } = batchResult;
+      const nsDisabled = results.some((r) => r.message.includes("disable_ns_management"));
+
+      if (successCount > 0) await dnsService(db).refreshStatus(domain);
       await logService(db).write(failCount === 0 ? "success" : "warning", "api", `批量添加域名 [${domain.full_domain}] 的解析记录完成：成功 ${successCount} 条，失败 ${failCount} 条`, results);
       await auditService(db).write({ actor: "session", action: "batch-create", resourceType: "dns_record", resourceId: String(domainId), result: failCount === 0 ? "success" : "failure", details: { successCount, failCount } });
       return c.json(successRes({ success_count: successCount, fail_count: failCount, results, error_code: nsDisabled ? "ns_management_disabled" : undefined, message: `批量添加完成：成功 ${successCount} 条，失败 ${failCount} 条` }));

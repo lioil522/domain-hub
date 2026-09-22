@@ -305,6 +305,25 @@ export function mapHuaweiZoneToUpstream(zone: HuaweiZoneInfo): UpstreamSubdomain
   };
 }
 
+/** 判断一个线路值是否为默认线路（空、null、undefined、default、default_line、default_view 统一视作默认） */
+export function isHuaweiDefaultLine(line: string | undefined | null): boolean {
+  const s = String(line || "").trim().toLowerCase();
+  return (
+    !s ||
+    s === "default" ||
+    s === "default_line" ||
+    s === "default_view" ||
+    s === "null" ||
+    s === "undefined"
+  );
+}
+
+/** 比较两个华为云线路标识是否相等（默认线路之间互等） */
+export function isHuaweiLineEqual(lineA: string | undefined | null, lineB: string | undefined | null): boolean {
+  if (isHuaweiDefaultLine(lineA) && isHuaweiDefaultLine(lineB)) return true;
+  return String(lineA || "").trim().toLowerCase() === String(lineB || "").trim().toLowerCase();
+}
+
 /**
  * 华为云云解析 DNS API 请求封装类
  */
@@ -422,7 +441,8 @@ export class HuaweiCloudClient {
           continue;
         }
 
-        throw new Error(translateHuaweiError(code, message, response.status));
+        const translated = translateHuaweiError(code, message, response.status);
+        throw new HuaweiApiError(translated, code, response.status, message);
       }
 
       resolvedHuaweiHost.set(this.accessKeyId, host);
@@ -454,6 +474,29 @@ export class HuaweiCloudClient {
   }
 
   /**
+   * 分页列出 zone 下全部原始 Recordset
+   *
+   * NOTE: 上下游统一复用本方法的分页逻辑（limit: 100, offset: page * 100），杜绝 limit: 500 导致网关报 400
+   */
+  async listAllRawRecordSets(zoneId: string | number): Promise<HuaweiRecordSet[]> {
+    const id = String(zoneId || "").trim();
+    if (!id) return [];
+
+    const recordsets: HuaweiRecordSet[] = [];
+    for (let page = 0; page < HUAWEI_MAX_PAGES; page++) {
+      const res = await this.request<{ recordsets?: HuaweiRecordSet[] }>(
+        "GET",
+        `/v2/zones/${encodeURIComponent(id)}/recordsets`,
+        { query: { limit: HUAWEI_PAGE_SIZE, offset: page * HUAWEI_PAGE_SIZE } }
+      );
+      const list = Array.isArray(res.recordsets) ? res.recordsets : [];
+      recordsets.push(...list);
+      if (list.length < HUAWEI_PAGE_SIZE) break;
+    }
+    return recordsets;
+  }
+
+  /**
    * 分页列出 zone 下全部 Recordset（展开多值后映射为内部形状）
    *
    * NOTE: `zoneId` 是华为云的 zone id（domains_cache.remote_id 存的就是它）。
@@ -464,20 +507,165 @@ export class HuaweiCloudClient {
       throw new Error("华为云 DNS 解析记录列表需要 zone id 作为参数");
     }
 
+    const rawList = await this.listAllRawRecordSets(id);
     const records: DnsRecordInfo[] = [];
-    for (let page = 0; page < HUAWEI_MAX_PAGES; page++) {
-      const res = await this.request<{ recordsets?: HuaweiRecordSet[] }>(
-        "GET",
-        `/v2/zones/${encodeURIComponent(id)}/recordsets`,
-        { query: { limit: HUAWEI_PAGE_SIZE, offset: page * HUAWEI_PAGE_SIZE } }
-      );
-      const list = Array.isArray(res.recordsets) ? res.recordsets : [];
-      for (const rs of list) {
-        records.push(...mapHuaweiRecordSet(rs));
-      }
-      if (list.length < HUAWEI_PAGE_SIZE) break;
+    for (const rs of rawList) {
+      records.push(...mapHuaweiRecordSet(rs));
     }
     return { success: true, records };
+  }
+
+  /**
+   * 根据 ID 查询单个 RecordSet
+   *
+   * NOTE: 华为云官方公网单条 RecordSet 详情标准路径为 GET /v2/zones/{zoneId}/recordsets/{id}；
+   * 若返回 404 或不可用，备用尝试 GET /v2/recordsets/{id}，兜底从稳健的 listAllRawRecordSets 列表中查找。
+   */
+  async getRecordSetById(zoneId: string | number, recordSetId: string): Promise<HuaweiRecordSet | null> {
+    const id = String(recordSetId || "").split("#")[0].trim();
+    if (!id) return null;
+
+    // 1. 优先调用官方标准路径 GET /v2/zones/{zoneId}/recordsets/{id}
+    try {
+      const res = await this.request<HuaweiRecordSet>(
+        "GET",
+        `/v2/zones/${encodeURIComponent(String(zoneId))}/recordsets/${encodeURIComponent(id)}`
+      );
+      if (res && res.id) return res;
+    } catch {
+      // 容错降级
+    }
+
+    // 2. 备用尝试 GET /v2/recordsets/{id}
+    try {
+      const res = await this.request<HuaweiRecordSet>(
+        "GET",
+        `/v2/recordsets/${encodeURIComponent(id)}`
+      );
+      if (res && res.id) return res;
+    } catch {
+      // 容错降级
+    }
+
+    // 3. 兜底：直接拉取该 zone 下的 recordsets 列表在本地匹配
+    try {
+      const list = await this.listAllRawRecordSets(zoneId);
+      const found = list.find((rs) => rs.id === id);
+      if (found) return found;
+    } catch {
+      // 容错
+    }
+
+    return null;
+  }
+
+  /**
+   * 根据 name、type、line 精确查找单个 RecordSet
+   * 若精确匹配未命中，采用同名同类型的强力兜底匹配；若发现同名互斥记录（如已存在 CNAME），抛出明确提示
+   */
+  async findRecordSet(params: {
+    zoneId: string | number;
+    zoneName: string;
+    type: string;
+    name: string;
+    line?: string;
+  }): Promise<HuaweiRecordSet | null> {
+    const type = String(params.type || "").trim().toUpperCase();
+    const zone = stripTrailingDot(params.zoneName);
+    const rawName = String(params.name || "").trim().replace(/\.+$/, "");
+    const fqdn = !rawName || rawName === "@" ? zone : rawName.toLowerCase().endsWith(`.${zone}`) ? rawName.toLowerCase() : `${rawName.toLowerCase()}.${zone}`;
+
+    // 1. 优先从稳健的全量列表拉取进行双层本地比对
+    let list: HuaweiRecordSet[] = [];
+    try {
+      list = await this.listAllRawRecordSets(params.zoneId);
+    } catch {
+      // 容错降级
+    }
+
+    if (list.length > 0) {
+      // 1.1 第一优先级：精确匹配 (fqdn, type, line)
+      const exactMatch = list.find(
+        (rs) =>
+          stripTrailingDot(rs.name) === fqdn &&
+          String(rs.type).toUpperCase() === type &&
+          isHuaweiLineEqual(rs.line, params.line)
+      );
+      if (exactMatch) return exactMatch;
+
+      // 1.2 第二优先级（强力兜底）：同名同类型匹配
+      // 在公网解析场景下，一旦上游返回 409 Conflict，说明该同名同类型的 RecordSet 已经存在。
+      // 华为云可能将默认线路返回为 null/undefined/""/"default_view"，无论如何该 FQDN+Type 均属同一个 RecordSet
+      const sameTypeRecords = list.filter(
+        (rs) => stripTrailingDot(rs.name) === fqdn && String(rs.type).toUpperCase() === type
+      );
+      if (sameTypeRecords.length === 1) {
+        return sameTypeRecords[0];
+      }
+      if (sameTypeRecords.length > 1) {
+        // 多条记录集时，优先匹配默认线路
+        const defaultMatch = sameTypeRecords.find((rs) => isHuaweiDefaultLine(rs.line));
+        if (defaultMatch) return defaultMatch;
+        return sameTypeRecords[0];
+      }
+
+      // 1.3 若未找到同名同类型，检查是否已存在同名但不同类型的互斥记录集（例如已存在 CNAME）
+      const conflictRecord = list.find((rs) => stripTrailingDot(rs.name) === fqdn);
+      if (conflictRecord && String(conflictRecord.type).toUpperCase() !== type) {
+        throw new Error(
+          `该主机名已存在同名 ${conflictRecord.type} 解析记录（记录值: ${conflictRecord.records?.join(", ") || "(空)"}），DNS 规范不允许 ${conflictRecord.type} 与 ${type} 共存，请先删除该 ${conflictRecord.type} 记录后再添加`
+        );
+      }
+    }
+
+    // 2. 备用尝试：带 name / type 查询（分带点和不带点兼容各网关版本）
+    try {
+      const res = await this.request<{ recordsets?: HuaweiRecordSet[] }>(
+        "GET",
+        `/v2/zones/${encodeURIComponent(String(params.zoneId))}/recordsets`,
+        {
+          query: {
+            name: `${fqdn}.`,
+            type,
+            limit: HUAWEI_PAGE_SIZE,
+          },
+        }
+      );
+      const queryList = Array.isArray(res.recordsets) ? res.recordsets : [];
+      const found = queryList.find(
+        (rs) =>
+          stripTrailingDot(rs.name) === fqdn &&
+          String(rs.type).toUpperCase() === type
+      );
+      if (found) return found;
+    } catch {
+      // 容错
+    }
+
+    try {
+      const res = await this.request<{ recordsets?: HuaweiRecordSet[] }>(
+        "GET",
+        `/v2/zones/${encodeURIComponent(String(params.zoneId))}/recordsets`,
+        {
+          query: {
+            name: fqdn,
+            type,
+            limit: HUAWEI_PAGE_SIZE,
+          },
+        }
+      );
+      const queryList = Array.isArray(res.recordsets) ? res.recordsets : [];
+      const found = queryList.find(
+        (rs) =>
+          stripTrailingDot(rs.name) === fqdn &&
+          String(rs.type).toUpperCase() === type
+      );
+      if (found) return found;
+    } catch {
+      // 容错
+    }
+
+    return null;
   }
 
   /**
@@ -486,6 +674,7 @@ export class HuaweiCloudClient {
    * NOTE: 华为云要求记录名是**带尾点的完整域名**，值里 CNAME/MX/NS/SRV/PTR 类目标
    * 也必须带尾点。MX / SRV 的优先级写在值前缀（与阿里云一致）。
    * 面板传进来的 name 是相对名（路由层 normalizeDnsRecordName 产出），这里补全。
+   * 公网域名的 TTL 合法范围为 300 ~ 2147483647，小于 300 一律安全兜底为 300。
    */
   private buildRecordSetPayload(params: {
     zoneId: string;
@@ -502,23 +691,16 @@ export class HuaweiCloudClient {
     const rawName = String(params.name || "").trim().replace(/\.+$/, "");
     const fqdn = !rawName || rawName === "@" ? zone : rawName.toLowerCase().endsWith(`.${zone}`) ? rawName.toLowerCase() : `${rawName.toLowerCase()}.${zone}`;
 
-    let content = String(params.content || "").trim();
-    const priority = Number(params.priority);
-    if ((type === "MX" || type === "SRV") && Number.isFinite(priority) && priority >= 0 && !/^\d+\s+/.test(content)) {
-      content = `${priority} ${content}`;
-    }
-    // 目标类记录的值必须带尾点，否则华为云会拒绝
-    if (["CNAME", "MX", "NS", "SRV", "PTR"].includes(type) && content && !content.endsWith(".")) {
-      content = `${content}.`;
-    }
+    const content = formatHuaweiRecordContent(type, params.content, params.priority);
+    const safeTtl = Number(params.ttl) >= 300 ? Number(params.ttl) : 300;
 
     const payload: Record<string, unknown> = {
       name: `${fqdn}.`,
       type,
-      ttl: Number(params.ttl) > 0 ? Number(params.ttl) : 300,
+      ttl: safeTtl,
       records: [content],
     };
-    if (params.line && params.line !== "default") {
+    if (params.line && !isHuaweiDefaultLine(params.line)) {
       payload.line = params.line;
     }
 
@@ -528,9 +710,8 @@ export class HuaweiCloudClient {
   /**
    * 创建 DNS 解析记录
    *
-   * NOTE: 华为云的 CreateRecordSet 对「同名同类型已存在」会返回 409 —— 这正是
-   * RRset 模型的语义（应该改用更新把新值并进去）。这里翻译成明确的中文指引，
-   * 而不是让用户对着一句 Conflict 发愣。
+   * NOTE: 华为云的 CreateRecordSet 对「同名同类型已存在」会返回 409。
+   * 这里捕获冲突并自动调用 PUT 并入现有的 Recordset，真正符合 RRset 模型的自然语义。
    */
   async createDnsRecord(params: {
     zoneId: string;
@@ -544,34 +725,283 @@ export class HuaweiCloudClient {
     record_id?: string | number;
   }): Promise<CreateDnsRecordResponse> {
     const payload = this.buildRecordSetPayload(params);
-    const res = await this.request<HuaweiRecordSet>(
-      "POST",
-      `/v2/zones/${encodeURIComponent(params.zoneId)}/recordsets`,
-      { body: payload }
-    );
-    return {
-      success: true,
-      record: res?.id
-        ? {
-            id: res.id,
-            name: stripTrailingDot(res.name),
-            type: String(res.type || params.type).toUpperCase(),
+    try {
+      const res = await this.request<HuaweiRecordSet>(
+        "POST",
+        `/v2/zones/${encodeURIComponent(params.zoneId)}/recordsets`,
+        { body: payload }
+      );
+      return {
+        success: true,
+        record: res?.id
+          ? {
+              id: res.id,
+              name: stripTrailingDot(res.name),
+              type: String(res.type || params.type).toUpperCase(),
+              content: params.content,
+              ttl: Number(res.ttl) >= 300 ? Number(res.ttl) : (Number(params.ttl) >= 300 ? Number(params.ttl) : 300),
+              priority: null,
+              line: params.line || null,
+              proxied: false,
+            }
+          : undefined,
+      };
+    } catch (e: unknown) {
+      const errObj = e as any;
+      const isConflict =
+        (e instanceof HuaweiApiError || (e && typeof e === "object" && ("httpStatus" in errObj || "code" in errObj))) &&
+        (errObj.httpStatus === 409 ||
+          errObj.code === "DNS.0304" ||
+          errObj.code === "DNS.0312" ||
+          /record\s*set.*exist/i.test(errObj.rawMessage || errObj.message || "") ||
+          /conflict/i.test(errObj.rawMessage || errObj.message || ""));
+
+      if (!isConflict) {
+        throw e;
+      }
+
+      // 409/400 冲突：同名同类型 RecordSet 已存在，自动并入
+      // 华为云主从同步延迟兜底：阶梯重试检索已有记录集（300ms, 800ms, 1500ms）
+      let existing = await this.findRecordSet(params);
+      const retryDelays = [300, 800, 1500];
+      for (const delay of retryDelays) {
+        if (existing) break;
+        await new Promise((r) => setTimeout(r, delay));
+        existing = await this.findRecordSet(params);
+      }
+      if (!existing) {
+        throw e;
+      }
+
+      const formattedVal = formatHuaweiRecordContent(params.type, params.content, params.priority);
+      const existingRecords = Array.isArray(existing.records) ? existing.records : [];
+
+      // 若已经包含该记录值，直接幂等返回成功
+      if (existingRecords.includes(formattedVal)) {
+        const valIdx = existingRecords.indexOf(formattedVal);
+        return {
+          success: true,
+          record: {
+            id: existingRecords.length > 1 ? `${existing.id}#${valIdx}` : existing.id,
+            name: stripTrailingDot(existing.name),
+            type: String(existing.type).toUpperCase(),
             content: params.content,
-            ttl: Number(res.ttl) || Number(params.ttl) || 300,
+            ttl: Number(existing.ttl) >= 300 ? Number(existing.ttl) : (Number(params.ttl) >= 300 ? Number(params.ttl) : 300),
             priority: null,
-            line: params.line || null,
+            line: existing.line || null,
             proxied: false,
-          }
-        : undefined,
-    };
+          },
+        };
+      }
+
+      // 华为云单个 RecordSet 限制最多 20 条记录值
+      if (existingRecords.length >= 20) {
+        throw new Error("华为云单个记录集最多包含 20 个记录值，已达上限");
+      }
+
+      // Set 去重，彻底防止 DNS.0308 重复值错误
+      const updatedRecords = Array.from(new Set([...existingRecords, formattedVal]));
+      const safeTtl = Number(params.ttl) >= 300 ? Number(params.ttl) : (Number(existing.ttl) >= 300 ? Number(existing.ttl) : 300);
+      // NOTE: 华为云 UpdateRecordSet API（PUT /v2/zones/{zone_id}/recordsets/{recordset_id}）
+      // 官方规范 Body 仅接收 records / ttl / description。严禁下发 name / type / line，
+      // 否则华为云网关会触发唯一性校验判定同名冲突，返回 409 DNS.0304！
+      const putBody: Record<string, unknown> = {
+        records: updatedRecords,
+        ttl: safeTtl,
+      };
+
+      await this.request(
+        "PUT",
+        `/v2/zones/${encodeURIComponent(params.zoneId)}/recordsets/${encodeURIComponent(existing.id)}`,
+        { body: putBody }
+      );
+
+      return {
+        success: true,
+        record: {
+          id: `${existing.id}#${updatedRecords.length - 1}`,
+          name: stripTrailingDot(existing.name),
+          type: String(existing.type).toUpperCase(),
+          content: params.content,
+          ttl: safeTtl,
+          priority: null,
+          line: existing.line || null,
+          proxied: false,
+        },
+      };
+    }
   }
 
   /**
-   * 修改 DNS 解析记录（PUT 整条覆盖一条 Recordset）
+   * 批量创建/合并 DNS 解析记录
    *
-   * NOTE: 华为云的 UpdateRecordSet 只接受 name/type/ttl/records 四个字段（zone_id
-   * 走路径）。record_id 若形如 `<uuid>#<idx>`（多值展开产生的行）需要剥掉下标 ——
-   * 整条 Recordset 共用一个真实 id。
+   * 按 (name, type, line) 自动分组聚合，针对同组多值一次性提交，大幅减少 API 请求并避免冲突。
+   */
+  async batchCreateDnsRecords(params: {
+    zoneId: string;
+    zoneName: string;
+    items: Array<{
+      type: string;
+      name: string;
+      content: string;
+      ttl?: number;
+      priority?: number;
+      line?: string;
+    }>;
+  }): Promise<{
+    results: Array<{ label: string; success: boolean; message: string }>;
+    successCount: number;
+    failCount: number;
+  }> {
+    const results: Array<{ label: string; success: boolean; message: string }> = [];
+    let successCount = 0;
+    let failCount = 0;
+
+    interface GroupItem {
+      raw: (typeof params.items)[0];
+      formattedVal: string;
+    }
+    const groups = new Map<
+      string,
+      {
+        name: string;
+        type: string;
+        line?: string;
+        ttl: number;
+        items: GroupItem[];
+      }
+    >();
+
+    for (const item of params.items) {
+      const type = String(item.type || "").trim().toUpperCase();
+      const rawName = String(item.name ?? "").trim();
+      const line = item.line && item.line !== "default" ? item.line : undefined;
+      const ttl = Number(item.ttl) >= 300 ? Number(item.ttl) : 300;
+      const formattedVal = formatHuaweiRecordContent(type, item.content, item.priority);
+
+      const groupKey = `${type}:::${rawName}:::${line || ""}`;
+      if (!groups.has(groupKey)) {
+        groups.set(groupKey, {
+          name: rawName,
+          type,
+          line,
+          ttl,
+          items: [],
+        });
+      }
+      groups.get(groupKey)!.items.push({ raw: item, formattedVal });
+    }
+
+    for (const group of groups.values()) {
+      try {
+        const existing = await this.findRecordSet({
+          zoneId: params.zoneId,
+          zoneName: params.zoneName,
+          type: group.type,
+          name: group.name,
+          line: group.line,
+        });
+
+        if (!existing) {
+          // 不存在该 RecordSet：一次性 POST 创建该组全部记录
+          const uniqueValues: string[] = [];
+          for (const it of group.items) {
+            if (!uniqueValues.includes(it.formattedVal)) {
+              uniqueValues.push(it.formattedVal);
+            }
+          }
+
+          const zone = stripTrailingDot(params.zoneName);
+          const rawName = group.name.replace(/\.+$/, "");
+          const fqdn = !rawName || rawName === "@" ? zone : rawName.toLowerCase().endsWith(`.${zone}`) ? rawName.toLowerCase() : `${rawName.toLowerCase()}.${zone}`;
+
+          const toAdd = uniqueValues.slice(0, 20);
+          const payload: Record<string, unknown> = {
+            name: `${fqdn}.`,
+            type: group.type,
+            ttl: group.ttl,
+            records: toAdd,
+          };
+          if (group.line) payload.line = group.line;
+
+          await this.request("POST", `/v2/zones/${encodeURIComponent(params.zoneId)}/recordsets`, { body: payload });
+
+          for (const it of group.items) {
+            const label = `${it.raw.type || "?"} ${it.raw.name} → ${it.raw.content || "(空)"}`;
+            if (toAdd.includes(it.formattedVal)) {
+              successCount++;
+              results.push({ label, success: true, message: "创建成功" });
+            } else {
+              failCount++;
+              results.push({ label, success: false, message: "华为云单个记录集最多包含 20 个记录值，超出上限" });
+            }
+          }
+        } else {
+          // 已存在 RecordSet：合并现有值与待添加的值
+          const existingRecords = Array.isArray(existing.records) ? [...existing.records] : [];
+          const newToAdd: string[] = [];
+
+          for (const it of group.items) {
+            if (!existingRecords.includes(it.formattedVal) && !newToAdd.includes(it.formattedVal)) {
+              newToAdd.push(it.formattedVal);
+            }
+          }
+
+          const combined = [...existingRecords];
+          const acceptedNewValues = new Set<string>();
+
+          for (const val of newToAdd) {
+            if (combined.length < 20) {
+              combined.push(val);
+              acceptedNewValues.add(val);
+            }
+          }
+
+          if (acceptedNewValues.size > 0) {
+            await this.request(
+              "PUT",
+              `/v2/zones/${encodeURIComponent(params.zoneId)}/recordsets/${encodeURIComponent(existing.id)}`,
+              {
+                body: {
+                  ttl: group.ttl || Number(existing.ttl) || 300,
+                  records: combined,
+                },
+              }
+            );
+          }
+
+          for (const it of group.items) {
+            const label = `${it.raw.type || "?"} ${it.raw.name} → ${it.raw.content || "(空)"}`;
+            if (existingRecords.includes(it.formattedVal)) {
+              successCount++;
+              results.push({ label, success: true, message: "记录已存在（已自动合并）" });
+            } else if (acceptedNewValues.has(it.formattedVal)) {
+              successCount++;
+              results.push({ label, success: true, message: "已并入现有记录集" });
+            } else {
+              failCount++;
+              results.push({ label, success: false, message: "华为云单个记录集最多包含 20 个记录值，超出上限" });
+            }
+          }
+        }
+      } catch (err: unknown) {
+        const errMsg = err instanceof Error ? err.message : "创建失败";
+        for (const it of group.items) {
+          const label = `${it.raw.type || "?"} ${it.raw.name} → ${it.raw.content || "(空)"}`;
+          failCount++;
+          results.push({ label, success: false, message: errMsg });
+        }
+      }
+    }
+
+    return { results, successCount, failCount };
+  }
+
+  /**
+   * 修改 DNS 解析记录
+   *
+   * NOTE: record_id 若形如 `<uuid>#<idx>`（多值展开产生的行），只更新该下标对应的单项值，
+   * 完整保留同条 Recordset 内的其他值，避免覆盖抹除。
    */
   async updateDnsRecord(params: {
     zoneId: string;
@@ -580,26 +1010,158 @@ export class HuaweiCloudClient {
     type: string;
     name: string;
     content: string;
+    originContent?: string;
     ttl?: number;
     priority?: number;
     line?: string;
   }): Promise<ActionResponse> {
-    const recordSetId = String(params.record_id).split("#")[0];
+    const rawId = String(params.record_id);
+    const [recordSetId, idxStr] = rawId.split("#");
+    const targetIdx = idxStr !== undefined && idxStr !== "" ? parseInt(idxStr, 10) : -1;
+
+    const existing = await this.getRecordSetById(params.zoneId, recordSetId);
+    if (!existing) {
+      throw new Error("未在上游找到该解析记录（可能已被删除），请刷新记录列表后重试");
+    }
+
+    const type = String(params.type || existing.type || "").trim().toUpperCase();
+    const zone = stripTrailingDot(params.zoneName);
+    const rawName = String(params.name || "").trim().replace(/\.+$/, "");
+    const targetFqdn = !rawName || rawName === "@"
+      ? `${zone}.`
+      : rawName.toLowerCase().endsWith(`.${zone}`)
+      ? `${rawName.toLowerCase()}.`
+      : `${rawName.toLowerCase()}.${zone}.`;
+
+    const existingFqdn = existing.name.toLowerCase();
+    const nameChanged = targetFqdn.toLowerCase() !== existingFqdn;
+    const typeChanged = existing.type.toUpperCase() !== type;
+    const existingLine = existing.line || "default";
+    const targetLine = params.line && params.line !== "default" ? params.line : "default";
+    const lineChanged = existingLine !== targetLine;
+
+    // 当主机记录 (name)、类型 (type) 或解析线路 (line) 改变时，属于 RecordSet 跨归属迁移
+    if (nameChanged || typeChanged || lineChanged) {
+      // 1. 事务安全铁律：先加后删（Add-Before-Delete）
+      // 先将新记录安全并入目标 (name, type, line) 下，自动处理已有合并与去重
+      // 若目标添加失败（例如超限 20 条、上游校验报错等），在此处抛出异常并中断，原记录完好无损！
+      const safeTtl = Number(params.ttl) >= 300 ? Number(params.ttl) : (Number(existing.ttl) >= 300 ? Number(existing.ttl) : 300);
+      const createRes = await this.createDnsRecord({
+        zoneId: params.zoneId,
+        zoneName: params.zoneName,
+        type,
+        name: params.name,
+        content: params.content,
+        ttl: safeTtl,
+        priority: params.priority,
+        line: params.line,
+      });
+
+      // 2. 目标确认添加/合并成功后，再从原 RecordSet 中剥离旧值或删除旧记录
+      try {
+        const existingRecords = Array.isArray(existing.records) ? [...existing.records] : [];
+        if (existingRecords.length > 1) {
+          // 优先按记录值内容比对匹配要移除的项，防止批量连续修改时下标漂移（Index Drift）
+          const valToFind = formatHuaweiRecordContent(existing.type, params.originContent || params.content, params.priority);
+          let removeIdx = existingRecords.indexOf(valToFind);
+          if (removeIdx === -1 && targetIdx >= 0 && targetIdx < existingRecords.length) {
+            removeIdx = targetIdx;
+          }
+
+          if (removeIdx >= 0 && removeIdx < existingRecords.length) {
+            existingRecords.splice(removeIdx, 1);
+          }
+
+          if (existingRecords.length > 0) {
+            const putOldBody: Record<string, unknown> = {
+              ttl: Number(existing.ttl) >= 300 ? Number(existing.ttl) : 300,
+              records: existingRecords,
+            };
+            await this.request("PUT", `/v2/zones/${encodeURIComponent(params.zoneId)}/recordsets/${encodeURIComponent(recordSetId)}`, {
+              body: putOldBody,
+            });
+          } else {
+            await this.request("DELETE", `/v2/zones/${encodeURIComponent(params.zoneId)}/recordsets/${encodeURIComponent(recordSetId)}`);
+          }
+        } else {
+          // 原 RecordSet 只有这 1 项或单值，直接删除原 RecordSet
+          await this.request("DELETE", `/v2/zones/${encodeURIComponent(params.zoneId)}/recordsets/${encodeURIComponent(recordSetId)}`);
+        }
+      } catch (cleanErr) {
+        console.warn("清理华为云原解析记录失败（新记录已成功添加）:", cleanErr);
+      }
+
+      return createRes;
+    }
+
+    // 主机记录未改变（仅原地修改记录值、TTL 等）
+    const formattedVal = formatHuaweiRecordContent(type, params.content, params.priority);
+    const safeTtl = Number(params.ttl) >= 300 ? Number(params.ttl) : (Number(existing.ttl) >= 300 ? Number(existing.ttl) : 300);
+
+    if (targetIdx >= 0) {
+      // 多值展开的某一行：只替换对应下标的值，去重保留同组其余值
+      const records = Array.isArray(existing.records) ? [...existing.records] : [];
+      if (targetIdx < records.length) {
+        records[targetIdx] = formattedVal;
+      } else {
+        records.push(formattedVal);
+      }
+      const uniqueRecords = Array.from(new Set(records));
+      const putBody: Record<string, unknown> = {
+        ttl: safeTtl,
+        records: uniqueRecords,
+      };
+
+      await this.request("PUT", `/v2/zones/${encodeURIComponent(params.zoneId)}/recordsets/${encodeURIComponent(recordSetId)}`, {
+        body: putBody,
+      });
+      return { success: true };
+    }
+
+    // 单值记录集：直接覆盖（保留原有合法 fqdn 与线路）
+    const singlePutBody: Record<string, unknown> = {
+      ttl: safeTtl,
+      records: [formattedVal],
+    };
+
     await this.request("PUT", `/v2/zones/${encodeURIComponent(params.zoneId)}/recordsets/${encodeURIComponent(recordSetId)}`, {
-      body: this.buildRecordSetPayload(params),
+      body: singlePutBody,
     });
     return { success: true };
   }
 
   /**
-   * 删除 DNS 解析记录（删除整条 Recordset）
+   * 删除 DNS 解析记录
    *
-   * NOTE: 多值展开的行共用同一个 recordset id，删任意一行等于删掉整条 Recordset
-   * 的全部值 —— 这是 RRset 模型的固有语义（与 DigitalPlat 相同），前端在删除确认
-   * 弹窗里已对这类托管商做了「该操作会删除同名同类型的全部值」提示。
+   * NOTE: record_id 若形如 `<uuid>#<idx>` 且 Recordset 包含多个记录值时，只剔除对应下标的值，
+   * 剩余值通过 PUT 保留；只有当记录集仅剩最后 1 个值或无下标时才真正发 DELETE。
    */
   async deleteDnsRecord(zoneId: string | number, recordId: string | number): Promise<ActionResponse> {
-    const recordSetId = String(recordId).split("#")[0];
+    const rawId = String(recordId);
+    const [recordSetId, idxStr] = rawId.split("#");
+    const targetIdx = idxStr !== undefined && idxStr !== "" ? parseInt(idxStr, 10) : -1;
+
+    if (targetIdx >= 0) {
+      // 多值展开的某一行：只剔除该行对应的值；若只剩最后 1 个值则直接删整条
+      const existing = await this.getRecordSetById(zoneId, recordSetId);
+      if (existing && Array.isArray(existing.records) && existing.records.length > 1) {
+        const records = [...existing.records];
+        if (targetIdx < records.length) {
+          records.splice(targetIdx, 1);
+          const putRemainBody: Record<string, unknown> = {
+            ttl: Number(existing.ttl) || 300,
+            records,
+          };
+          await this.request("PUT", `/v2/zones/${encodeURIComponent(String(zoneId))}/recordsets/${encodeURIComponent(recordSetId)}`, {
+            body: putRemainBody,
+          });
+          return { success: true };
+        }
+      }
+    }
+
+
+    // 单值或最后一条值：删除整条 RecordSet
     await this.request(
       "DELETE",
       `/v2/zones/${encodeURIComponent(String(zoneId))}/recordsets/${encodeURIComponent(recordSetId)}`
@@ -649,4 +1211,36 @@ export function translateHuaweiError(code: string, message: string, httpStatus?:
 
   const detail = m ? `${c || "未知错误"}: ${m}` : c || "未知错误";
   return `华为云 DNS API 错误: ${detail}`;
+}
+
+/**
+ * 格式化华为云 RecordSet 的单条 record 字符串
+ * MX / SRV 带有优先级前缀，CNAME/MX/NS/SRV/PTR 带尾点
+ */
+export function formatHuaweiRecordContent(type: string, content: string, priority?: number): string {
+  const t = String(type || "").trim().toUpperCase();
+  let val = String(content || "").trim();
+  const pri = Number(priority);
+  if ((t === "MX" || t === "SRV") && Number.isFinite(pri) && pri >= 0 && !/^\d+\s+/.test(val)) {
+    val = `${pri} ${val}`;
+  }
+  if (["CNAME", "MX", "NS", "SRV", "PTR"].includes(t) && val && !val.endsWith(".")) {
+    val = `${val}.`;
+  }
+  return val;
+}
+
+/**
+ * 华为云 API 结构化错误类
+ */
+export class HuaweiApiError extends Error {
+  constructor(
+    message: string,
+    public readonly code: string,
+    public readonly httpStatus: number,
+    public readonly rawMessage: string
+  ) {
+    super(message);
+    this.name = "HuaweiApiError";
+  }
 }

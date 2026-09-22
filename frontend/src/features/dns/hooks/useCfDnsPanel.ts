@@ -30,6 +30,7 @@ export function useCfDnsPanel({ actionLoading, setActionLoading }: UseCfDnsPanel
     cfBatchResults, cfBatchTextareaRef, cfEditingKey, setCfEditingKey, cfEditType, setCfEditType, cfEditLine, setCfEditLine,
     cfEditName, setCfEditName, cfEditContent, setCfEditContent, cfEditTtl, setCfEditTtl, cfEditPriority, setCfEditPriority,
     cfEditProxied, setCfEditProxied, cfEditPanelOpen, setCfEditPanelOpen, cfEditFields, setCfEditFields,
+    cfBatchEditName, setCfBatchEditName,
     cfBatchEditTtl, setCfBatchEditTtl, cfBatchEditProxied, setCfBatchEditProxied, cfBatchEditContents, setCfBatchEditContents, cfEditResults,
   } = state;
   const { cfValidBatchLines, handleCfBatchCreate, handleCfCreateRecord, handleCfOpenEditPanel, handleCfBatchUpdateRecords, handleCfBatchDeleteRecords,
@@ -80,6 +81,7 @@ export function useCfDnsPanel({ actionLoading, setActionLoading }: UseCfDnsPanel
     onToggleAllSelection: actions.cfToggleAllSelection,
     editPanelOpen: cfEditPanelOpen, setEditPanelOpen: setCfEditPanelOpen,
     editFields: cfEditFields, setEditFields: setCfEditFields,
+    batchEditName: cfBatchEditName, setBatchEditName: setCfBatchEditName,
     batchEditTtl: cfBatchEditTtl, setBatchEditTtl: setCfBatchEditTtl,
     batchEditProxied: cfBatchEditProxied, setBatchEditProxied: setCfBatchEditProxied,
     batchEditContents: cfBatchEditContents, setBatchEditContents: setCfBatchEditContents,

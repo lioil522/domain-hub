@@ -30,6 +30,62 @@ export class DnsService {
     return result;
   }
 
+  async batchCreate(
+    domain: DBDomain,
+    inputs: DnsRecordInput[],
+    options?: {
+      fallbackItemHandler?: (input: DnsRecordInput) => Promise<void>;
+      sleep?: (ms: number) => Promise<void>;
+    }
+  ) {
+    const { client, provider } = await this.db.getClientForAccount(domain.account_id);
+    const adapter = createDnsProviderAdapter(provider, client);
+
+    let batchResult: {
+      results: Array<{ label: string; success: boolean; message: string }>;
+      successCount: number;
+      failCount: number;
+    };
+
+    if (typeof adapter.batchCreateRecords === "function") {
+      batchResult = await adapter.batchCreateRecords({ domain, client }, inputs);
+    } else {
+      const results: Array<{ label: string; success: boolean; message: string }> = [];
+      let successCount = 0;
+      let failCount = 0;
+      for (const input of inputs) {
+        const label = `${input.type || "?"} ${input.name} → ${input.content || "(空)"}`;
+        if (!input.type || !input.content) {
+          failCount++;
+          results.push({ label, success: false, message: "记录类型与记录值均不能为空" });
+          continue;
+        }
+        try {
+          if (options?.fallbackItemHandler) {
+            await options.fallbackItemHandler(input);
+          } else {
+            const res = await adapter.createRecord({ domain, client }, input);
+            if (!res.success) throw new Error(res.message || "创建失败");
+          }
+          successCount++;
+          results.push({ label, success: true, message: "创建成功" });
+        } catch (e: unknown) {
+          failCount++;
+          results.push({ label, success: false, message: e instanceof Error ? e.message : "未知错误" });
+        }
+        if (options?.sleep) {
+          await options.sleep(300);
+        }
+      }
+      batchResult = { results, successCount, failCount };
+    }
+
+    if (batchResult.successCount > 0) {
+      await this.invalidate(domain.id);
+    }
+    return batchResult;
+  }
+
   async update(domain: DBDomain, recordId: string, input: DnsRecordInput) {
     const { client, provider } = await this.db.getClientForAccount(domain.account_id);
     const result = await createDnsProviderAdapter(provider, client).updateRecord({ domain, client }, recordId, input);

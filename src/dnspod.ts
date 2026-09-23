@@ -57,7 +57,7 @@ interface Tc3SignedHeaders {
  * 最常见的误填在本地就拦下来，不必浪费一次上游调用去换一句难懂的报错。
  */
 export function looksLikeTencentSecretId(value: string): boolean {
-  return /^AKID[A-Za-z0-9]{5,}$/.test(String(value || "").trim());
+  return /^(AKID|IKID)[A-Za-z0-9]{5,}$/.test(String(value || "").trim());
 }
 
 /** 把 ArrayBuffer 编成小写十六进制 */

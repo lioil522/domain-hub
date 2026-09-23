@@ -36,7 +36,7 @@ export const MULTI_PROVIDER_META: Record<
     primaryLabel: "SecretId",
     secondaryLabel: "SecretKey",
     credentialHint:
-      "请到腾讯云控制台「访问管理 → API 密钥管理」创建密钥。注意：DNSPod 控制台里的「API Token」是另一套凭据，本面板使用腾讯云 API 密钥（SecretId 以 AKID 开头）。",
+      "请到腾讯云控制台「访问管理 → API 密钥管理」创建密钥。注意：DNSPod 控制台里的「API Token」是另一套凭据，本面板使用腾讯云 API 密钥（SecretId 以 AKID 或 IKID 开头）。",
     singleCredential: false,
     batchField: "api_key",
     batchHint: "每行一条，格式：SecretId,SecretKey 或 SecretId,SecretKey,别名",

@@ -107,7 +107,7 @@ export async function addAccount(
   } else if (provider === "dnspod") {
     if (!looksLikeTencentSecretId(apiKey)) {
       throw new Error(
-        "DNSPod 的 SecretId 格式不正确（应以 AKID 开头，来自腾讯云「访问管理 → API 密钥管理」）；" +
+        "DNSPod 的 SecretId 格式不正确（应以 AKID 或 IKID 开头，来自腾讯云「访问管理 → API 密钥管理」）；" +
           "请注意 DNSPod 控制台里的「API Token」是另一套凭据，本面板使用腾讯云 API 密钥"
       );
     }

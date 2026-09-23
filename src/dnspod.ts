@@ -414,6 +414,11 @@ export class DnspodClient {
       );
     } catch (e: unknown) {
       if (e instanceof Error && (e.message.includes("QuhuiTxtRecordWait") || e.message.includes("_dnspodcheck"))) {
+        const isIntl = /(^|:)IKID/i.test(this.secretId) || this.secretId.startsWith("IKID");
+        if (isIntl) {
+          throw new Error("添加子域请到国际版DNSPod控制台");
+        }
+
         // 尝试自动通过 CreateSubdomainValidateTXTValue 获取上游生成的专属 TXT 记录值
         let txtValue: string | undefined = undefined;
         try {

@@ -74,6 +74,28 @@ console.log("多服务商添加域名 (CreateDomain) 单元测试开始...");
   console.log("  ✓ DNSPod 子域名遇 QuhuiTxtRecordWait 时正确提取 TXT 专属授权校验结构");
 }
 
+// 1.2 DNSPod 国际站（IKID）子域拦截并引导场景
+{
+  const client = new DnspodClient("IKIDtest", "testkey");
+  (client as any).request = async (action: string) => {
+    if (action === "CreateDomain") {
+      throw new Error("InvalidParameter.QuhuiTxtRecordWait: TXT record not set or haven't taken effect. Retry later..");
+    }
+    throw new Error(`Unexpected action: ${action}`);
+  };
+
+  const adapter = new LegacyDomainProviderAdapter("dnspod", client);
+  await assert.rejects(
+    async () => {
+      await adapter.createDomain("lvl.cn.mt");
+    },
+    (err: Error) => {
+      return err.message.includes("添加子域请到国际版DNSPod控制台");
+    }
+  );
+  console.log("  ✓ DNSPod 国际站（IKID）添加子域时成功拦截并提示引导至国际版控制台");
+}
+
 // 2. Cloudflare
 {
   const client = new CloudflareClient("cftoken123");

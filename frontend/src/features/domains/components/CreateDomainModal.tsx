@@ -51,6 +51,36 @@ const PROVIDER_LABELS: Record<string, string> = {
   vercel: "Vercel",
 };
 
+/**
+ * 判断是否为 DNSPod 国际站账号（SecretId 以 IKID 开头）
+ */
+export function isDnspodIntlAccount(account?: Account): boolean {
+  if (!account || account.provider !== "dnspod") return false;
+  const key = String(account.api_key || "");
+  return /(^|:)IKID/i.test(key);
+}
+
+/**
+ * 获取账号服务商展示名（区分 DNSPod 中国站 / 国际站）
+ */
+export function getAccountProviderLabel(account?: Account): string {
+  if (!account) return "";
+  if (account.provider === "dnspod") {
+    return isDnspodIntlAccount(account) ? "DNSPod 国际站" : "DNSPod 中国站";
+  }
+  return PROVIDER_LABELS[account.provider || ""] || account.provider || "";
+}
+
+/**
+ * 判断输入是否为子域名（段数 >= 3，如 lvl.cn.mt、sub.example.com）
+ */
+export function isLikelySubdomain(domain: string): boolean {
+  const trimmed = domain.trim().toLowerCase().replace(/\.+$/, "");
+  if (!trimmed) return false;
+  const parts = trimmed.split(".");
+  return parts.length >= 3;
+}
+
 export function CreateDomainModal({
   open,
   onClose,
@@ -146,6 +176,12 @@ export function CreateDomainModal({
       return;
     }
 
+    // 针对 DNSPod 国际站限制添加子域
+    if (isDnspodIntlAccount(currentAccount) && isLikelySubdomain(domain)) {
+      setErrorMsg("INTL_SUBDOMAIN_BLOCKED");
+      return;
+    }
+
     setSubmitting(true);
     setErrorMsg(null);
 
@@ -172,6 +208,10 @@ export function CreateDomainModal({
     } catch (err: unknown) {
       if (isApiRequestError(err)) {
         const payload = err.payload as any;
+        if (payload?.message?.includes("国际版DNSPod控制台") || payload?.error?.includes("国际版DNSPod控制台")) {
+          setErrorMsg("INTL_SUBDOMAIN_BLOCKED");
+          return;
+        }
         if (payload?.need_txt_verify && payload?.verify_info) {
           setTxtVerifyInfo({
             ...payload.verify_info,
@@ -221,10 +261,10 @@ export function CreateDomainModal({
               <p className="text-xs text-content-muted mt-0.5 truncate">
                 {currentAccount ? (
                   <>
-                    所属账号: <span className="font-semibold text-accent">[{PROVIDER_LABELS[currentAccount.provider || ""] || currentAccount.provider}] {currentAccount.alias}</span> · 
+                    所属账号: <span className="font-semibold text-accent">[{getAccountProviderLabel(currentAccount)}] {currentAccount.alias}</span> · 
                   </>
                 ) : null}
-                支持添加主域或独立子域
+                {isDnspodIntlAccount(currentAccount) ? "国际站仅支持添加主域名" : "支持添加主域或独立子域"}
               </p>
             </div>
           </div>
@@ -535,17 +575,77 @@ export function CreateDomainModal({
                   autoFocus
                 />
                 <p className="text-xs text-content-muted mt-1.5 leading-relaxed">
-                  支持主域名（如 <code className="text-content-secondary">test.com</code>）或独立委派的子域名（如 <code className="text-content-secondary">sub.test.com</code>）。
+                  {isDnspodIntlAccount(currentAccount) ? (
+                    <>DNSPod 国际站仅支持添加主域名（如 <code className="text-content-secondary">example.com</code>）。</>
+                  ) : (
+                    <>支持主域名（如 <code className="text-content-secondary">test.com</code>）或独立委派的子域名（如 <code className="text-content-secondary">sub.test.com</code>）。</>
+                  )}
                 </p>
+
+                {/* 国际站实时输入子域时的内联提示 */}
+                {isDnspodIntlAccount(currentAccount) && isLikelySubdomain(domainInput) ? (
+                  <div className="p-2.5 rounded-xl bg-amber-500/10 border border-amber-500/25 text-amber-300 text-xs flex items-center justify-between gap-2 mt-2 animate-in fade-in">
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <AlertCircle className="w-4 h-4 flex-shrink-0 text-amber-400" />
+                      <span className="truncate">
+                        添加子域请到{" "}
+                        <a
+                          href="https://console.intl.cloud.tencent.com/cns"
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="font-bold underline hover:text-amber-100 inline-flex items-center gap-0.5"
+                        >
+                          国际版DNSPod控制台
+                          <ExternalLink className="w-3 h-3" />
+                        </a>
+                      </span>
+                    </div>
+                    <a
+                      href="https://console.intl.cloud.tencent.com/cns"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="px-2 py-0.5 rounded bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 text-[11px] font-medium transition-colors flex items-center gap-1 flex-shrink-0"
+                    >
+                      前往控制台
+                      <ExternalLink className="w-2.5 h-2.5" />
+                    </a>
+                  </div>
+                ) : null}
               </div>
 
               {/* 错误提示 */}
-              {errorMsg && (
+              {errorMsg === "INTL_SUBDOMAIN_BLOCKED" ? (
+                <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/25 text-amber-300 text-xs flex items-center justify-between gap-2 animate-in fade-in">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <AlertCircle className="w-4 h-4 flex-shrink-0 text-amber-400" />
+                    <span>
+                      添加子域请到{" "}
+                      <a
+                        href="https://console.intl.cloud.tencent.com/cns"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="font-bold underline hover:text-amber-100 inline-flex items-center gap-0.5"
+                      >
+                        国际版DNSPod控制台
+                        <ExternalLink className="w-3.5 h-3.5" />
+                      </a>
+                    </span>
+                  </div>
+                  <a
+                    href="https://console.intl.cloud.tencent.com/cns"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="px-2.5 py-1 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 text-xs font-medium transition-colors flex items-center gap-1 flex-shrink-0"
+                  >
+                    跳转控制台 <ExternalLink className="w-3 h-3" />
+                  </a>
+                </div>
+              ) : errorMsg ? (
                 <div className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/25 text-rose-300 text-xs flex items-center gap-2 animate-in fade-in">
                   <AlertCircle className="w-4 h-4 flex-shrink-0" />
                   <span>{errorMsg}</span>
                 </div>
-              )}
+              ) : null}
             </div>
 
             {/* 表单底部按钮 */}

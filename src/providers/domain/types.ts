@@ -21,4 +21,5 @@ export interface DomainProviderAdapter {
   getNameservers(domain: DBDomain): Promise<DomainOperationResult<NameserverResult>>;
   updateNameservers(domain: DBDomain, nameservers: string[]): Promise<DomainOperationResult<NameserverResult>>;
   registerSubdomain(subdomain: string, rootdomain: string): Promise<DomainOperationResult<{ full_domain: string; subdomain_id: number }>>;
+  createDomain?(domain: string): Promise<DomainOperationResult<{ domain: UpstreamSubdomain; nameservers?: string[] }>>;
 }

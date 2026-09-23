@@ -30,4 +30,11 @@ export const domainsApi = {
   updateNameservers(apiFetch: ApiFetch, id: number, body: Record<string, unknown>) {
     return apiJson(apiFetch, `/api/domains/${id}/nameservers`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify(body) });
   },
+  create(apiFetch: ApiFetch, body: { account_id: number; domain: string }) {
+    return apiJson<{ domain?: Domain; nameservers?: string[]; message?: string }>(apiFetch, "/api/domains", {
+      method: "POST",
+      headers: jsonHeaders,
+      body: JSON.stringify(body),
+    });
+  },
 };

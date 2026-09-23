@@ -214,6 +214,7 @@ export interface HuaweiZoneInfo {
   zone_type?: string;
   created_at?: string;
   updated_at?: string;
+  nameservers?: string[];
 }
 
 /** 华为云 Recordset 原始形状（records 是值数组） */
@@ -471,6 +472,29 @@ export class HuaweiCloudClient {
       if (list.length < HUAWEI_PAGE_SIZE) break;
     }
     return zones;
+  }
+
+  /**
+   * 在华为云中创建公网域名（Zone，支持主域与子域）
+   *
+   * @param zoneName 域名，如 example.com 或 sub.example.com
+   */
+  async createZone(zoneName: string): Promise<HuaweiZoneInfo> {
+    const raw = String(zoneName || "").trim().toLowerCase();
+    if (!raw) {
+      throw new Error("域名不能为空");
+    }
+    const formatted = raw.endsWith(".") ? raw : `${raw}.`;
+    const res = await this.request<HuaweiZoneInfo>("POST", "/v2/zones", {
+      body: {
+        name: formatted,
+        zone_type: "public",
+      },
+    });
+    if (!res || !res.id) {
+      throw new Error("华为云创建公网域名失败，上游未返回数据");
+    }
+    return res;
   }
 
   /**

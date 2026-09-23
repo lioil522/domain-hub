@@ -329,6 +329,30 @@ export class AlidnsClient {
   }
 
   /**
+   * 在阿里云 DNS 中添加域名（支持主域与子域）
+   *
+   * @param domainName 域名，如 example.com 或 sub.example.com
+   */
+  async createDomain(domainName: string): Promise<AlidnsDomainInfo> {
+    const trimmed = String(domainName || "").trim().toLowerCase();
+    if (!trimmed) {
+      throw new Error("域名不能为空");
+    }
+    const xml = await this.requestXml("AddDomain", {
+      DomainName: trimmed,
+    });
+    const id = pickXml(xml, "DomainId");
+    const name = pickXml(xml, "DomainName") || trimmed;
+    const nsRaw = pickXmlBlocks(xml, "DnsServer").map((ns) => decodeXmlEntities(ns).trim()).filter(Boolean);
+    return {
+      DomainId: id,
+      DomainName: name,
+      RecordCount: 0,
+      DnsServers: nsRaw.length > 0 ? { DnsServer: nsRaw } : undefined,
+    };
+  }
+
+  /**
    * 分页列出域名下全部解析记录（映射为内部形状）
    *
    * NOTE: `domain` 参数即域名本身（阿里云 DescribeDomainRecords 以 DomainName 定位）。

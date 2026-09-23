@@ -72,6 +72,7 @@ import { useAppData } from "../state/AppDataContext";
 import { BindAccountModal } from "../features/accounts/components/BindAccountModal";
 import { EditAccountModal } from "../features/accounts/components/EditAccountModal";
 import { DeleteDomainModal } from "../features/domains/components/DeleteDomainModal";
+import { CreateDomainModal } from "../features/domains/components/CreateDomainModal";
 import { NameserverModal } from "../features/domains/components/NameserverModal";
 import { checkHasDns, getDnsProviderLabel } from "../lib/dns-status";
 import { DpNameserverModal } from "../features/domains/components/DpNameserverModal";
@@ -152,6 +153,10 @@ export function useAppControllerView() {
   const [dnsModalOpen, setDnsModalOpen] = useState(false);
   // NS 弹窗路径删除解析记录后，用它通知 DNSHE 弹窗重拉列表（弹窗本体见 DnsheDnsModal）
   const [dnsRefreshToken, setDnsRefreshToken] = useState(0);
+
+  // 在线添加域名弹窗状态（支持 DNSPod / Cloudflare / 阿里云 / 华为云 / Vercel）
+  const [createDomainModalOpen, setCreateDomainModalOpen] = useState(false);
+  const [createDomainDefaultAccountId, setCreateDomainDefaultAccountId] = useState<number | undefined>(undefined);
 
   // NS 修改弹窗状态（DNSHE + DigitalPlat）（实现见 features/domains/hooks/useNameservers）
   const {
@@ -598,6 +603,25 @@ export function useAppControllerView() {
   // 打开修改账号弹窗
   const openEditAccount = (acc: Account) => {
     setEditingAccount(acc);
+  };
+
+  // 打开添加域名弹窗
+  const handleOpenCreateDomain = (defaultAccountId?: number) => {
+    setCreateDomainDefaultAccountId(defaultAccountId);
+    setCreateDomainModalOpen(true);
+  };
+
+  // 添加域名成功后的全量列表刷新
+  const handleCreateDomainSuccess = async (_createdDomain?: Domain) => {
+    void fetchDomains();
+    void fetchCfZones();
+    MULTI_PROVIDER_ORDER.forEach((key) => void fetchMultiProviderDomains(key));
+  };
+
+  // 点击添加成功后的「立即配置解析」
+  const handleCreateDomainOpenDns = (createdDomain: Domain) => {
+    setCreateDomainModalOpen(false);
+    handleCfOpenDnsModal(createdDomain);
   };
 
 
@@ -1175,6 +1199,10 @@ export function useAppControllerView() {
             cfZones={cfZones}
             loadingCfZones={loadingCfZones}
             actionLoading={actionLoading}
+            onAddDomain={() => {
+              const preselected = cfAccountFilter !== "all" ? Number(cfAccountFilter) : cfAccountList[0]?.id;
+              handleOpenCreateDomain(preselected);
+            }}
             handleCfSyncZones={handleCfSyncZones}
             cfToggleAllAccounts={cfToggleAllAccounts}
             cfCollapsedAccounts={cfCollapsedAccounts}
@@ -1223,6 +1251,12 @@ export function useAppControllerView() {
                 domains={multiProviderData[key]}
                 loading={multiProviderLoading[key]}
                 actionLoading={actionLoading}
+                onAddDomain={() => {
+                  const filterVal = multiProviderFilter[key];
+                  const list = multiProviderAccountLists[key];
+                  const preselected = filterVal !== "all" ? Number(filterVal) : list[0]?.id;
+                  handleOpenCreateDomain(preselected);
+                }}
                 onSyncAll={() => handleMultiProviderSync(key)}
                 onToggleAllAccounts={() => multiToggleAllAccounts(key)}
                 collapsedAccounts={multiProviderCollapsed[key]}
@@ -1626,6 +1660,16 @@ export function useAppControllerView() {
           onSynced={handleSyncDnsheDomains}
         />
       )}
+
+      {/* 在线添加域名托管弹窗（支持 DNSPod / Cloudflare / 阿里云 DNS / 华为云 DNS / Vercel） */}
+      <CreateDomainModal
+        open={createDomainModalOpen}
+        onClose={() => setCreateDomainModalOpen(false)}
+        accounts={accounts}
+        defaultAccountId={createDomainDefaultAccountId}
+        onSuccess={handleCreateDomainSuccess}
+        onOpenDns={handleCreateDomainOpenDns}
+      />
 
       {/* 全局 Toast 通知 */}
       <ToastView toast={toast} animated />

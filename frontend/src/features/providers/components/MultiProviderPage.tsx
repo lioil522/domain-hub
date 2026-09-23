@@ -8,6 +8,7 @@ import {
   ChevronDown,
   Globe,
   Key,
+  Plus,
 } from "lucide-react";
 import { CustomSelect } from "../../../components/form/CustomSelect";
 import type { Account } from "../../../types/account";
@@ -46,6 +47,8 @@ export interface MultiProviderPageProps {
   actionLoading: string | null;
   /** 同步该托管商的全部账号域名 */
   onSyncAll: () => void;
+  /** 添加域名回调 */
+  onAddDomain?: () => void;
   /** 展开 / 收起全部分组 */
   onToggleAllAccounts: () => void;
   /** 已收起的分组账号 id */
@@ -74,6 +77,7 @@ export function MultiProviderPage(props: MultiProviderPageProps) {
     loading,
     actionLoading,
     onSyncAll,
+    onAddDomain,
     onToggleAllAccounts,
     collapsedAccounts,
     groupedDomains,
@@ -116,6 +120,17 @@ export function MultiProviderPage(props: MultiProviderPageProps) {
         </div>
 
         <div className="flex flex-wrap items-center gap-2 w-full md:w-auto md:justify-end">
+          {onAddDomain && (
+            <button
+              onClick={onAddDomain}
+              disabled={accountList.length === 0}
+              className="px-3.5 py-2 sm:py-1.5 text-xs font-semibold text-content-primary bg-surface-raised hover:bg-hovered border border-border-base rounded-lg transition-all flex items-center gap-1.5 whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
+              title={`在 ${meta.label} 添加域名`}
+            >
+              <Plus className="w-3.5 h-3.5 text-accent" />
+              添加域名
+            </button>
+          )}
           <button
             onClick={onSyncAll}
             disabled={accountList.length === 0 || actionLoading === `multi-sync-${providerKey}`}

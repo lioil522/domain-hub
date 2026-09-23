@@ -339,6 +339,36 @@ export class CloudflareClient {
   }
 
   /**
+   * 在 Cloudflare 中添加 Zone（域名）
+   *
+   * @param name 域名，如 example.com
+   * @param accountId Cloudflare 账号 ID（若不传则自动拉取当前 Token 下的首个可用账号）
+   */
+  async createZone(name: string, accountId?: string): Promise<CfZoneInfo> {
+    const trimmed = String(name || "").trim().toLowerCase();
+    if (!trimmed) {
+      throw new Error("域名不能为空");
+    }
+    let accId = accountId ? String(accountId).trim() : "";
+    if (!accId) {
+      const accounts = await this.listAccounts();
+      if (!accounts || accounts.length === 0) {
+        throw new Error("无法获取 Cloudflare 账号信息，请确认 Token 具备 Account:Read 权限");
+      }
+      accId = accounts[0].id;
+    }
+    const result = await this.request<CfZoneInfo>("POST", "/zones", undefined, {
+      name: trimmed,
+      account: { id: accId },
+      type: "full",
+    });
+    if (!result) {
+      throw new Error("Cloudflare 创建 Zone 失败，上游未返回数据");
+    }
+    return result;
+  }
+
+  /**
    * 列出 zone 下全部 DNS 解析记录（分页拉全，映射为内部形状）
    *
    * 合并 Worker 绑定信息：CF 在「Workers 自定义域」设置里绑定 Worker 后，会在

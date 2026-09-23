@@ -68,6 +68,74 @@ export function registerDomainRoutes(app: Hono<AppEnv>, deps: DomainRouteDeps) {
     }
   });
 
+  /**
+   * 1.5 在指定云服务商账号中添加/托管新域名（支持主域与子域）
+   */
+  app.post("/api/domains", async (c) => {
+    const dbManager = c.get("db");
+    try {
+      const body = await c.req.json().catch(() => ({}));
+      const accountId = Number(body?.account_id);
+      const rawDomain = String(body?.domain || "").trim();
+      if (!accountId || !rawDomain) {
+        return c.json(errorRes("必须提供 account_id 和 domain", "bad_request"), 400);
+      }
+
+      const domainName = toASCII(rawDomain.toLowerCase().replace(/\.+$/, ""));
+      if (!domainName) {
+        return c.json(errorRes("域名格式不正确", "bad_request"), 400);
+      }
+
+      const { client, alias, provider } = await dbManager.getClientForAccount(accountId);
+      const adapter = createDomainProviderAdapter(provider, client);
+
+      if (!adapter.createDomain) {
+        return c.json(errorRes(`${adapter.label} 暂不支持在面板中直接添加域名`, "not_supported"), 400);
+      }
+
+      const result = await adapter.createDomain(domainName);
+      if (!result.success || !result.data?.domain) {
+        return c.json(errorRes(result.message || "添加域名失败"), 400);
+      }
+
+      const createdUpstream = result.data.domain;
+      // 立即写入数据库缓存，无需等待定时同步
+      await dbManager.upsertAccountDomains(accountId, [createdUpstream]);
+
+      // 获取入库后的 Domain 实体以提供前端直接跳转解析所需的 domain_id
+      const domainRepo = new DomainRepository(dbManager);
+      const matched = await domainRepo.list(domainName, undefined, accountId);
+      const insertedDomain = matched.find(
+        (d) => d.full_domain.toLowerCase() === domainName.toLowerCase() || d.domain.toLowerCase() === domainName.toLowerCase()
+      ) || matched[0];
+
+      const nsList = result.data.nameservers || [];
+      const msg = `已成功在 [${alias}] (${adapter.label}) 下添加域名 [${domainName}]！`;
+      await logService(dbManager).write("success", "api", msg, { domain: domainName, nameservers: nsList });
+      await auditService(dbManager).write({
+        actor: "session",
+        action: "create",
+        resourceType: "domain",
+        resourceId: String(createdUpstream.id),
+        provider,
+        result: "success",
+        details: { domain: domainName, nameservers: nsList },
+      });
+
+      return c.json(
+        successRes({
+          message: msg,
+          domain: createdUpstream,
+          domain_id: insertedDomain?.id,
+          nameservers: nsList,
+        })
+      );
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : "添加域名发生错误";
+      return c.json(errorRes(message), 400);
+    }
+  });
+
   // 2. 立即全量同步所有账号的域名
   app.post("/api/domains/sync", async (c) => {
     const dbManager = c.get("db");

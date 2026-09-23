@@ -300,6 +300,26 @@ export class VercelClient {
   }
 
   /**
+   * 在 Vercel 中添加域名（支持主域与子域）
+   *
+   * @param domainName 域名，如 example.com 或 sub.example.com
+   */
+  async createDomain(domainName: string): Promise<VercelDomainInfo> {
+    const trimmed = String(domainName || "").trim().toLowerCase();
+    if (!trimmed) {
+      throw new Error("域名不能为空");
+    }
+    const res = await this.request<{ domain?: VercelDomainInfo } | VercelDomainInfo>("POST", "/v5/domains", {
+      body: { name: trimmed },
+    });
+    const info = (res && "domain" in res && res.domain ? res.domain : res) as VercelDomainInfo;
+    if (!info || !info.name) {
+      return { name: trimmed };
+    }
+    return info;
+  }
+
+  /**
    * 分页列出域名下全部 DNS 解析记录
    *
    * NOTE: `domain` 是域名本身（remote_id 存的就是它）。Vercel 的 records 接口

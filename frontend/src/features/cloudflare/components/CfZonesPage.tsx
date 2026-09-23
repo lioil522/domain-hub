@@ -8,6 +8,7 @@ import {
   ChevronDown,
   Cloud,
   Key,
+  Plus,
 } from "lucide-react";
 import { CustomSelect } from "../../../components/form/CustomSelect";
 import { CloudflareIcon } from "../../../components/icons/CloudflareIcon";
@@ -36,6 +37,8 @@ export interface CfZonesPageProps {
   loadingCfZones: boolean;
   /** 动作级 loading 标记 */
   actionLoading: string | null;
+  /** 打开「添加域名」弹窗 */
+  onAddDomain?: () => void;
   /** 全量同步 zones */
   handleCfSyncZones: () => void;
   /** 展开 / 收起全部分组 */
@@ -64,6 +67,7 @@ export function CfZonesPage(props: CfZonesPageProps) {
     cfZones,
     loadingCfZones,
     actionLoading,
+    onAddDomain,
     handleCfSyncZones,
     cfToggleAllAccounts,
     cfCollapsedAccounts,
@@ -105,6 +109,16 @@ export function CfZonesPage(props: CfZonesPageProps) {
         </div>
 
         <div className="flex flex-wrap items-center gap-2 w-full md:w-auto md:justify-end">
+          {onAddDomain && (
+            <button
+              onClick={onAddDomain}
+              disabled={cfAccountList.length === 0}
+              className="px-3.5 py-2 sm:py-1.5 text-xs font-semibold text-white bg-accent hover:opacity-95 rounded-lg transition-all flex items-center gap-1.5 whitespace-nowrap shadow-sm disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              添加域名
+            </button>
+          )}
           <button
             onClick={handleCfSyncZones}
             disabled={cfAccountList.length === 0 || actionLoading === "cf-sync"}

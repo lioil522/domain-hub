@@ -375,6 +375,41 @@ export class DnspodClient {
   }
 
   /**
+   * 在 DNSPod 中添加域名（支持主域与子域）
+   *
+   * @param domainName 域名字符串，如 example.com 或 sub.example.com
+   */
+  async createDomain(domainName: string): Promise<DnspodDomainInfo> {
+    const trimmed = String(domainName || "").trim().toLowerCase();
+    if (!trimmed) {
+      throw new Error("域名不能为空");
+    }
+    const res = await this.request<{ DomainInfo?: DnspodDomainInfo & { Id?: number; Domain?: string } }>(
+      "CreateDomain",
+      { Domain: trimmed }
+    );
+    const info = res.DomainInfo || {};
+    const domainId = info.DomainId || info.Id;
+    // 尝试拉取更完整的详情（含 NS 列表）
+    try {
+      const detail = await this.describeDomain(trimmed);
+      return {
+        ...info,
+        ...detail,
+        DomainId: domainId || detail.DomainId,
+        Name: trimmed,
+      };
+    } catch {
+      return {
+        ...info,
+        DomainId: domainId,
+        Name: trimmed,
+        EffectiveDNS: ["a.dnspod.com", "b.dnspod.com", "c.dnspod.com"],
+      };
+    }
+  }
+
+  /**
    * 分页列出域名下全部 DNS 解析记录（映射为内部形状）
    *
    * NOTE: `Domain` 参数接受**域名本身**（不是 DomainId）—— 路由层传的 remote_id

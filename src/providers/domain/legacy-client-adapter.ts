@@ -1,5 +1,5 @@
 import type { DBDomain, UpstreamClient, UpstreamSubdomain } from "../../db";
-import { CloudflareClient } from "../../cloudflare";
+import { CloudflareClient, mapZoneToUpstream } from "../../cloudflare";
 import { DigitalPlatClient } from "../../digitalplat";
 import { DNSHEClient } from "../../dnshe";
 import { DnspodClient, mapDnspodDomainToUpstream } from "../../dnspod";
@@ -75,6 +75,7 @@ export class LegacyDomainProviderAdapter implements DomainProviderAdapter {
     await this.client.updateNameservers(String(domain.remote_id || domain.full_domain), nameservers);
     return { success: true, data: { nameservers } };
   }
+
   async registerSubdomain(subdomain: string, rootdomain: string): Promise<DomainOperationResult<{ full_domain: string; subdomain_id: number }>> {
     if (!(this.client instanceof DNSHEClient)) return { success: false, message: "仅 DNSHE 账号支持在线注册子域名" };
     const result = await this.client.registerSubdomain(subdomain, rootdomain);
@@ -82,4 +83,48 @@ export class LegacyDomainProviderAdapter implements DomainProviderAdapter {
     return { success: true, message: result.message, data: { full_domain: result.full_domain || `${subdomain}.${rootdomain}`, subdomain_id: result.subdomain_id } };
   }
 
+  async createDomain(domain: string): Promise<DomainOperationResult<{ domain: UpstreamSubdomain; nameservers?: string[] }>> {
+    const domainName = String(domain || "").trim();
+    if (!domainName) {
+      return { success: false, message: "域名不能为空" };
+    }
+
+    if (this.client instanceof DnspodClient) {
+      const info = await this.client.createDomain(domainName);
+      const upstream = mapDnspodDomainToUpstream(info);
+      const ns = (info.NameServers || info.EffectiveDNS || []).map((s) => String(s)).filter(Boolean);
+      return { success: true, message: "DNSPod 域名添加成功", data: { domain: upstream, nameservers: ns } };
+    }
+
+    if (this.client instanceof CloudflareClient) {
+      const info = await this.client.createZone(domainName);
+      const upstream = mapZoneToUpstream(info);
+      const ns = (info.name_servers || []).map((s) => String(s)).filter(Boolean);
+      return { success: true, message: "Cloudflare Zone 添加成功", data: { domain: upstream, nameservers: ns } };
+    }
+
+    if (this.client instanceof AlidnsClient) {
+      const info = await this.client.createDomain(domainName);
+      const upstream = mapAlidnsDomainToUpstream(info);
+      const ns = Array.isArray(info.DnsServers?.DnsServer)
+        ? info.DnsServers!.DnsServer.map((s) => String(s)).filter(Boolean)
+        : [];
+      return { success: true, message: "阿里云 DNS 域名添加成功", data: { domain: upstream, nameservers: ns } };
+    }
+
+    if (this.client instanceof HuaweiCloudClient) {
+      const info = await this.client.createZone(domainName);
+      const upstream = mapHuaweiZoneToUpstream(info);
+      const ns = (info.nameservers || []).map((s) => String(s)).filter(Boolean);
+      return { success: true, message: "华为云公网域名添加成功", data: { domain: upstream, nameservers: ns } };
+    }
+
+    if (this.client instanceof VercelClient) {
+      const info = await this.client.createDomain(domainName);
+      const upstream = mapVercelDomainToUpstream(info);
+      return { success: true, message: "Vercel 域名添加成功", data: { domain: upstream } };
+    }
+
+    return { success: false, message: `${this.label} 暂不支持在面板内直接创建域名` };
+  }
 }

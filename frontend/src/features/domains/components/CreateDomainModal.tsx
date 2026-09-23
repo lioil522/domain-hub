@@ -51,6 +51,9 @@ const PROVIDER_LABELS: Record<string, string> = {
   vercel: "Vercel",
 };
 
+/** 腾讯云国际版 DNSPod 控制台新域名地址 */
+const DNSPOD_INTL_CONSOLE_URL = "https://console.tencentcloud.com/cns";
+
 /**
  * 判断是否为 DNSPod 国际站账号（SecretId 以 IKID 开头）
  */
@@ -590,7 +593,7 @@ export function CreateDomainModal({
                       <span className="truncate">
                         添加子域请到{" "}
                         <a
-                          href="https://console.intl.cloud.tencent.com/cns"
+                          href={DNSPOD_INTL_CONSOLE_URL}
                           target="_blank"
                           rel="noopener noreferrer"
                           className="font-bold underline hover:text-amber-100 inline-flex items-center gap-0.5"
@@ -601,7 +604,7 @@ export function CreateDomainModal({
                       </span>
                     </div>
                     <a
-                      href="https://console.intl.cloud.tencent.com/cns"
+                      href={DNSPOD_INTL_CONSOLE_URL}
                       target="_blank"
                       rel="noopener noreferrer"
                       className="px-2 py-0.5 rounded bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 text-[11px] font-medium transition-colors flex items-center gap-1 flex-shrink-0"
@@ -621,7 +624,7 @@ export function CreateDomainModal({
                     <span>
                       添加子域请到{" "}
                       <a
-                        href="https://console.intl.cloud.tencent.com/cns"
+                        href={DNSPOD_INTL_CONSOLE_URL}
                         target="_blank"
                         rel="noopener noreferrer"
                         className="font-bold underline hover:text-amber-100 inline-flex items-center gap-0.5"
@@ -632,7 +635,7 @@ export function CreateDomainModal({
                     </span>
                   </div>
                   <a
-                    href="https://console.intl.cloud.tencent.com/cns"
+                    href={DNSPOD_INTL_CONSOLE_URL}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="px-2.5 py-1 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 text-xs font-medium transition-colors flex items-center gap-1 flex-shrink-0"

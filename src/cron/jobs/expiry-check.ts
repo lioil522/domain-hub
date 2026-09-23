@@ -8,11 +8,29 @@ import type { DatabaseManager } from "../../db";
 import { isRegistrableDomain } from "../../punycode";
 import { CF_EXPIRY_BUDGET } from "../cf-helpers";
 
+/**
+ * 每日到期提醒去重缓存 key
+ *
+ * NOTE: cron 每天会触发两轮（见 wrangler.toml triggers），
+ * 但到期提醒只需发送一次。利用此 key 记录当天已发送的日期，
+ * 第二轮检测到标记后直接跳过，避免重复推送。
+ */
+const EXPIRY_REMINDER_SENT_KEY = "expiry_reminder_sent";
+
+/** 缓存 TTL：25 小时，确保跨天后自动失效 */
+const EXPIRY_REMINDER_TTL = 25 * 60 * 60;
+
 export async function collectExpiryReminders(
   dbManager: DatabaseManager,
   renewThresholdDays: number,
   out: string[]
 ): Promise<void> {
+  // 当天去重：如果本日已执行过到期提醒，直接跳过
+  const todayStr = new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
+  const lastSentDate = await dbManager.getCache(EXPIRY_REMINDER_SENT_KEY);
+  if (lastSentDate === todayStr) {
+    return;
+  }
   // ── ① Cloudflare ────────────────────────────────────────────────
   try {
     const cfZones = await dbManager.getDomains("", "", undefined, "cloudflare");
@@ -114,4 +132,7 @@ export async function collectExpiryReminders(
     const message = e instanceof Error ? e.message : "未知错误";
     await dbManager.writeLog("error", "renew", `自定义分组域名到期检查失败：${message}`);
   }
+
+  // 标记当天已完成到期提醒，后续 cron 轮次不再重复推送
+  await dbManager.setCache(EXPIRY_REMINDER_SENT_KEY, todayStr, EXPIRY_REMINDER_TTL);
 }

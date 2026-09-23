@@ -115,7 +115,7 @@ export function registerDomainRoutes(app: Hono<AppEnv>, deps: DomainRouteDeps) {
       const domainRepo = new DomainRepository(dbManager);
       const matched = await domainRepo.list(domainName, undefined, accountId);
       const insertedDomain = matched.find(
-        (d) => d.full_domain.toLowerCase() === domainName.toLowerCase() || d.domain.toLowerCase() === domainName.toLowerCase()
+        (d) => d.full_domain.toLowerCase() === domainName.toLowerCase()
       ) || matched[0];
 
       const nsList = result.data.nameservers || [];

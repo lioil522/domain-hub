@@ -10,8 +10,8 @@ import type { DnsProviderAdapter, DnsProviderContext } from "./types";
 export class DnspodDnsAdapter implements DnsProviderAdapter {
   async listRecords({ domain, client }: DnsProviderContext) {
     const dnspodClient = client as DnspodClient;
-    const remoteId = String(domain.remote_id || domain.full_domain);
-    const res = await dnspodClient.listDnsRecords(remoteId);
+    const targetDomain = domain.full_domain;
+    const res = await dnspodClient.listDnsRecords(targetDomain);
     return { success: Boolean(res?.success), records: res?.records || [], message: res?.message };
   }
 
@@ -19,7 +19,7 @@ export class DnspodDnsAdapter implements DnsProviderAdapter {
     const dnspodClient = client as DnspodClient;
     const name = normalizeDnsRecordName(String(input.name || ""), domain.full_domain);
     const res = await dnspodClient.createDnsRecord({
-      domain: String(domain.remote_id || domain.full_domain),
+      domain: domain.full_domain,
       type: input.type,
       name,
       content: input.content,
@@ -34,7 +34,7 @@ export class DnspodDnsAdapter implements DnsProviderAdapter {
     const dnspodClient = client as DnspodClient;
     const name = normalizeDnsRecordName(String(input.name || ""), domain.full_domain);
     const res = await dnspodClient.updateDnsRecord({
-      domain: String(domain.remote_id || domain.full_domain),
+      domain: domain.full_domain,
       record_id: recordId,
       type: input.type,
       name,
@@ -48,8 +48,7 @@ export class DnspodDnsAdapter implements DnsProviderAdapter {
 
   async deleteRecord({ domain, client }: DnsProviderContext, recordId: string) {
     const dnspodClient = client as DnspodClient;
-    const remoteId = String(domain.remote_id || domain.full_domain);
-    const res = await dnspodClient.deleteDnsRecord(remoteId, recordId);
+    const res = await dnspodClient.deleteDnsRecord(domain.full_domain, recordId);
     return { success: Boolean(res?.success), message: res?.message };
   }
 }

@@ -46,8 +46,9 @@ export function useCfDnsPanelActions({ state, meta, apiFetch, showToast, setActi
         showToast("error", data.message || "获取解析记录失败");
       }
     } catch (e) {
-      setCfRecordsError("网络连接异常，无法获取解析记录");
-      showToast("error", "网络连接异常，无法获取解析记录");
+      const msg = e instanceof Error ? e.message : "获取解析记录失败";
+      setCfRecordsError(msg);
+      showToast("error", msg);
     } finally {
       setLoadingCfRecords(false);
     }

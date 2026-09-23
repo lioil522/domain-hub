@@ -253,7 +253,7 @@ export function mapDnspodDomainToUpstream(domain: DnspodDomainInfo): UpstreamSub
     has_dns: 1,
     dns_provider: "DNSPod",
     provider_account_id: domain.DomainId ?? null,
-    remote_id: String(domain.DomainId ?? ""),
+    remote_id: domainName,
     dns_state_known: true,
     // NS 列表随行带上，供前端「当前 DNS 服务器」一栏直接渲染（无需单独查一次）
     ns1: nameservers[0],

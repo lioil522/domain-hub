@@ -1199,8 +1199,8 @@ export function useAppControllerView() {
             cfZones={cfZones}
             loadingCfZones={loadingCfZones}
             actionLoading={actionLoading}
-            onAddDomain={() => {
-              const preselected = cfAccountFilter !== "all" ? Number(cfAccountFilter) : cfAccountList[0]?.id;
+            onAddDomain={(accountId) => {
+              const preselected = accountId ?? (cfAccountFilter !== "all" ? Number(cfAccountFilter) : cfAccountList[0]?.id);
               handleOpenCreateDomain(preselected);
             }}
             handleCfSyncZones={handleCfSyncZones}
@@ -1251,10 +1251,10 @@ export function useAppControllerView() {
                 domains={multiProviderData[key]}
                 loading={multiProviderLoading[key]}
                 actionLoading={actionLoading}
-                onAddDomain={() => {
+                onAddDomain={(accountId) => {
                   const filterVal = multiProviderFilter[key];
                   const list = multiProviderAccountLists[key];
-                  const preselected = filterVal !== "all" ? Number(filterVal) : list[0]?.id;
+                  const preselected = accountId ?? (filterVal !== "all" ? Number(filterVal) : list[0]?.id);
                   handleOpenCreateDomain(preselected);
                 }}
                 onSyncAll={() => handleMultiProviderSync(key)}

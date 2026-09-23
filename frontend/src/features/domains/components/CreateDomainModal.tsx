@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import {
   Globe,
   X,
@@ -70,6 +70,15 @@ export function CreateDomainModal({
   const [domainInput, setDomainInput] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  // 当外部传入的 defaultAccountId 发生变化时，同步选中的账号
+  useEffect(() => {
+    if (defaultAccountId && supportedAccounts.some((a) => a.id === defaultAccountId)) {
+      setSelectedAccountId(defaultAccountId);
+    } else if (supportedAccounts.length > 0 && !supportedAccounts.some((a) => a.id === selectedAccountId)) {
+      setSelectedAccountId(supportedAccounts[0].id);
+    }
+  }, [defaultAccountId, supportedAccounts]);
 
   // 成功状态
   const [createdResult, setCreatedResult] = useState<{
@@ -153,28 +162,30 @@ export function CreateDomainModal({
 
   return (
     <ModalOverlay>
-      <div className="relative w-full max-w-lg bg-surface border border-border-base rounded-2xl shadow-2xl p-6 sm:p-7 overflow-hidden text-content-primary animate-in fade-in zoom-in-95 duration-200">
-        {/* 背景光晕微装饰 */}
-        <div className="absolute -top-20 -right-20 w-44 h-44 bg-accent/10 rounded-full blur-3xl pointer-events-none" />
-
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="create-domain-modal-title"
+        className="bg-surface border border-border-base w-full max-w-lg max-h-[90dvh] rounded-2xl overflow-hidden flex flex-col shadow-2xl animate-in fade-in zoom-in-95 duration-200"
+      >
         {/* 顶部标题栏 */}
-        <div className="flex items-center justify-between pb-4 border-b border-border-base mb-5">
-          <div className="flex items-center gap-3">
-            <div className="p-2 rounded-xl bg-accent/15 text-accent border border-accent/20 flex-shrink-0">
+        <div className="bg-elevated px-4 sm:px-6 py-4 flex items-center justify-between border-b border-border-base flex-shrink-0">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className="p-1.5 rounded-lg bg-accent/15 text-accent flex-shrink-0">
               <Globe className="w-5 h-5" />
             </div>
-            <div>
-              <h3 className="text-lg font-bold text-content-primary">
+            <div className="min-w-0">
+              <h3 id="create-domain-modal-title" className="text-base sm:text-lg font-bold text-content-primary truncate">
                 添加域名托管
               </h3>
-              <p className="text-xs text-content-muted mt-0.5">
-                支持添加主域（如 example.com）或子域（如 a.test.com）
+              <p className="text-xs text-content-muted mt-0.5 truncate">
+                支持添加主域（如 example.com）或独立子域（如 a.test.com）
               </p>
             </div>
           </div>
           <button
             onClick={handleResetAndClose}
-            className="p-1.5 rounded-lg text-content-muted hover:text-content-primary hover:bg-hovered transition-colors"
+            className="p-1.5 rounded-lg text-content-muted hover:text-content-primary hover:bg-hovered transition-colors flex-shrink-0"
             title="关闭"
           >
             <X className="w-5 h-5" />
@@ -183,63 +194,66 @@ export function CreateDomainModal({
 
         {/* 内容展示：成功结果页 */}
         {createdResult ? (
-          <div className="space-y-5">
-            <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/25 flex items-start gap-3">
-              <CheckCircle2 className="w-5 h-5 text-emerald-400 mt-0.5 flex-shrink-0" />
-              <div>
-                <h4 className="text-sm font-bold text-emerald-300">
-                  {createdResult.message}
-                </h4>
-                <p className="text-xs text-content-secondary mt-1">
-                  域名 <span className="font-mono font-semibold text-content-primary">{createdResult.domain.full_domain}</span> 已成功添加到服务商并自动同步至系统！
-                </p>
+          <div className="flex flex-col flex-1 overflow-hidden">
+            <div className="p-4 sm:p-6 overflow-y-auto flex-1 space-y-4">
+              <div className="p-3.5 rounded-xl bg-emerald-500/10 border border-emerald-500/25 flex items-start gap-3">
+                <CheckCircle2 className="w-5 h-5 text-emerald-400 mt-0.5 flex-shrink-0" />
+                <div>
+                  <h4 className="text-sm font-bold text-emerald-300">
+                    {createdResult.message}
+                  </h4>
+                  <p className="text-xs text-content-secondary mt-1">
+                    域名 <span className="font-mono font-semibold text-content-primary">{createdResult.domain.full_domain}</span> 已成功添加到服务商并自动同步至系统！
+                  </p>
+                </div>
               </div>
+
+              {createdResult.nameservers.length > 0 ? (
+                <div className="space-y-2.5">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold text-content-secondary flex items-center gap-1.5">
+                      <Server className="w-3.5 h-3.5 text-accent" />
+                      上游分配的 DNS 服务器 (NS 记录)：
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => handleCopyAllNs(createdResult.nameservers)}
+                      className="text-xs text-accent hover:underline flex items-center gap-1"
+                    >
+                      <Copy className="w-3 h-3" /> 复制全部
+                    </button>
+                  </div>
+                  <div className="p-3 bg-surface-raised rounded-xl border border-border-base space-y-2 font-mono text-xs">
+                    {createdResult.nameservers.map((ns, idx) => (
+                      <div
+                        key={idx}
+                        className="flex items-center justify-between p-2 rounded-lg bg-surface border border-border-subtle group hover:border-accent/40 transition-colors"
+                      >
+                        <span className="text-content-primary font-medium">{ns}</span>
+                        <button
+                          type="button"
+                          onClick={() => handleCopyNs(ns, idx)}
+                          className="p-1 rounded text-content-muted hover:text-accent transition-colors"
+                          title="复制此记录"
+                        >
+                          {copiedIndex === idx ? (
+                            <Check className="w-3.5 h-3.5 text-emerald-400" />
+                          ) : (
+                            <Copy className="w-3.5 h-3.5" />
+                          )}
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                  <p className="text-xs text-content-muted leading-relaxed">
+                    💡 提示：若该域名刚购买，请前往域名原注册商控制台，将 DNS 服务器修改为上述地址，全球生效约需数分钟至数小时。
+                  </p>
+                </div>
+              ) : null}
             </div>
 
-            {createdResult.nameservers.length > 0 ? (
-              <div className="space-y-2.5">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-semibold text-content-secondary flex items-center gap-1.5">
-                    <Server className="w-3.5 h-3.5 text-accent" />
-                    上游分配的 DNS 服务器 (NS 记录)：
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => handleCopyAllNs(createdResult.nameservers)}
-                    className="text-xs text-accent hover:underline flex items-center gap-1"
-                  >
-                    <Copy className="w-3 h-3" /> 复制全部
-                  </button>
-                </div>
-                <div className="p-3 bg-surface-raised rounded-xl border border-border-base space-y-2 font-mono text-xs">
-                  {createdResult.nameservers.map((ns, idx) => (
-                    <div
-                      key={idx}
-                      className="flex items-center justify-between p-2 rounded-lg bg-surface border border-border-subtle group hover:border-accent/40 transition-colors"
-                    >
-                      <span className="text-content-primary font-medium">{ns}</span>
-                      <button
-                        type="button"
-                        onClick={() => handleCopyNs(ns, idx)}
-                        className="p-1 rounded text-content-muted hover:text-accent transition-colors"
-                        title="复制此记录"
-                      >
-                        {copiedIndex === idx ? (
-                          <Check className="w-3.5 h-3.5 text-emerald-400" />
-                        ) : (
-                          <Copy className="w-3.5 h-3.5" />
-                        )}
-                      </button>
-                    </div>
-                  ))}
-                </div>
-                <p className="text-xs text-content-muted leading-relaxed">
-                  💡 提示：若该域名刚购买，请前往域名原注册商控制台，将 DNS 服务器修改为上述地址，全球生效约需数分钟至数小时。
-                </p>
-              </div>
-            ) : null}
-
-            <div className="flex items-center justify-end gap-3 pt-2">
+            {/* 成功页底部操作栏 */}
+            <div className="bg-elevated px-4 sm:px-6 py-3.5 flex items-center justify-end gap-3 border-t border-border-base flex-shrink-0">
               <Button
                 variant="secondary"
                 onClick={handleResetAndClose}
@@ -262,64 +276,66 @@ export function CreateDomainModal({
           </div>
         ) : (
           /* 输入表单 */
-          <form onSubmit={handleSubmit} className="space-y-4">
-            {/* 选择账号 */}
-            <div>
-              <label className="block text-xs font-semibold text-content-secondary mb-1.5">
-                所属账号 / 服务商
-              </label>
-              {supportedAccounts.length === 0 ? (
-                <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/25 text-amber-300 text-xs flex items-center gap-2">
-                  <AlertCircle className="w-4 h-4 flex-shrink-0" />
-                  当前尚未绑定支持在线添加域名的账号（DNSPod、Cloudflare、阿里云、华为云、Vercel）。请先前往「账号管理」进行绑定。
+          <form onSubmit={handleSubmit} className="flex flex-col flex-1 overflow-hidden">
+            <div className="p-4 sm:p-6 overflow-y-auto flex-1 space-y-4">
+              {/* 选择账号 */}
+              <div>
+                <label className="block text-xs font-semibold text-content-secondary mb-1.5">
+                  所属账号 / 服务商
+                </label>
+                {supportedAccounts.length === 0 ? (
+                  <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/25 text-amber-300 text-xs flex items-center gap-2">
+                    <AlertCircle className="w-4 h-4 flex-shrink-0" />
+                    当前尚未绑定支持在线添加域名的账号（DNSPod、Cloudflare、阿里云、华为云、Vercel）。请先前往「账号管理」进行绑定。
+                  </div>
+                ) : (
+                  <CustomSelect
+                    value={String(selectedAccountId)}
+                    onChange={(val) => setSelectedAccountId(Number(val))}
+                    options={supportedAccounts.map((acc) => ({
+                      value: String(acc.id),
+                      label: `[${PROVIDER_LABELS[acc.provider || ""] || acc.provider || "未知"}] ${acc.alias || `账号 ${acc.id}`}`,
+                    }))}
+                    ariaLabel="选择目标账号"
+                    className="w-full text-sm"
+                  />
+                )}
+              </div>
+
+              {/* 域名输入框 */}
+              <div>
+                <label className="block text-xs font-semibold text-content-secondary mb-1.5">
+                  域名名称
+                </label>
+                <div className="relative">
+                  <input
+                    type="text"
+                    value={domainInput}
+                    onChange={(e) => {
+                      setDomainInput(e.target.value);
+                      if (errorMsg) setErrorMsg(null);
+                    }}
+                    placeholder="如 example.com 或 a.test.com"
+                    className="w-full px-3.5 py-2.5 rounded-xl bg-surface-raised border border-border-base focus:border-accent focus:ring-1 focus:ring-accent text-sm text-content-primary placeholder:text-content-muted outline-none transition-all font-mono"
+                    autoFocus
+                  />
                 </div>
-              ) : (
-                <CustomSelect
-                  value={String(selectedAccountId)}
-                  onChange={(val) => setSelectedAccountId(Number(val))}
-                  options={supportedAccounts.map((acc) => ({
-                    value: String(acc.id),
-                    label: `[${PROVIDER_LABELS[acc.provider || ""] || acc.provider || "未知"}] ${acc.alias || `账号 ${acc.id}`}`,
-                  }))}
-                  ariaLabel="选择目标账号"
-                  className="w-full text-sm"
-                />
+                <p className="text-xs text-content-muted mt-1.5 leading-relaxed">
+                  支持主域名（如 <code className="text-content-secondary">test.com</code>）或独立委派的子域名（如 <code className="text-content-secondary">sub.test.com</code>）。
+                </p>
+              </div>
+
+              {/* 错误提示 */}
+              {errorMsg && (
+                <div className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/25 text-rose-300 text-xs flex items-center gap-2 animate-in fade-in">
+                  <AlertCircle className="w-4 h-4 flex-shrink-0" />
+                  <span>{errorMsg}</span>
+                </div>
               )}
             </div>
 
-            {/* 域名输入框 */}
-            <div>
-              <label className="block text-xs font-semibold text-content-secondary mb-1.5">
-                域名名称
-              </label>
-              <div className="relative">
-                <input
-                  type="text"
-                  value={domainInput}
-                  onChange={(e) => {
-                    setDomainInput(e.target.value);
-                    if (errorMsg) setErrorMsg(null);
-                  }}
-                  placeholder="如 example.com 或 a.test.com"
-                  className="w-full px-3.5 py-2.5 rounded-xl bg-surface-raised border border-border-base focus:border-accent focus:ring-1 focus:ring-accent text-sm text-content-primary placeholder:text-content-muted outline-none transition-all font-mono"
-                  autoFocus
-                />
-              </div>
-              <p className="text-xs text-content-muted mt-1.5 leading-relaxed">
-                支持主域名（如 <code className="text-content-secondary">test.com</code>）或独立委派的子域名（如 <code className="text-content-secondary">sub.test.com</code>）。
-              </p>
-            </div>
-
-            {/* 错误提示 */}
-            {errorMsg && (
-              <div className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/25 text-rose-300 text-xs flex items-center gap-2 animate-in fade-in">
-                <AlertCircle className="w-4 h-4 flex-shrink-0" />
-                <span>{errorMsg}</span>
-              </div>
-            )}
-
-            {/* 底部按钮 */}
-            <div className="flex items-center justify-end gap-3 pt-3 border-t border-border-base mt-5">
+            {/* 表单底部按钮 */}
+            <div className="bg-elevated px-4 sm:px-6 py-3.5 flex items-center justify-end gap-3 border-t border-border-base flex-shrink-0">
               <Button
                 type="button"
                 variant="secondary"

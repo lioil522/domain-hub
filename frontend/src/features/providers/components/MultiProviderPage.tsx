@@ -47,8 +47,8 @@ export interface MultiProviderPageProps {
   actionLoading: string | null;
   /** 同步该托管商的全部账号域名 */
   onSyncAll: () => void;
-  /** 添加域名回调 */
-  onAddDomain?: () => void;
+  /** 添加域名回调（可指定预选账号 ID） */
+  onAddDomain?: (accountId?: number) => void;
   /** 展开 / 收起全部分组 */
   onToggleAllAccounts: () => void;
   /** 已收起的分组账号 id */
@@ -120,17 +120,7 @@ export function MultiProviderPage(props: MultiProviderPageProps) {
         </div>
 
         <div className="flex flex-wrap items-center gap-2 w-full md:w-auto md:justify-end">
-          {onAddDomain && (
-            <button
-              onClick={onAddDomain}
-              disabled={accountList.length === 0}
-              className="px-3.5 py-2 sm:py-1.5 text-xs font-semibold text-content-primary bg-surface-raised hover:bg-hovered border border-border-base rounded-lg transition-all flex items-center gap-1.5 whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
-              title={`在 ${meta.label} 添加域名`}
-            >
-              <Plus className="w-3.5 h-3.5 text-accent" />
-              添加域名
-            </button>
-          )}
+
           <button
             onClick={onSyncAll}
             disabled={accountList.length === 0 || actionLoading === `multi-sync-${providerKey}`}
@@ -218,19 +208,31 @@ export function MultiProviderPage(props: MultiProviderPageProps) {
                       </span>
                     </h3>
                   </button>
-                  {/* 单账号同步：只拉这一个账号的域名，避开全量同步的子请求上限 */}
-                  <button
-                    onClick={() => onSyncAccount(group.accountId)}
-                    disabled={actionLoading === `sync-account-${group.accountId}`}
-                    className="p-2 rounded-lg text-content-muted hover:text-accent hover:bg-surface transition-colors disabled:opacity-50 shrink-0"
-                    title="仅同步该账号的域名"
-                  >
-                    <RefreshCw
-                      className={`w-4 h-4 ${
-                        actionLoading === `sync-account-${group.accountId}` ? "animate-spin" : ""
-                      }`}
-                    />
-                  </button>
+                  <div className="flex items-center gap-1 shrink-0">
+                    {onAddDomain && (
+                      <button
+                        onClick={() => onAddDomain(group.accountId)}
+                        className="p-2 rounded-lg text-content-muted hover:text-accent hover:bg-surface transition-colors shrink-0"
+                        title="在此账号下添加域名"
+                        aria-label="添加域名"
+                      >
+                        <Plus className="w-4 h-4" />
+                      </button>
+                    )}
+                    {/* 单账号同步：只拉这一个账号的域名，避开全量同步的子请求上限 */}
+                    <button
+                      onClick={() => onSyncAccount(group.accountId)}
+                      disabled={actionLoading === `sync-account-${group.accountId}`}
+                      className="p-2 rounded-lg text-content-muted hover:text-accent hover:bg-surface transition-colors disabled:opacity-50 shrink-0"
+                      title="仅同步该账号的域名"
+                    >
+                      <RefreshCw
+                        className={`w-4 h-4 ${
+                          actionLoading === `sync-account-${group.accountId}` ? "animate-spin" : ""
+                        }`}
+                      />
+                    </button>
+                  </div>
                 </div>
 
                 {!isCollapsed &&

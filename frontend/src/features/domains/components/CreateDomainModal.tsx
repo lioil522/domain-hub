@@ -11,7 +11,7 @@ import {
   Plus,
 } from "lucide-react";
 import { ModalOverlay } from "../../../components/ModalOverlay";
-import { CustomSelect } from "../../../components/form/CustomSelect";
+import { Input } from "../../../components/form/Input";
 import { Button } from "../../../components/Button";
 import { domainsApi } from "../../../api/endpoints/domains";
 import { useAppData } from "../../../state/AppDataContext";
@@ -80,6 +80,8 @@ export function CreateDomainModal({
     }
   }, [defaultAccountId, supportedAccounts]);
 
+  const currentAccount = supportedAccounts.find((a) => a.id === selectedAccountId) || supportedAccounts[0];
+
   // 成功状态
   const [createdResult, setCreatedResult] = useState<{
     domain: Domain;
@@ -117,8 +119,9 @@ export function CreateDomainModal({
       setErrorMsg("请输入要添加的域名");
       return;
     }
-    if (!selectedAccountId) {
-      setErrorMsg("请选择要绑定的账号");
+    const targetId = selectedAccountId || currentAccount?.id;
+    if (!targetId) {
+      setErrorMsg("未指定目标托管账号，请先在「账号管理」中绑定支持的服务商");
       return;
     }
 
@@ -127,7 +130,7 @@ export function CreateDomainModal({
 
     try {
       const res = await domainsApi.create(apiFetch, {
-        account_id: selectedAccountId,
+        account_id: targetId,
         domain,
       });
 
@@ -179,7 +182,12 @@ export function CreateDomainModal({
                 添加域名托管
               </h3>
               <p className="text-xs text-content-muted mt-0.5 truncate">
-                支持添加主域（如 example.com）或独立子域（如 a.test.com）
+                {currentAccount ? (
+                  <>
+                    所属账号: <span className="font-semibold text-accent">[{PROVIDER_LABELS[currentAccount.provider || ""] || currentAccount.provider}] {currentAccount.alias}</span> · 
+                  </>
+                ) : null}
+                支持添加主域或独立子域
               </p>
             </div>
           </div>
@@ -278,48 +286,31 @@ export function CreateDomainModal({
           /* 输入表单 */
           <form onSubmit={handleSubmit} className="flex flex-col flex-1 overflow-hidden">
             <div className="p-4 sm:p-6 overflow-y-auto flex-1 space-y-4">
-              {/* 选择账号 */}
-              <div>
-                <label className="block text-xs font-semibold text-content-secondary mb-1.5">
-                  所属账号 / 服务商
-                </label>
-                {supportedAccounts.length === 0 ? (
-                  <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/25 text-amber-300 text-xs flex items-center gap-2">
-                    <AlertCircle className="w-4 h-4 flex-shrink-0" />
-                    当前尚未绑定支持在线添加域名的账号（DNSPod、Cloudflare、阿里云、华为云、Vercel）。请先前往「账号管理」进行绑定。
-                  </div>
-                ) : (
-                  <CustomSelect
-                    value={String(selectedAccountId)}
-                    onChange={(val) => setSelectedAccountId(Number(val))}
-                    options={supportedAccounts.map((acc) => ({
-                      value: String(acc.id),
-                      label: `[${PROVIDER_LABELS[acc.provider || ""] || acc.provider || "未知"}] ${acc.alias || `账号 ${acc.id}`}`,
-                    }))}
-                    ariaLabel="选择目标账号"
-                    className="w-full text-sm"
-                  />
-                )}
-              </div>
+              {supportedAccounts.length === 0 ? (
+                <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/25 text-amber-300 text-xs flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 flex-shrink-0" />
+                  当前尚未绑定支持在线添加域名的账号（DNSPod、Cloudflare、阿里云、华为云、Vercel）。请先前往「账号管理」进行绑定。
+                </div>
+              ) : null}
 
               {/* 域名输入框 */}
               <div>
                 <label className="block text-xs font-semibold text-content-secondary mb-1.5">
                   域名名称
                 </label>
-                <div className="relative">
-                  <input
-                    type="text"
-                    value={domainInput}
-                    onChange={(e) => {
-                      setDomainInput(e.target.value);
-                      if (errorMsg) setErrorMsg(null);
-                    }}
-                    placeholder="如 example.com 或 a.test.com"
-                    className="w-full px-3.5 py-2.5 rounded-xl bg-surface-raised border border-border-base focus:border-accent focus:ring-1 focus:ring-accent text-sm text-content-primary placeholder:text-content-muted outline-none transition-all font-mono"
-                    autoFocus
-                  />
-                </div>
+                <Input
+                  type="text"
+                  value={domainInput}
+                  onChange={(e) => {
+                    setDomainInput(e.target.value);
+                    if (errorMsg) setErrorMsg(null);
+                  }}
+                  placeholder="如 example.com 或 a.test.com"
+                  mono
+                  size="md"
+                  className="w-full text-content-primary placeholder:text-content-muted"
+                  autoFocus
+                />
                 <p className="text-xs text-content-muted mt-1.5 leading-relaxed">
                   支持主域名（如 <code className="text-content-secondary">test.com</code>）或独立委派的子域名（如 <code className="text-content-secondary">sub.test.com</code>）。
                 </p>

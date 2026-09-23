@@ -48,6 +48,32 @@ console.log("多服务商添加域名 (CreateDomain) 单元测试开始...");
   console.log("  ✓ DNSPod createDomain 支持添加子域，且成功解析并映射 NS");
 }
 
+// 1.1 DNSPod 子域遇 TXT 校验场景
+{
+  const client = new DnspodClient("AKIDtest", "testkey");
+  (client as any).request = async (action: string) => {
+    if (action === "CreateDomain") {
+      throw new Error("InvalidParameter.QuhuiTxtRecordWait: TXT record not set or haven't taken effect. Retry later..");
+    }
+    if (action === "CreateSubdomainValidateTXTValue") {
+      return {
+        Value: "7bdae520773783feb0c9e352846ff33b",
+      };
+    }
+    throw new Error(`Unexpected action: ${action}`);
+  };
+
+  const adapter = new LegacyDomainProviderAdapter("dnspod", client);
+  const res = await adapter.createDomain("lvl.cn.mt");
+  assert.equal(res.success, false);
+  assert.equal(res.need_txt_verify, true);
+  assert.equal(res.verify_info?.host, "_dnspodcheck");
+  assert.equal(res.verify_info?.type, "TXT");
+  assert.equal(res.verify_info?.parent_domain, "cn.mt");
+  assert.equal(res.verify_info?.value, "7bdae520773783feb0c9e352846ff33b");
+  console.log("  ✓ DNSPod 子域名遇 QuhuiTxtRecordWait 时正确提取 TXT 专属授权校验结构");
+}
+
 // 2. Cloudflare
 {
   const client = new CloudflareClient("cftoken123");

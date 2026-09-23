@@ -4,6 +4,21 @@ import type { Domain } from "../../types/domain";
 
 export interface DomainsResponse { domains: Domain[]; }
 
+export interface SubdomainVerifyInfo {
+  host: string;
+  type: string;
+  parent_domain: string;
+  value?: string;
+}
+
+export interface CreateDomainResponse {
+  domain?: Domain;
+  nameservers?: string[];
+  message?: string;
+  need_txt_verify?: boolean;
+  verify_info?: SubdomainVerifyInfo;
+}
+
 export const domainsApi = {
   list(apiFetch: ApiFetch, params: { provider?: string; accountId?: number | string } = {}) {
     const query = new URLSearchParams();
@@ -31,7 +46,7 @@ export const domainsApi = {
     return apiJson(apiFetch, `/api/domains/${id}/nameservers`, { method: "PUT", headers: jsonHeaders, body: JSON.stringify(body) });
   },
   create(apiFetch: ApiFetch, body: { account_id: number; domain: string }) {
-    return apiJson<{ domain?: Domain; nameservers?: string[]; message?: string }>(apiFetch, "/api/domains", {
+    return apiJson<CreateDomainResponse>(apiFetch, "/api/domains", {
       method: "POST",
       headers: jsonHeaders,
       body: JSON.stringify(body),

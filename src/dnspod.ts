@@ -50,6 +50,27 @@ interface Tc3SignedHeaders {
   timestamp: number;
 }
 
+export interface SubdomainVerifyInfo {
+  host: string;
+  type: string;
+  parent_domain: string;
+  value?: string;
+}
+
+/**
+ * 当添加子域名需先在主域名处完成 TXT 授权校验时抛出的结构化异常
+ */
+export class DnspodSubdomainTxtVerifyError extends Error {
+  readonly code = "need_txt_verify";
+  readonly verifyInfo: SubdomainVerifyInfo;
+
+  constructor(message: string, verifyInfo: SubdomainVerifyInfo) {
+    super(message);
+    this.name = "DnspodSubdomainTxtVerifyError";
+    this.verifyInfo = verifyInfo;
+  }
+}
+
 /**
  * 判断一个字符串是否形如腾讯云 SecretId
  *
@@ -384,10 +405,44 @@ export class DnspodClient {
     if (!trimmed) {
       throw new Error("域名不能为空");
     }
-    const res = await this.request<{ DomainInfo?: DnspodDomainInfo & { Id?: number; Domain?: string } }>(
-      "CreateDomain",
-      { Domain: trimmed }
-    );
+
+    let res: { DomainInfo?: DnspodDomainInfo & { Id?: number; Domain?: string } };
+    try {
+      res = await this.request<{ DomainInfo?: DnspodDomainInfo & { Id?: number; Domain?: string } }>(
+        "CreateDomain",
+        { Domain: trimmed }
+      );
+    } catch (e: unknown) {
+      if (e instanceof Error && (e.message.includes("QuhuiTxtRecordWait") || e.message.includes("_dnspodcheck"))) {
+        // 尝试自动通过 CreateSubdomainValidateTXTValue 获取上游生成的专属 TXT 记录值
+        let txtValue: string | undefined = undefined;
+        try {
+          const txtRes = await this.request<{ Value?: string; RecordValue?: string; TXTValue?: string }>(
+            "CreateSubdomainValidateTXTValue",
+            { DomainZone: trimmed }
+          );
+          txtValue = txtRes.Value || txtRes.RecordValue || txtRes.TXTValue;
+        } catch {
+          // 部分账号或套餐受腾讯云网关策略限制未放行此接口，不阻塞主流程，保持优雅降级
+        }
+
+        // 推导父级主域名，如 lvl.cn.mt -> cn.mt
+        const parts = trimmed.split(".");
+        const parentDomain = parts.length > 2 ? parts.slice(1).join(".") : trimmed;
+
+        throw new DnspodSubdomainTxtVerifyError(
+          `要想添加此子域名，请先完成 TXT 记录授权校验：需前往主域名 ${parentDomain} 的 DNS 服务商处添加专属 TXT 解析记录`,
+          {
+            host: "_dnspodcheck",
+            type: "TXT",
+            parent_domain: parentDomain,
+            value: txtValue,
+          }
+        );
+      }
+      throw e;
+    }
+
     const info = res.DomainInfo || {};
     const domainId = info.DomainId || info.Id;
     // 尝试拉取更完整的详情（含 NS 列表）

@@ -95,6 +95,15 @@ export function registerDomainRoutes(app: Hono<AppEnv>, deps: DomainRouteDeps) {
 
       const result = await adapter.createDomain(domainName);
       if (!result.success || !result.data?.domain) {
+        if (result.need_txt_verify) {
+          return c.json({
+            success: false,
+            error_code: "need_txt_verify",
+            message: result.message || "添加该子域名需先在主域名原 DNS 处完成 TXT 授权校验",
+            need_txt_verify: true,
+            verify_info: result.verify_info,
+          }, 400);
+        }
         return c.json(errorRes(result.message || "添加域名失败"), 400);
       }
 
@@ -131,6 +140,16 @@ export function registerDomainRoutes(app: Hono<AppEnv>, deps: DomainRouteDeps) {
         })
       );
     } catch (e: unknown) {
+      if (typeof e === "object" && e !== null && "verifyInfo" in e) {
+        const verifyError = e as { message: string; verifyInfo: unknown };
+        return c.json({
+          success: false,
+          error_code: "need_txt_verify",
+          message: verifyError.message,
+          need_txt_verify: true,
+          verify_info: verifyError.verifyInfo,
+        }, 400);
+      }
       const message = e instanceof Error ? e.message : "添加域名发生错误";
       return c.json(errorRes(message), 400);
     }

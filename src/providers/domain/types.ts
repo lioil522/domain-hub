@@ -5,6 +5,13 @@ export interface DomainOperationResult<T = unknown> {
   success: boolean;
   message?: string;
   data?: T;
+  need_txt_verify?: boolean;
+  verify_info?: {
+    host: string;
+    type: string;
+    parent_domain: string;
+    value?: string;
+  };
 }
 
 export interface NameserverResult {

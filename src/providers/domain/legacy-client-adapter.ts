@@ -2,7 +2,7 @@ import type { DBDomain, UpstreamClient, UpstreamSubdomain } from "../../db";
 import { CloudflareClient, mapZoneToUpstream } from "../../cloudflare";
 import { DigitalPlatClient } from "../../digitalplat";
 import { DNSHEClient } from "../../dnshe";
-import { DnspodClient, mapDnspodDomainToUpstream } from "../../dnspod";
+import { DnspodClient, DnspodSubdomainTxtVerifyError, mapDnspodDomainToUpstream } from "../../dnspod";
 import { AlidnsClient, mapAlidnsDomainToUpstream } from "../../alidns";
 import { HuaweiCloudClient, mapHuaweiZoneToUpstream } from "../../huaweicloud";
 import { VercelClient, mapVercelDomainToUpstream } from "../../vercel";
@@ -90,10 +90,22 @@ export class LegacyDomainProviderAdapter implements DomainProviderAdapter {
     }
 
     if (this.client instanceof DnspodClient) {
-      const info = await this.client.createDomain(domainName);
-      const upstream = mapDnspodDomainToUpstream(info);
-      const ns = (info.NameServers || info.EffectiveDNS || []).map((s) => String(s)).filter(Boolean);
-      return { success: true, message: "DNSPod 域名添加成功", data: { domain: upstream, nameservers: ns } };
+      try {
+        const info = await this.client.createDomain(domainName);
+        const upstream = mapDnspodDomainToUpstream(info);
+        const ns = (info.NameServers || info.EffectiveDNS || []).map((s) => String(s)).filter(Boolean);
+        return { success: true, message: "DNSPod 域名添加成功", data: { domain: upstream, nameservers: ns } };
+      } catch (e: unknown) {
+        if (e instanceof DnspodSubdomainTxtVerifyError) {
+          return {
+            success: false,
+            message: e.message,
+            need_txt_verify: true,
+            verify_info: e.verifyInfo,
+          };
+        }
+        throw e;
+      }
     }
 
     if (this.client instanceof CloudflareClient) {

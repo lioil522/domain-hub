@@ -9,11 +9,16 @@ import {
   AlertCircle,
   Loader2,
   Plus,
+  ShieldAlert,
+  ExternalLink,
+  ArrowLeft,
+  RotateCw,
 } from "lucide-react";
 import { ModalOverlay } from "../../../components/ModalOverlay";
 import { Input } from "../../../components/form/Input";
 import { Button } from "../../../components/Button";
-import { domainsApi } from "../../../api/endpoints/domains";
+import { domainsApi, type SubdomainVerifyInfo } from "../../../api/endpoints/domains";
+import { isApiRequestError } from "../../../api/request";
 import { useAppData } from "../../../state/AppDataContext";
 import type { Account } from "../../../types/account";
 import type { Domain } from "../../../types/domain";
@@ -71,6 +76,11 @@ export function CreateDomainModal({
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
+  // 子域名 TXT 授权校验状态
+  const [txtVerifyInfo, setTxtVerifyInfo] = useState<(SubdomainVerifyInfo & { message?: string }) | null>(null);
+  const [manualTxtValue, setManualTxtValue] = useState("");
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+
   // 当外部传入的 defaultAccountId 发生变化时，同步选中的账号
   useEffect(() => {
     if (defaultAccountId && supportedAccounts.some((a) => a.id === defaultAccountId)) {
@@ -92,6 +102,17 @@ export function CreateDomainModal({
 
   if (!open) return null;
 
+  const handleCopyText = async (text: string, key: string, label: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedKey(key);
+      setTimeout(() => setCopiedKey(null), 2000);
+      showToast("success", `已复制: ${label}`);
+    } catch {
+      showToast("error", "复制失败，请手动选取复制");
+    }
+  };
+
   const handleCopyNs = async (ns: string, index: number) => {
     try {
       await navigator.clipboard.writeText(ns);
@@ -112,8 +133,8 @@ export function CreateDomainModal({
     }
   };
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleSubmit = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
     const domain = domainInput.trim().toLowerCase();
     if (!domain) {
       setErrorMsg("请输入要添加的域名");
@@ -136,6 +157,7 @@ export function CreateDomainModal({
 
       if (res.success && res.domain) {
         showToast("success", res.message || "域名添加成功！");
+        setTxtVerifyInfo(null);
         setCreatedResult({
           domain: res.domain,
           nameservers: res.nameservers || [],
@@ -148,6 +170,19 @@ export function CreateDomainModal({
         throw new Error(res.message || "添加域名失败");
       }
     } catch (err: unknown) {
+      if (isApiRequestError(err)) {
+        const payload = err.payload as any;
+        if (payload?.need_txt_verify && payload?.verify_info) {
+          setTxtVerifyInfo({
+            ...payload.verify_info,
+            message: payload.message,
+          });
+          if (payload.verify_info.value) {
+            setManualTxtValue(payload.verify_info.value);
+          }
+          return;
+        }
+      }
       const msg = err instanceof Error ? err.message : "添加域名失败，请重试";
       setErrorMsg(msg);
       showToast("error", msg);
@@ -159,6 +194,8 @@ export function CreateDomainModal({
   const handleResetAndClose = () => {
     setDomainInput("");
     setCreatedResult(null);
+    setTxtVerifyInfo(null);
+    setManualTxtValue("");
     setErrorMsg(null);
     onClose();
   };
@@ -280,6 +317,192 @@ export function CreateDomainModal({
                   立即配置解析记录
                 </Button>
               )}
+            </div>
+          </div>
+        ) : txtVerifyInfo ? (
+          /* 子域名 TXT 授权校验界面 */
+          <div className="flex flex-col flex-1 overflow-hidden">
+            <div className="p-4 sm:p-6 overflow-y-auto flex-1 space-y-4">
+              {/* 提示横幅 */}
+              <div className="p-3.5 rounded-xl bg-amber-500/10 border border-amber-500/25 flex items-start gap-3">
+                <ShieldAlert className="w-5 h-5 text-amber-400 mt-0.5 flex-shrink-0" />
+                <div className="space-y-1">
+                  <h4 className="text-sm font-bold text-amber-300">
+                    需要完成 TXT 记录授权校验
+                  </h4>
+                  <p className="text-xs text-content-secondary leading-relaxed">
+                    为防止子域劫持，腾讯云 DNSPod 要求证明您拥有该子域控制权。请前往主域名{" "}
+                    <span className="font-mono font-semibold text-accent">{txtVerifyInfo.parent_domain}</span>{" "}
+                    的原 DNS 服务商处添加以下 TXT 解析记录：
+                  </p>
+                </div>
+              </div>
+
+              {/* 专属校验值参数表格 */}
+              <div className="p-3.5 bg-surface-raised rounded-xl border border-border-base space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-semibold text-content-primary">
+                    请在主域 [{txtVerifyInfo.parent_domain}] 添加以下记录：
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const val = txtVerifyInfo.value || manualTxtValue || "";
+                      const text = `主机记录: ${txtVerifyInfo.host}\n记录类型: ${txtVerifyInfo.type}\n记录值: ${val}`;
+                      handleCopyText(text, "all_txt", "全部校验信息");
+                    }}
+                    className="text-xs text-accent hover:underline flex items-center gap-1"
+                  >
+                    <Copy className="w-3 h-3" /> 复制整段
+                  </button>
+                </div>
+
+                <div className="space-y-2">
+                  {/* 主机记录 */}
+                  <div className="flex items-center justify-between p-2.5 rounded-lg bg-surface border border-border-subtle group hover:border-accent/40 transition-colors">
+                    <div className="min-w-0 pr-2">
+                      <span className="text-[11px] text-content-muted block">主机记录 (Host)</span>
+                      <span className="font-mono text-xs font-semibold text-content-primary truncate block">
+                        {txtVerifyInfo.host}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => handleCopyText(txtVerifyInfo.host, "host", txtVerifyInfo.host)}
+                      className="p-1.5 rounded-lg text-content-muted hover:text-accent hover:bg-hovered transition-colors flex-shrink-0"
+                      title="复制主机记录"
+                    >
+                      {copiedKey === "host" ? (
+                        <Check className="w-4 h-4 text-emerald-400" />
+                      ) : (
+                        <Copy className="w-4 h-4" />
+                      )}
+                    </button>
+                  </div>
+
+                  {/* 记录类型 */}
+                  <div className="flex items-center justify-between p-2.5 rounded-lg bg-surface border border-border-subtle group hover:border-accent/40 transition-colors">
+                    <div className="min-w-0 pr-2">
+                      <span className="text-[11px] text-content-muted block">记录类型 (Type)</span>
+                      <span className="font-mono text-xs font-semibold text-content-primary truncate block">
+                        {txtVerifyInfo.type}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => handleCopyText(txtVerifyInfo.type, "type", txtVerifyInfo.type)}
+                      className="p-1.5 rounded-lg text-content-muted hover:text-accent hover:bg-hovered transition-colors flex-shrink-0"
+                      title="复制记录类型"
+                    >
+                      {copiedKey === "type" ? (
+                        <Check className="w-4 h-4 text-emerald-400" />
+                      ) : (
+                        <Copy className="w-4 h-4" />
+                      )}
+                    </button>
+                  </div>
+
+                  {/* 记录值 */}
+                  <div className="p-2.5 rounded-lg bg-surface border border-border-subtle space-y-1.5 group hover:border-accent/40 transition-colors">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[11px] text-content-muted">
+                        专属校验记录值 (Value)
+                      </span>
+                      {(txtVerifyInfo.value || manualTxtValue) ? (
+                        <button
+                          type="button"
+                          onClick={() => handleCopyText(txtVerifyInfo.value || manualTxtValue, "value", "记录值")}
+                          className="p-1 rounded text-content-muted hover:text-accent transition-colors"
+                          title="复制记录值"
+                        >
+                          {copiedKey === "value" ? (
+                            <Check className="w-3.5 h-3.5 text-emerald-400" />
+                          ) : (
+                            <Copy className="w-3.5 h-3.5" />
+                          )}
+                        </button>
+                      ) : null}
+                    </div>
+
+                    {txtVerifyInfo.value ? (
+                      <div className="font-mono text-xs font-semibold text-emerald-400 break-all select-all py-0.5">
+                        {txtVerifyInfo.value}
+                      </div>
+                    ) : (
+                      <div className="space-y-2">
+                        <Input
+                          type="text"
+                          value={manualTxtValue}
+                          onChange={(e) => setManualTxtValue(e.target.value)}
+                          placeholder="粘贴在腾讯云控制台获取的 32 位校验记录值（如 7bdae52...）"
+                          mono
+                          size="sm"
+                          className="w-full text-xs text-content-primary"
+                        />
+                        <div className="flex items-center justify-between text-[11px] text-content-muted">
+                          <span>💡 您可直接前往腾讯云 DNSPod 控制台添加时复制该 32 位值</span>
+                          <a
+                            href="https://console.cloud.tencent.com/cns"
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-accent hover:underline flex items-center gap-1 flex-shrink-0 ml-2"
+                          >
+                            直达控制台 <ExternalLink className="w-3 h-3" />
+                          </a>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <p className="text-[11px] text-content-muted leading-relaxed">
+                  💡 步骤说明：前往 <code className="text-content-secondary">{txtVerifyInfo.parent_domain}</code> 的原 DNS 服务商添加上述 TXT 记录后，点击下方【我已添加解析，立即验证】按钮，系统将自动发起上游校验并完成域名创建。
+                </p>
+              </div>
+
+              {/* 错误提示（若重试时依然校验不通过） */}
+              {errorMsg && (
+                <div className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/25 text-rose-300 text-xs flex items-center gap-2 animate-in fade-in">
+                  <AlertCircle className="w-4 h-4 flex-shrink-0" />
+                  <span>{errorMsg}</span>
+                </div>
+              )}
+            </div>
+
+            {/* 校验页底部操作栏 */}
+            <div className="bg-elevated px-4 sm:px-6 py-3.5 flex items-center justify-between border-t border-border-base flex-shrink-0">
+              <Button
+                type="button"
+                variant="secondary"
+                onClick={() => {
+                  setTxtVerifyInfo(null);
+                  setErrorMsg(null);
+                }}
+                disabled={submitting}
+                className="flex items-center gap-1.5"
+              >
+                <ArrowLeft className="w-4 h-4" />
+                返回修改
+              </Button>
+              <Button
+                type="button"
+                variant="primary"
+                onClick={() => handleSubmit()}
+                disabled={submitting}
+                className="flex items-center gap-2"
+              >
+                {submitting ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    正在上游验证并添加...
+                  </>
+                ) : (
+                  <>
+                    <RotateCw className="w-4 h-4" />
+                    我已添加解析，立即验证
+                  </>
+                )}
+              </Button>
             </div>
           </div>
         ) : (

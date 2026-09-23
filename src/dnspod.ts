@@ -587,6 +587,12 @@ export function translateDnspodError(code: string, message: string): string {
   if (c === "LimitExceeded.RecordLimitExceeded" || /record.*limit/i.test(m)) {
     return "该域名在 DNSPod 的解析记录数量已达套餐上限，请升级套餐或删除无用记录";
   }
+  if (c === "InvalidParameter.QuhuiTxtRecordWait" || /QuhuiTxtRecordWait/i.test(m)) {
+    return "添加该子域名需先完成主域名 TXT 授权校验：因主域名未在当前 DNSPod 账号下，腾讯云要求在原 DNS 服务商处添加一条主机名为「_dnspodcheck」的 TXT 校验记录，待 TXT 记录生效后再提交添加。";
+  }
+  if (c === "InvalidParameter.DomainIsExists" || /already exists|已存在/i.test(m)) {
+    return "该域名已存在于当前 DNSPod 账号名下，无需重复添加";
+  }
 
   const detail = m ? `${c || "未知错误"}: ${m}` : c || "未知错误";
   return `DNSPod API 错误: ${detail}`;

@@ -3,7 +3,7 @@
  */
 
 import { DatabaseManager, UpstreamSubdomain } from "../../db";
-import { DNSHEClient } from "../../dnshe";
+import { DNSHEClient, isDnsheOriginError } from "../../dnshe";
 import { CloudflareClient, mapZoneToUpstream, type CfZoneInfo } from "../../cloudflare";
 import { DigitalPlatClient, mapDomainToUpstream } from "../../digitalplat";
 import { computeDnsState } from "../../dns-provider";
@@ -317,6 +317,16 @@ export async function runDailySyncAndRenewal(
           "检测到 Worker 子请求配额已耗尽（免费计划单次调用硬限 50 次），已跳过本批次剩余账号。下一轮定时任务会从本轮中断处继续，不会漏掉账号。可尝试：把域名较多的账号拆分成多个 API Token 绑定，或升级到 Workers 付费计划"
         );
         quotaExhausted = true;
+        break;
+      }
+      // 上游不可达（520 等）：与限流无关，等下去不会恢复。
+      // 立即中止本轮，避免为剩余账号重复打出同样的失败与日志。
+      if (isDnsheOriginError(e)) {
+        await dbManager.writeLog(
+          "warning",
+          "sync",
+          "检测到 DNSHE 上游不可达，已中止本轮剩余账号的同步。该状态与请求频率无关，退避等待不会恢复，请稍后重试或联系服务商"
+        );
         break;
       }
     }

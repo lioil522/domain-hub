@@ -9,7 +9,7 @@
  * 5. 跨 DAO 编排（refreshAccountQuotaCache）
  */
 
-import { DNSHEClient } from "../dnshe";
+import { DNSHEClient, setDnsheCooldownStore } from "../dnshe";
 import { getBeijingNow, toBeijingString } from "./time-utils";
 import * as settingsDao from "./dao/settings-dao";
 import * as cacheDao from "./dao/cache-dao";
@@ -38,6 +38,14 @@ export class DatabaseManager {
   constructor(d1Database: D1Database, aesKey?: string) {
     this.db = d1Database;
     this.aesKey = aesKey;
+
+    // 把 D1 注入 DNSHE 客户端的冷却存储：520 后多 isolate 共享同一份冷却状态，
+    // 避免每个 isolate 各自「试一次」把上游刷成一片 520。
+    // NOTE: 用 setter 而非构造参数，保持 DNSHEClient 可被旧版/测试直接 new。
+    setDnsheCooldownStore({
+      get: (key) => cacheDao.getCache(this.db, key),
+      set: (key, value, ttl) => cacheDao.setCache(this.db, key, value, ttl),
+    });
   }
 
   // ===== Schema 自举 =====

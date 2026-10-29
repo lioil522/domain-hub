@@ -1,5 +1,6 @@
 import type { DatabaseManager, UpstreamSubdomain } from "../db";
-import { DNSHEClient } from "../dnshe";
+import { DNSHEClient, isDnsheOriginError } from "../dnshe";
+import type { SubdomainInfo } from "../dnshe";
 import { CloudflareClient, mapZoneToUpstream } from "../cloudflare";
 import { HuaweiCloudClient } from "../huaweicloud";
 import type { CfZoneInfo } from "../cloudflare";
@@ -109,14 +110,40 @@ export async function syncViaProviderAdapter(dbManager: DatabaseManager, account
   return upstreams.length;
 }
 
+/**
+ * 分批并发执行，允许映射到不同类型（`batchedPromiseAll` 限定 T→T，此处需要 T→R|null）
+ *
+ * WHY 单独实现：`cron/utils.ts` 的 `batchedPromiseAll<T>` 签名是 `(item:T)=>Promise<T>`，
+ * 要求输入输出同型。这里要把 SubdomainInfo 映射成 UpstreamSubdomain，且失败时返回 null，
+ * 类型对不上，故就地实现一个更宽松的版本。
+ */
+async function batchedMap<T, R>(items: T[], fn: (item: T) => Promise<R>, batchSize: number): Promise<R[]> {
+  const out: R[] = [];
+  for (let i = 0; i < items.length; i += batchSize) {
+    out.push(...(await Promise.all(items.slice(i, i + batchSize).map(fn))));
+  }
+  return out;
+}
+
 // NOTE: 深度同步单个 DNSHE 账号的域名缓存 — 逐个拉取每个域名的 DNS 记录，自动分类（已委派/已解析/未解析）
 // 与 cron.ts 中 "同步所有域名" 的逻辑保持一致，供绑定/批量/修改换 Key 后调用
+//
+// WHY 必须用分批并发：早期这里是裸 `Promise.all(subdomains.map(...))`，
+// 账号下所有域名的 listDnsRecords 会**同时**发出。实测瞬时并发 120 会把 DNSHE
+// 应用层打崩（89/120 返回 520，且持续数十分钟不恢复）。批处理后并发峰值 ≤3。
+//
+// WHY 遇到 DnsheOriginError 要整体中止：520 与限流无关（串行 120 次实测 0 次 520），
+// 是上游不可达。此时继续为剩余域名发请求既不可能成功，还会加重上游负担、刷爆日志。
 export async function deepSyncAccountDomains(dbManager: DatabaseManager, accountId: number, client: DNSHEClient): Promise<number> {
   const subdomains = await fetchAllSubdomainsFromClient(client);
 
-  // 并发拉取每个子域名的 DNS 记录，自动计算真实状态
-  const enriched = await Promise.all(
-    subdomains.map(async (sub) => {
+  // 并发拉取每个子域名的 DNS 记录，自动计算真实状态（并发上限 3）
+  let originDown: unknown = null;
+
+  const enriched = await batchedMap<SubdomainInfo, UpstreamSubdomain | null>(
+    subdomains,
+    async (sub): Promise<UpstreamSubdomain | null> => {
+      if (originDown) return null; // 已判定上游不可达，剩余项直接跳过
       try {
         const recordsRes = await client.listDnsRecords(sub.id);
         const records = recordsRes.records || [];
@@ -126,16 +153,26 @@ export async function deepSyncAccountDomains(dbManager: DatabaseManager, account
 
         return { ...sub, ...computeDnsState(records) };
       } catch (e: unknown) {
+        if (isDnsheOriginError(e)) {
+          originDown = e;
+          return null;
+        }
         console.error(`listDnsRecords failed for subdomain ${sub.id}:`, e);
         // 上游临时失败时不带 dns_state_known，缓存中已识别出的三态与托管商保持不变。
         return { ...sub };
       }
-    })
+    },
+    3
   );
 
-  if (enriched.length > 0) {
-    await dbManager.syncAccountDomains(accountId, enriched);
+  const usable = enriched.filter((x): x is UpstreamSubdomain => x !== null);
+  if (usable.length > 0) {
+    await dbManager.syncAccountDomains(accountId, usable);
   }
+
+  // 上游不可达：把错误上抛，让 resyncAccountsInBackground 中止整批
+  if (originDown) throw originDown;
+
   return subdomains.length;
 }
 
@@ -149,6 +186,11 @@ export async function deepSyncAccountDomains(dbManager: DatabaseManager, account
  * 页看不到手动单账号同步的任何痕迹，用户以为同步没跑。定时任务那条路径（cron.ts）每步
  * 都有 writeLog，所以只有它有日志，这个差异是缺陷而不是设计。
  *
+ * WHY 遇到上游不可达要 break 而不是 continue：
+ * 实测 6 个账号 × 2 次调用 = 12 条 520，每账号间隔 1.2s，全程 13 秒。而 520 与限流
+ * 无关（串行 120 次 0 次 520），不可能靠等待恢复。继续跑剩余账号只会得到同样的 520，
+ * 把 1 条错误变成 N 条，并给已故障的上游继续施压。故首个账号判定上游不可达后立即中止。
+ *
  * @param trigger 触发来源，仅用于日志措辞（"manual"=用户手动点同步 / "auto"=绑定后自动）
  */
 export async function resyncAccountsInBackground(
@@ -157,7 +199,8 @@ export async function resyncAccountsInBackground(
   trigger: "manual" | "auto" = "auto"
 ) {
   const triggerLabel = trigger === "manual" ? "手动同步" : "后台同步";
-  for (const id of accountIds) {
+  for (let i = 0; i < accountIds.length; i++) {
+    const id = accountIds[i];
     // 先取别名用于日志；取不到就用 id 兜底（账号可能已被删除）
     let aliasForLog = `账号 ${id}`;
     try {
@@ -199,6 +242,21 @@ export async function resyncAccountsInBackground(
       );
       console.log(`Deep sync finished for account ${id}: ${synced} domains`);
     } catch (e: unknown) {
+      // ── 上游不可达：落一条聚合日志后中止整批 ──
+      if (isDnsheOriginError(e)) {
+        const remain = accountIds.length - i;
+        const msg = e instanceof Error ? e.message : "DNSHE 上游服务异常";
+        await logService(dbManager).write(
+          "error",
+          "sync",
+          `${triggerLabel}：账号 [${aliasForLog}] 同步失败：${msg}。` +
+            `已中止本批剩余 ${remain - 1} 个账号的同步（上游不可达时重试无意义）`,
+          e instanceof Error ? e.stack : undefined
+        );
+        console.error(`Background account resync aborted at account ${id} (upstream unreachable):`, e);
+        return;
+      }
+
       const message = e instanceof Error ? e.message : "未知错误";
       const stack = e instanceof Error ? (e.stack || message) : message;
       // 失败必须落库 —— 这正是原先只 console.error 时用户完全看不到的那类信息

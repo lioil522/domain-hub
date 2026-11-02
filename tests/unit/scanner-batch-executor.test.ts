@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import { runScannerWorkers } from "../../frontend/src/features/scanner/utils/scanner-batch-executor";
 import type { ScannerTask } from "../../frontend/src/features/scanner/utils/scanner-batch-planner";
 import type { ScanStatus } from "../../frontend/src/features/scanner/utils/scanner-types";
@@ -8,6 +8,22 @@ import { scannerAccountPauseReason } from "../../frontend/src/features/scanner/u
 const task = (sub: string): ScannerTask => ({ sub, root: "us.ci", full: `${sub}.us.ci`, queryFull: `${sub}.us.ci` });
 
 async function tick() { await new Promise(resolve => setTimeout(resolve, 0)); }
+
+async function flushMicrotasks() { for (let i = 0; i < 10; i++) await Promise.resolve(); }
+
+function mockClock(t: TestContext) {
+  let now = 0;
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+  t.mock.method(performance, "now", () => now);
+  return {
+    now: () => now,
+    async advance(timerMs: number, elapsedMs = timerMs) {
+      now += elapsedMs;
+      t.mock.timers.tick(timerMs);
+      await flushMicrotasks();
+    },
+  };
+}
 
 test("executor distributes tasks across workers and preserves all task claims", async () => {
   const statusBox: { value: ScanStatus } = { value: "running" };
@@ -90,20 +106,106 @@ test("queued accounts do not claim after stop; in-flight calls may still finish"
   assert.equal(progress.at(-1), 5);
 });
 
-test("independent lanes retain each account's minimum start interval", async () => {
+test("independent lanes retain each account's minimum start interval", async t => {
+  const clock = mockClock(t);
   const accounts = [1, 2, 3, 4, 5].map(id => ({ id })) as import("../../frontend/src/types/account").Account[];
   const starts = new Map<number, number[]>();
-  await runScannerWorkers({ tasks: Array.from({ length: 15 }, (_, i) => task(`a${i}`)), accounts, rateLimitMs: 20,
+  const running = runScannerWorkers({ tasks: Array.from({ length: 15 }, (_, i) => task(`a${i}`)), accounts, rateLimitMs: 20,
     getStatus: () => "running", waitWhilePaused: async () => {}, shouldSkip: () => false,
     onTaskClaimed: () => {}, onSkipped: () => {},
     processTask: async (_task, account) => {
       const list = starts.get(account!.id) || [];
-      list.push(Date.now());
+      list.push(clock.now());
       starts.set(account!.id, list);
     },
   });
+  await flushMicrotasks();
   assert.equal(starts.size, 5);
-  for (const list of starts.values()) assert.ok(list.slice(1).every((at, i) => at - list[i] >= 20));
+  for (const list of starts.values()) assert.deepEqual(list, [0]);
+  await clock.advance(19);
+  for (const list of starts.values()) assert.deepEqual(list, [0]);
+  await clock.advance(1);
+  for (const list of starts.values()) assert.deepEqual(list, [0, 20]);
+  await clock.advance(20);
+  await running;
+  for (const list of starts.values()) {
+    assert.deepEqual(list, [0, 20, 40]);
+    assert.ok(list.slice(1).every((at, i) => at - list[i] >= 20));
+  }
+});
+
+test("early and fractional timer wakeups cannot shorten a lane's minimum start interval", async t => {
+  const clock = mockClock(t);
+  const starts: number[] = [];
+  const running = runScannerWorkers({ tasks: [task("a"), task("b")], accounts: [null], rateLimitMs: 20,
+    getStatus: () => "running", waitWhilePaused: async () => {}, shouldSkip: () => false,
+    onTaskClaimed: () => {}, onSkipped: () => {},
+    processTask: async () => { starts.push(clock.now()); },
+  });
+  await flushMicrotasks();
+  await clock.advance(20, 19);
+  assert.deepEqual(starts, [0]);
+  await clock.advance(1, 0.5);
+  assert.deepEqual(starts, [0]);
+  await clock.advance(1, 0.5);
+  await running;
+  assert.deepEqual(starts, [0, 20]);
+});
+
+test("wall-clock jumps do not shorten a lane's monotonic start interval", async t => {
+  const clock = mockClock(t);
+  const starts: number[] = [];
+  const running = runScannerWorkers({ tasks: [task("a"), task("b")], accounts: [null], rateLimitMs: 20,
+    getStatus: () => "running", waitWhilePaused: async () => {}, shouldSkip: () => false,
+    onTaskClaimed: () => {}, onSkipped: () => {},
+    processTask: async () => { starts.push(clock.now()); },
+  });
+  await flushMicrotasks();
+  await clock.advance(1000, 19);
+  assert.deepEqual(starts, [0]);
+  await clock.advance(1);
+  await running;
+  assert.deepEqual(starts, [0, 20]);
+});
+
+test("slow requests consume the start interval without an extra full delay", async t => {
+  const clock = mockClock(t);
+  const starts: number[] = [];
+  const running = runScannerWorkers({ tasks: [task("a"), task("b")], accounts: [null], rateLimitMs: 20,
+    getStatus: () => "running", waitWhilePaused: async () => {}, shouldSkip: () => false,
+    onTaskClaimed: () => {}, onSkipped: () => {},
+    processTask: async () => {
+      starts.push(clock.now());
+      await new Promise(resolve => setTimeout(resolve, 25));
+    },
+  });
+  await flushMicrotasks();
+  await clock.advance(24);
+  assert.deepEqual(starts, [0]);
+  await clock.advance(1);
+  assert.deepEqual(starts, [0, 25]);
+  await clock.advance(25);
+  await running;
+});
+
+test("stopping during a rechecked interval does not claim or send another task", async t => {
+  const clock = mockClock(t);
+  let status: ScanStatus = "running";
+  const claimed: string[] = [];
+  const starts: number[] = [];
+  const running = runScannerWorkers({ tasks: [task("a"), task("b")], accounts: [null], rateLimitMs: 20,
+    getStatus: () => status, waitWhilePaused: async () => {}, shouldSkip: () => false,
+    onTaskClaimed: item => { claimed.push(item.sub); }, onSkipped: () => {},
+    processTask: async () => { starts.push(clock.now()); },
+  });
+  await flushMicrotasks();
+  await clock.advance(20, 19);
+  status = "idle";
+  await clock.advance(1);
+  const result = await running;
+  assert.deepEqual(claimed, ["a"]);
+  assert.deepEqual(starts, [0]);
+  assert.equal(result.processedCount, 1);
 });
 
 test("1000 account lanes start independently and a slow first lane retains the earliest unfinished frontier", async () => {

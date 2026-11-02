@@ -81,7 +81,7 @@ export async function runScannerWorkers({
         continue;
       }
 
-      const startedAt = Date.now();
+      const startedAt = performance.now();
       const result = await processTask(task, account, index);
       if (result === "retry") retries.push(index);
       else {
@@ -90,9 +90,12 @@ export async function runScannerWorkers({
       }
       if (result === "account-paused") return; // Never automatically resume/retry a cooled credential.
 
-      const elapsed = Date.now() - startedAt;
-      if (elapsed < rateLimitMs && (nextTaskIndex < tasks.length || retries.length > 0)) {
-        await new Promise(resolve => setTimeout(resolve, rateLimitMs - elapsed));
+      // Timers may wake early; wall-clock adjustments must not shorten a lane's
+      // interval. Recheck monotonic elapsed time before claiming any more work.
+      let remainingMs = rateLimitMs - (performance.now() - startedAt);
+      while (remainingMs > 0 && getStatus() !== "idle" && (nextTaskIndex < tasks.length || retries.length > 0)) {
+        await new Promise(resolve => setTimeout(resolve, Math.ceil(remainingMs)));
+        remainingMs = rateLimitMs - (performance.now() - startedAt);
       }
     }
   };

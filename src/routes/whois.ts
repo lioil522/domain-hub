@@ -5,6 +5,7 @@ import { toASCII, isRegistrableDomain } from "../punycode";
 import { successRes, errorRes } from "./response";
 import { WhoisService } from "../services/whois-service";
 import type { Bindings, Variables } from "./types";
+import { AppError } from "../errors";
 
 export interface WhoisRouteDeps {
   logService: (db: DatabaseManager) => { write: (level: string, source: string, message: string, meta?: unknown) => Promise<unknown> };
@@ -25,7 +26,7 @@ app.get("/api/whois", async (c) => {
   try {
     const accountId = accountIdParam ? Number(accountIdParam) : undefined;
     const asciiDomain = toASCII(domain.trim());
-    const res = await new WhoisService(dbManager).query(asciiDomain, accountId);
+    const res = await new WhoisService(dbManager).query(asciiDomain, accountId, c.req.raw.signal);
 
     // 查重池回填：确认已注册的域名写入池子（7 天 TTL），供后续批量扫描直接跳过
     if (res && res.registered === true) {
@@ -42,6 +43,7 @@ app.get("/api/whois", async (c) => {
     }
     return c.json(successRes({ whois: res }));
   } catch (e: unknown) {
+    if (e instanceof AppError) throw e;
     const message = e instanceof Error ? e.message : "WHOIS 查询异常";
     return c.json(errorRes(message), 400);
   }

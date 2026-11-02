@@ -17,6 +17,7 @@ import * as logDao from "./dao/log-dao";
 import * as authDao from "./dao/auth-dao";
 import * as accountDao from "./dao/account-dao";
 import * as domainDao from "./dao/domain-dao";
+import * as syncDao from "./dao/sync-dao";
 import * as customDao from "./dao/custom-dao";
 import * as backupDao from "./dao/backup-dao";
 import type {
@@ -30,6 +31,9 @@ import type {
   UpstreamSubdomain,
 } from "./types";
 import { NON_QUOTA_PROVIDERS } from "./types";
+import { databaseBudget } from "./budget-d1";
+import { SYNC_TASK_SCHEMA } from "./sync-task-schema";
+import { AUTOMATION_SCHEMA } from "./automation-schema";
 
 export class DatabaseManager {
   private db: D1Database;
@@ -39,6 +43,10 @@ export class DatabaseManager {
     this.db = d1Database;
     this.aesKey = aesKey;
   }
+
+  get invocationBudget() { return databaseBudget(this.db); }
+  /** Internal DAO composition; retains the invocation's counted connection. */
+  get connection() { return this.db; }
 
   // ===== Schema 自举 =====
 
@@ -191,6 +199,7 @@ export class DatabaseManager {
       if (migrations.length > 0) {
         await this.db.batch(migrations.map((sql) => this.db.prepare(sql)));
       }
+      await this.db.batch([...SYNC_TASK_SCHEMA, ...AUTOMATION_SCHEMA].map(sql => this.db.prepare(sql)));
       return true;
     } catch (e) {
       console.error("Auto ensureTables error:", e);
@@ -210,7 +219,8 @@ export class DatabaseManager {
 
   async allRaw<T>(sql: string, bindings: unknown[] = []): Promise<T[]> {
     const result = await this.db.prepare(sql).bind(...bindings).all<T>();
-    return result.results || [];
+    if (!result.success || !Array.isArray(result.results)) throw new Error("数据库查询未完成");
+    return result.results;
   }
 
   // ===== 时间工具（保持兼容，内部委托） =====
@@ -319,6 +329,12 @@ export class DatabaseManager {
   async setPassword(username: string, password: string): Promise<void> {
     return authDao.setPassword(this.db, username, password);
   }
+  async getAuthoritativeAppSettings(): Promise<Record<string, string>> {
+    return settingsDao.getAllAppSettings(this.db, this.aesKey, true);
+  }
+  async initializePassword(username: string, password: string): Promise<boolean> {
+    return authDao.initializePassword(this.db, username, password);
+  }
   async verifyPassword(password: string): Promise<boolean> {
     return authDao.verifyPassword(this.db, this.aesKey, password);
   }
@@ -360,8 +376,8 @@ export class DatabaseManager {
   ): Promise<void> {
     return logDao.writeLog(this.db, type, category, message, details);
   }
-  async getLogs(limit = 100, categories?: string[]): Promise<DBLog[]> {
-    return logDao.getLogs(this.db, limit, categories);
+  async getLogs(limit = 100, categories?: string[], afterId?: number): Promise<DBLog[]> {
+    return logDao.getLogs(this.db, limit, categories, afterId);
   }
   async clearLogs(): Promise<void> {
     return logDao.clearLogs(this.db);
@@ -392,6 +408,25 @@ export class DatabaseManager {
   }
 
   // ===== Domain DAO 委托 =====
+
+  /** Complete records and invalidation marker commit together; never clear dirty on a failed write. */
+  async replaceDnsRecordsCache(domainId: number, records: unknown[]): Promise<void> {
+    await this.db.batch([
+      this.db.prepare(`INSERT INTO cache(key,value,expires_at) VALUES(?,?,?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, expires_at = excluded.expires_at`)
+        .bind(`api_cache:dns:${domainId}`, JSON.stringify(records), Math.floor(Date.now() / 1000) + 366 * 24 * 3600),
+      this.db.prepare("DELETE FROM cache WHERE key = ?").bind(`dns_dirty:${domainId}`),
+      this.db.prepare("UPDATE domains_cache SET updated_at=updated_at WHERE id=?").bind(domainId),
+    ]);
+  }
+
+  async acquireSyncLease(key: string, token: string): Promise<boolean> {
+    return syncDao.acquireSyncLease(this.db, key, token);
+  }
+  async commitSyncPage(accountId: number, domains: UpstreamSubdomain[], leaseKey: string, token: string,
+    cursorKey: string, value: string, ttl: number, deletions: syncDao.SyncCandidate[] = []): Promise<void> {
+    return syncDao.commitSyncPage(this.db, accountId, domains, leaseKey, token, cursorKey, value, ttl, deletions);
+  }
 
   async getDomains(search = "", status = "", accountId?: number, provider?: AccountProvider): Promise<DBDomain[]> {
     return domainDao.getDomains(this.db, search, status, accountId, provider);
@@ -462,7 +497,7 @@ export class DatabaseManager {
   async exportAllData() {
     return backupDao.exportAllData(this.db);
   }
-  async importAllData(snapshot: { version?: number; data?: Record<string, unknown[]> }) {
-    return backupDao.importAllData(this.db, snapshot);
+  async importAllData(snapshot: unknown, sourceAesKey?: string, dryRun = false) {
+    return backupDao.importAllData(this.db, snapshot, this.aesKey, sourceAesKey, dryRun);
   }
 }

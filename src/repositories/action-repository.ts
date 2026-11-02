@@ -23,13 +23,16 @@ export class ActionRepository {
   }
 
   async update(id: string, patch: Partial<StoredAction>): Promise<void> {
-    const current = await this.get(id);
-    if (!current) throw new Error(`Action ${id} not found`);
-    const next = { ...current, ...patch };
+    const columns = ["status", "progress", "started_at", "finished_at", "error", "metadata"] as const;
+    const supplied = columns.filter(column => patch[column] !== undefined);
+    if (!supplied.length) return;
+    const values = supplied.map(column => column === "metadata" ? JSON.stringify(patch[column]) : patch[column]);
+    // No read/merge/full-row write: independent patches cannot overwrite each other.
+    // A settled/cancelled Action is immutable, including to a late background runner.
     await this.db.executeRaw(`
-      UPDATE actions SET status = ?, progress = ?, started_at = ?, finished_at = ?, error = ?, metadata = ?, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `, [next.status, next.progress, next.started_at || null, next.finished_at || null, next.error || null, JSON.stringify(next.metadata ?? null), id]);
+      UPDATE actions SET ${supplied.map(column => `${column} = ?`).join(", ")}, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ? AND status IN ('queued', 'running')
+    `, [...values, id]);
   }
 
   async get(id: string): Promise<StoredAction | null> {

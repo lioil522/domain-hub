@@ -25,10 +25,9 @@ export const DNSHE_SCHEMA: BindProviderSchema = {
     body: (v) => ({ alias: v.alias, api_key: v.apiKey, api_secret: v.apiSecret }),
     validate: (v) => (!v.apiKey?.trim() || !v.apiSecret?.trim() ? "API Key 与 API Secret 为必填项！" : null),
     successToast: (data, v) => `账号 [${data.account?.alias || v.alias || v.apiKey}] 验证并绑定成功！`,
-    // 原实现：fetchAccounts() 与 waitForAccountDomainSync(...) 均不 await（fire-and-forget）
-    onSuccess: (data, v, deps) => {
-      deps.fetchAccounts();
-      deps.waitForAccountDomainSync([Number(data.account?.id)], `账号 [${data.account?.alias || v.apiKey}] 绑定成功`);
+    onSuccess: async (data, v, deps) => {
+      await deps.fetchAccounts();
+      await deps.waitForAccountDomainSync([Number(data.account?.id)], `账号 [${data.account?.alias || v.apiKey}] 绑定成功`, data.actionId);
     },
     errorFallback: "账号绑定失败，请检查密钥是否正确",
     catchToast: "绑定请求发送失败，请检查网络",
@@ -74,9 +73,9 @@ export const DNSHE_SCHEMA: BindProviderSchema = {
     invalidLineMsg: (n) => `${n} 行格式不正确（每行需包含 API Key 与 API Secret），已自动跳过`,
     invalidToast: "未能解析出任何有效的账号信息，请检查输入格式",
     successToast: (data) => ({ level: "success", msg: data.message || "批量绑定完成" }),
-    onSuccess: (data, deps) => {
-      deps.fetchAccounts();
-      deps.waitForAccountDomainSync((data.account_ids || []).map(Number), `${(data.account_ids || []).length} 个账号绑定成功`);
+    onSuccess: async (data, deps) => {
+      await deps.fetchAccounts();
+      if (data.account_ids?.length) await deps.waitForAccountDomainSync(data.account_ids.map(Number), `${data.account_ids.length} 个账号绑定成功`, data.actionId);
     },
     errorFallback: "批量绑定失败",
     catchToast: "批量绑定请求发送失败，请检查网络",

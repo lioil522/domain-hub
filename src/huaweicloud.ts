@@ -28,6 +28,9 @@
 
 import type { ActionResponse, CreateDnsRecordResponse, DnsRecordInfo, ListDnsRecordsResponse } from "./dnshe";
 import type { UpstreamSubdomain } from "./db";
+import { ProviderApiError, incompleteResponse } from "./errors/provider-api-error";
+import { parseProviderJson, requestProviderText, PROVIDER_TIMEOUT_MS, type ProviderRequestLimits, type ProviderTextResponse } from "./providers/provider-request";
+import { CompleteList, domainKey, hasText, isCount, isObject } from "./providers/list-integrity";
 import { zoneIdToNumericId } from "./cloudflare";
 
 /**
@@ -68,14 +71,6 @@ const HUAWEI_PAGE_SIZE = 100;
 
 /** 列表接口最多翻多少页（防御上游分页异常导致的死循环） */
 const HUAWEI_MAX_PAGES = 50;
-
-/**
- * 节点级失败 —— 只说明**这个接入点**用不了，与凭据无关，可以顺延到下一个候选节点。
- *
- * NOTE: 必须与「凭据级失败」严格区分开。认证失败（401 / APIGW.0301）是凭据的
- * 结论，换节点重试没有意义，而且会让用户等 4 倍时间才看到真正的错误。
- */
-class HuaweiEndpointUnreachableError extends Error {}
 
 /**
  * 判断一个字符串是否形如华为云 AccessKey ID（20 位大写字母数字）
@@ -325,9 +320,13 @@ export function isHuaweiLineEqual(lineA: string | undefined | null, lineB: strin
   return String(lineA || "").trim().toLowerCase() === String(lineB || "").trim().toLowerCase();
 }
 
-/**
- * 华为云云解析 DNS API 请求封装类
- */
+function huaweiRecordKeys(r: HuaweiRecordSet): string[] | null {
+  return hasText(r.id) && hasText(r.name) && hasText(r.type) && isCount(r.ttl) &&
+    Array.isArray(r.records) && r.records.length > 0 && r.records.every(v => typeof v === "string")
+      ? [`id:${r.id}`] : null;
+}
+
+/** 华为云云解析 DNS API 请求封装类 */
 export class HuaweiCloudClient {
   private accessKeyId: string;
   private secretAccessKey: string;
@@ -339,7 +338,8 @@ export class HuaweiCloudClient {
    *             让客户端自己走「全局节点 → 区域节点」的候选顺序，这样
    *             中国站与国际站的账号都不需要用户额外选择站点。
    */
-  constructor(accessKeyId: string, secretAccessKey: string, host?: string) {
+  constructor(accessKeyId: string, secretAccessKey: string, host?: string,
+    private readonly requestLimits: ProviderRequestLimits = {}) {
     this.accessKeyId = String(accessKeyId || "").trim();
     this.secretAccessKey = String(secretAccessKey || "").trim();
     this.pinnedHost = String(host || "").trim();
@@ -360,14 +360,16 @@ export class HuaweiCloudClient {
    * NOTE: 待签串里 CanonicalHeaders 必须与实际下发的 host / x-sdk-date **逐字符一致**，
    * 且 SignedHeaders 要按字母序声明；body 的哈希用空串的 SHA-256（GET/DELETE）或
    * 实际 body 的 SHA-256。规范 URI 必须补尾斜杠（见 toSignablePath，这是本项目
-   * 踩过的真实坑）。按候选择终端节点依次尝试：只有**节点级失败**才顺延，
-   * 拿到任何真实的 API 应答即返回。
+    * 踩过的真实坑）。仅 GET 可在节点网络/404 失败时换节点，候选共用总期限；
+    * 超时立即终止。写请求失败立即传播，未知写入结果不得换节点重发。
    */
   private async request<T>(
     method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE",
     path: string,
     options: { query?: Record<string, unknown>; body?: unknown } = {}
   ): Promise<T> {
+    const timeoutMs = this.requestLimits.timeoutMs ?? PROVIDER_TIMEOUT_MS;
+    const deadline = Date.now() + timeoutMs;
     const bodyText = options.body === undefined ? "" : JSON.stringify(options.body);
     const xSdkDate = new Date().toISOString().replace(/\.\d{3}Z$/, "Z").replace(/[-:]/g, "");
     const bodyHash = await sha256Hex(bodyText);
@@ -394,9 +396,12 @@ export class HuaweiCloudClient {
       const authorization =
         `SDK-HMAC-SHA256 Access=${this.accessKeyId}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
 
-      let response: Response;
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) throw new ProviderApiError("huaweicloud", 502, "request_timeout",
+        "华为云 DNS 请求超时；写入结果可能尚未确认，请先刷新核对，不会自动重试");
+      let result: ProviderTextResponse;
       try {
-        response = await fetch(requestUrl, {
+        result = await requestProviderText("huaweicloud", requestUrl, {
           method,
           headers: {
             Authorization: authorization,
@@ -406,28 +411,22 @@ export class HuaweiCloudClient {
             "Content-Type": "application/json",
           },
           body: bodyText === "" ? undefined : bodyText,
-        });
+        }, { ...this.requestLimits, timeoutMs: remainingMs });
       } catch (e: unknown) {
-        // 连不上 / 域名解析不了 —— 节点级失败，换下一个候选
-        lastError = new HuaweiEndpointUnreachableError(
-          `华为云 DNS 终端节点 ${host} 不可达：${e instanceof Error ? e.message : "网络请求失败"}`
-        );
+        if (method !== "GET" || !(e instanceof ProviderApiError) || e.error_code !== "transport_error") throw e;
+        lastError = e;
         continue;
       }
+      const { response, retryAfterMs } = result;
 
       if (response.status === 204) {
         resolvedHuaweiHost.set(this.accessKeyId, host);
         return {} as T;
       }
 
-      let data: unknown;
-      try {
-        data = await response.json();
-      } catch {
-        throw new Error(`华为云 DNS API 响应异常 (HTTP ${response.status})`);
-      }
+      const data = parseProviderJson("huaweicloud", result);
 
-      if (!response.ok) {
+      if (!response.ok || (isObject(data) && (hasText(data.error_code) || hasText(data.code)))) {
         const err = data as { error_code?: string; error_msg?: string; message?: string; code?: string };
         const code = String(err?.error_code || err?.code || "");
         const message = String(err?.error_msg || err?.message || "");
@@ -435,15 +434,15 @@ export class HuaweiCloudClient {
         // 404 /「接口未在该环境发布」= 这个接入点根本没有该 API，属节点级失败，可以顺延。
         // NOTE: 401(APIGW.0301) 是**凭据级**结论 —— 换节点结果完全一样，必须立刻抛给
         // 用户，否则要多花 3 次请求才看到同一句「认证失败」，白白拖慢绑定。
-        if (response.status === 404 || /does not exist or has not been published/i.test(message)) {
-          lastError = new HuaweiEndpointUnreachableError(
-            `华为云 DNS 终端节点 ${host} 未提供该接口 (HTTP ${response.status})`
-          );
+        if (method === "GET" && !result.rateLimited && (response.status === 404 ||
+          (response.status !== 401 && response.status !== 403 && response.status !== 429 && /does not exist or has not been published/i.test(message)))) {
+          lastError = new HuaweiApiError(translateHuaweiError(code, message, response.status), code, response.status, message, retryAfterMs);
           continue;
         }
 
-        const translated = translateHuaweiError(code, message, response.status);
-        throw new HuaweiApiError(translated, code, response.status, message);
+        const translated = result.rateLimited ? "华为云 DNS API 请求过于频繁被限流，请稍后重试"
+          : translateHuaweiError(code, message, response.status);
+        throw new HuaweiApiError(translated, code, response.status, message, retryAfterMs, result.rateLimited);
       }
 
       resolvedHuaweiHost.set(this.accessKeyId, host);
@@ -452,7 +451,7 @@ export class HuaweiCloudClient {
 
     throw lastError instanceof Error
       ? lastError
-      : new Error("华为云 DNS API 不可达：所有候选终端节点均连接失败");
+      : new ProviderApiError("huaweicloud", 502, "transport_error", "华为云 DNS API 不可达：所有候选终端节点均连接失败");
   }
 
   /**
@@ -461,17 +460,59 @@ export class HuaweiCloudClient {
    * NOTE: 只列公网域名（ListPublicZones）—— 面板管理的是公网解析，私网 zone
    * 没有对外的 NS 委派，列出来只会让用户困惑。分页参数是 limit/offset。
    */
-  async listDomains(): Promise<HuaweiZoneInfo[]> {
-    const zones: HuaweiZoneInfo[] = [];
-    for (let page = 0; page < HUAWEI_MAX_PAGES; page++) {
-      const res = await this.request<{ zones?: HuaweiZoneInfo[] }>("GET", "/v2/zones", {
-        query: { limit: HUAWEI_PAGE_SIZE, offset: page * HUAWEI_PAGE_SIZE, type: "public" },
-      });
-      const list = Array.isArray(res.zones) ? res.zones : [];
-      zones.push(...list.filter((z) => String(z.name || "").trim() !== ""));
-      if (list.length < HUAWEI_PAGE_SIZE) break;
+  async listDomainsPage(offset = 0, expectedTotal?: number) {
+    const res = await this.request<Record<string, unknown>>("GET", "/v2/zones", { query: { type: "public", limit: HUAWEI_PAGE_SIZE, offset } });
+    const list = new CompleteList<HuaweiZoneInfo>("huaweicloud");
+    list.add(res.zones, z => hasText(z.id) && hasText(z.name) && domainKey(z.name) ? [`id:${z.id}`, `name:${domainKey(z.name)}`] : null, HUAWEI_PAGE_SIZE);
+    const total = pageTotal("huaweicloud", isObject(res.metadata) ? res.metadata.total_count : undefined, offset, list.items.length, expectedTotal);
+    const ended = offset + list.items.length === total;
+    if (res.links !== undefined) {
+      if (!isObject(res.links)) throw incompleteResponse("huaweicloud");
+      const next = res.links.next;
+      if (next !== undefined && next !== null && next !== "") {
+        if (!hasText(next) || ended) throw incompleteResponse("huaweicloud");
+        let url: URL;
+        try { url = new URL(next, `https://${HUAWEI_DNS_HOSTS[0]}`); } catch { throw incompleteResponse("huaweicloud"); }
+        if (url.pathname !== "/v2/zones" || url.searchParams.has("offset") && url.searchParams.get("offset") !== String(offset + list.items.length)) throw incompleteResponse("huaweicloud");
+      } else if (Object.hasOwn(res.links, "next") && !ended) throw incompleteResponse("huaweicloud");
     }
-    return zones;
+    return { items: list.items, total, next: ended ? null : offset + list.items.length };
+  }
+
+  async listDomains(): Promise<HuaweiZoneInfo[]> {
+    return this.readCompleteList<HuaweiZoneInfo>("/v2/zones", "zones", z =>
+      hasText(z.id) && hasText(z.name) && domainKey(z.name)
+        ? [`id:${z.id}`, `name:${domainKey(z.name)}`] : null, { type: "public" });
+  }
+
+  private async readCompleteList<T>(
+    path: string, field: string, keys: (item: T) => string[] | null, query: Record<string, unknown> = {}
+  ): Promise<T[]> {
+    const list = new CompleteList<T>("huaweicloud");
+    for (let page = 0; page < HUAWEI_MAX_PAGES; page++) {
+      const res = await this.request<Record<string, unknown>>("GET", path, {
+        query: { ...query, limit: HUAWEI_PAGE_SIZE, offset: list.items.length },
+      });
+      list.add(res?.[field], keys, HUAWEI_PAGE_SIZE);
+      const ended = list.ended(isObject(res?.metadata) ? res.metadata.total_count : undefined);
+      if (res?.links !== undefined) {
+        if (!isObject(res.links)) throw incompleteResponse("huaweicloud");
+        const next = res.links.next;
+        if (next !== undefined && next !== null && next !== "") {
+          if (!hasText(next) || ended) throw incompleteResponse("huaweicloud");
+          // Never fetch an upstream-provided URL with credentials. Validate offset when present.
+          let url: URL;
+          try { url = new URL(next, `https://${HUAWEI_DNS_HOSTS[0]}`); }
+          catch { throw incompleteResponse("huaweicloud"); }
+          if (url.pathname !== path || (url.searchParams.has("offset") &&
+            url.searchParams.get("offset") !== String(list.items.length))) throw incompleteResponse("huaweicloud");
+        } else if (Object.hasOwn(res.links, "next") && !ended) {
+          throw incompleteResponse("huaweicloud");
+        }
+      }
+      if (ended) return list.items;
+    }
+    throw incompleteResponse("huaweicloud", "华为云分页达到上限，旧缓存保持不变");
   }
 
   /**
@@ -500,24 +541,12 @@ export class HuaweiCloudClient {
   /**
    * 分页列出 zone 下全部原始 Recordset
    *
-   * NOTE: 上下游统一复用本方法的分页逻辑（limit: 100, offset: page * 100），杜绝 limit: 500 导致网关报 400
+   * NOTE: 读取和 RRset 合并共享完整性校验；短页按实际条数推进 offset。
    */
   async listAllRawRecordSets(zoneId: string | number): Promise<HuaweiRecordSet[]> {
     const id = String(zoneId || "").trim();
-    if (!id) return [];
-
-    const recordsets: HuaweiRecordSet[] = [];
-    for (let page = 0; page < HUAWEI_MAX_PAGES; page++) {
-      const res = await this.request<{ recordsets?: HuaweiRecordSet[] }>(
-        "GET",
-        `/v2/zones/${encodeURIComponent(id)}/recordsets`,
-        { query: { limit: HUAWEI_PAGE_SIZE, offset: page * HUAWEI_PAGE_SIZE } }
-      );
-      const list = Array.isArray(res.recordsets) ? res.recordsets : [];
-      recordsets.push(...list);
-      if (list.length < HUAWEI_PAGE_SIZE) break;
-    }
-    return recordsets;
+    if (!id) throw new Error("华为云 DNS 解析记录列表需要 zone id 作为参数");
+    return this.readCompleteList<HuaweiRecordSet>(`/v2/zones/${encodeURIComponent(id)}/recordsets`, "recordsets", huaweiRecordKeys);
   }
 
   /**
@@ -536,7 +565,7 @@ export class HuaweiCloudClient {
     for (const rs of rawList) {
       records.push(...mapHuaweiRecordSet(rs));
     }
-    return { success: true, records };
+    return { success: true, complete: true, records };
   }
 
   /**
@@ -555,8 +584,9 @@ export class HuaweiCloudClient {
         "GET",
         `/v2/zones/${encodeURIComponent(String(zoneId))}/recordsets/${encodeURIComponent(id)}`
       );
-      if (res && res.id) return res;
-    } catch {
+      if (isObject(res) && res.id === id && huaweiRecordKeys(res)) return res;
+    } catch (error) {
+      if (error instanceof ProviderApiError && (error.statusCode === 429 || error.error_code.startsWith("scheduler_"))) throw error;
       // 容错降级
     }
 
@@ -566,26 +596,20 @@ export class HuaweiCloudClient {
         "GET",
         `/v2/recordsets/${encodeURIComponent(id)}`
       );
-      if (res && res.id) return res;
-    } catch {
+      if (isObject(res) && res.id === id && huaweiRecordKeys(res)) return res;
+    } catch (error) {
+      if (error instanceof ProviderApiError && (error.statusCode === 429 || error.error_code.startsWith("scheduler_"))) throw error;
       // 容错降级
     }
 
     // 3. 兜底：直接拉取该 zone 下的 recordsets 列表在本地匹配
-    try {
-      const list = await this.listAllRawRecordSets(zoneId);
-      const found = list.find((rs) => rs.id === id);
-      if (found) return found;
-    } catch {
-      // 容错
-    }
-
-    return null;
+    const list = await this.listAllRawRecordSets(zoneId);
+    return list.find(rs => rs.id === id) ?? null;
   }
 
   /**
    * 根据 name、type、line 精确查找单个 RecordSet
-   * 若精确匹配未命中，采用同名同类型的强力兜底匹配；若发现同名互斥记录（如已存在 CNAME），抛出明确提示
+   * 若精确匹配未命中，采用完整列表中的同名同类型兜底匹配；未知列表必须中止写入。
    */
   async findRecordSet(params: {
     zoneId: string | number;
@@ -600,12 +624,7 @@ export class HuaweiCloudClient {
     const fqdn = !rawName || rawName === "@" ? zone : rawName.toLowerCase().endsWith(`.${zone}`) ? rawName.toLowerCase() : `${rawName.toLowerCase()}.${zone}`;
 
     // 1. 优先从稳健的全量列表拉取进行双层本地比对
-    let list: HuaweiRecordSet[] = [];
-    try {
-      list = await this.listAllRawRecordSets(params.zoneId);
-    } catch {
-      // 容错降级
-    }
+    const list = await this.listAllRawRecordSets(params.zoneId);
 
     if (list.length > 0) {
       // 1.1 第一优先级：精确匹配 (fqdn, type, line)
@@ -642,53 +661,7 @@ export class HuaweiCloudClient {
       }
     }
 
-    // 2. 备用尝试：带 name / type 查询（分带点和不带点兼容各网关版本）
-    try {
-      const res = await this.request<{ recordsets?: HuaweiRecordSet[] }>(
-        "GET",
-        `/v2/zones/${encodeURIComponent(String(params.zoneId))}/recordsets`,
-        {
-          query: {
-            name: `${fqdn}.`,
-            type,
-            limit: HUAWEI_PAGE_SIZE,
-          },
-        }
-      );
-      const queryList = Array.isArray(res.recordsets) ? res.recordsets : [];
-      const found = queryList.find(
-        (rs) =>
-          stripTrailingDot(rs.name) === fqdn &&
-          String(rs.type).toUpperCase() === type
-      );
-      if (found) return found;
-    } catch {
-      // 容错
-    }
-
-    try {
-      const res = await this.request<{ recordsets?: HuaweiRecordSet[] }>(
-        "GET",
-        `/v2/zones/${encodeURIComponent(String(params.zoneId))}/recordsets`,
-        {
-          query: {
-            name: fqdn,
-            type,
-            limit: HUAWEI_PAGE_SIZE,
-          },
-        }
-      );
-      const queryList = Array.isArray(res.recordsets) ? res.recordsets : [];
-      const found = queryList.find(
-        (rs) =>
-          stripTrailingDot(rs.name) === fqdn &&
-          String(rs.type).toUpperCase() === type
-      );
-      if (found) return found;
-    } catch {
-      // 容错
-    }
-
+    // A successful complete list is the only evidence that a target is absent.
     return null;
   }
 
@@ -771,14 +744,12 @@ export class HuaweiCloudClient {
           : undefined,
       };
     } catch (e: unknown) {
-      const errObj = e as any;
       const isConflict =
-        (e instanceof HuaweiApiError || (e && typeof e === "object" && ("httpStatus" in errObj || "code" in errObj))) &&
-        (errObj.httpStatus === 409 ||
-          errObj.code === "DNS.0304" ||
-          errObj.code === "DNS.0312" ||
-          /record\s*set.*exist/i.test(errObj.rawMessage || errObj.message || "") ||
-          /conflict/i.test(errObj.rawMessage || errObj.message || ""));
+        e instanceof HuaweiApiError &&
+        !e.rateLimited &&
+        (e.httpStatus === 409 ||
+          ([200, 400].includes(e.httpStatus) && (e.error_code === "DNS.0304" || e.error_code === "DNS.0312" ||
+            /record\s*set.*exist|conflict/i.test(e.rawMessage))));
 
       if (!isConflict) {
         throw e;
@@ -873,11 +844,11 @@ export class HuaweiCloudClient {
       line?: string;
     }>;
   }): Promise<{
-    results: Array<{ label: string; success: boolean; message: string }>;
+    results: Array<{ label: string; success: boolean; message: string; not_sent?: boolean }>;
     successCount: number;
     failCount: number;
   }> {
-    const results: Array<{ label: string; success: boolean; message: string }> = [];
+    const results: Array<{ label: string; success: boolean; message: string; not_sent?: boolean }> = [];
     let successCount = 0;
     let failCount = 0;
 
@@ -916,7 +887,12 @@ export class HuaweiCloudClient {
       groups.get(groupKey)!.items.push({ raw: item, formattedVal });
     }
 
+    let stopped = false;
     for (const group of groups.values()) {
+      if (stopped) {
+        for (const it of group.items) { failCount++; results.push({ label: `${it.raw.type} ${it.raw.name}`, success: false, not_sent: true, message: "未发送：前组失败或结果未确认，请只读核验；不自动回滚/重试" }); }
+        continue;
+      }
       try {
         const existing = await this.findRecordSet({
           zoneId: params.zoneId,
@@ -1009,6 +985,7 @@ export class HuaweiCloudClient {
           }
         }
       } catch (err: unknown) {
+        stopped = true;
         const errMsg = err instanceof Error ? err.message : "创建失败";
         for (const it of group.items) {
           const label = `${it.raw.type || "?"} ${it.raw.name} → ${it.raw.content || "(空)"}`;
@@ -1257,14 +1234,17 @@ export function formatHuaweiRecordContent(type: string, content: string, priorit
 /**
  * 华为云 API 结构化错误类
  */
-export class HuaweiApiError extends Error {
+export class HuaweiApiError extends ProviderApiError {
   constructor(
     message: string,
-    public readonly code: string,
+    upstreamCode: string,
     public readonly httpStatus: number,
-    public readonly rawMessage: string
+    public readonly rawMessage: string,
+    retryAfterMs?: number,
+    rateLimited = false
   ) {
-    super(message);
+    super("huaweicloud", httpStatus, upstreamCode || "request_failed", message, undefined, retryAfterMs, rateLimited);
     this.name = "HuaweiApiError";
   }
 }
+import { pageTotal } from "./providers/sync-page";

@@ -4,18 +4,16 @@ import type { Account } from "../../../types/account";
 import type { Domain } from "../../../types/domain";
 import type { MultiProviderKey } from "../../../types/provider";
 import { MULTI_PROVIDER_META, MULTI_PROVIDER_ORDER, MULTI_PROVIDER_COLLAPSED_STORAGE } from "../providerMeta";
+import { finishSyncAction, type WaitForAccountDomainSync } from "../../../lib/sync-action";
+import { accountsApi } from "../../../api/endpoints/accounts";
+import { readSessionToken } from "../../../api/client";
 
 /** `useMultiProviders` 的外部依赖 —— 由 `App.tsx` 注入 */
 export interface UseMultiProvidersOptions {
   /** 动作级 loading 标记（App 的 `actionLoading` setter） */
   setActionLoading: (v: string | null) => void;
   /** 等待账号域名在后端落库后再刷新（App 的 `waitForAccountDomainSync`） */
-  waitForAccountDomainSync: (
-    accountIds: number[],
-    label: string,
-    baseline?: Map<number, string>,
-    providerLookup?: (id: number) => string | undefined
-  ) => Promise<void>;
+  waitForAccountDomainSync: WaitForAccountDomainSync;
   /**
    * 同步单个账号（App 的 `handleSyncAccount`，来自 useDomainSync）。
    *
@@ -176,13 +174,18 @@ export function useMultiProviders({
     }
     const loadingKey = `multi-sync-${key}`;
     setActionLoading(loadingKey);
+    const session = readSessionToken();
     try {
       for (const acc of list) {
-        await apiFetch(`/api/accounts/${acc.id}/sync`, { method: "POST" });
+        if (readSessionToken() !== session) break;
+        try {
+          const data = await accountsApi.sync(apiFetch, acc.id);
+          await finishSyncAction(apiFetch, data, () => fetchMultiProviderDomains(key), showToast, session);
+        } catch (error) {
+          if (readSessionToken() !== session) break;
+          showToast("error", `账号 [${acc.alias}] 同步请求失败：${error instanceof Error ? error.message : "未知错误"}`);
+        }
       }
-      showToast("success", `已发起 ${list.length} 个 ${MULTI_PROVIDER_META[key].label} 账号的同步`);
-      // 等待后端后台同步落库后再刷新列表
-      setTimeout(() => fetchMultiProviderDomains(key), 3000);
     } catch (e) {
       showToast("error", `${MULTI_PROVIDER_META[key].label} 同步请求失败`);
     } finally {
@@ -231,6 +234,7 @@ export function useMultiProviders({
     const accountId = multiEditingAccount.id;
 
     setActionLoading(`multi-update-${accountId}`);
+    const session = readSessionToken();
     try {
       const res = await apiFetch(`/api/accounts/${accountId}`, {
         method: "PUT",
@@ -248,7 +252,7 @@ export function useMultiProviders({
         await fetchAccounts();
         if (primary || secondary) {
           // 换了凭据：等后台重新同步完成后刷新
-          await waitForAccountDomainSync([accountId], "凭据已更新", undefined, () => key);
+          await waitForAccountDomainSync([accountId], "凭据已更新", data.actionId, () => key, session, data.syncWarning);
         } else {
           await fetchMultiProviderDomains(key);
         }

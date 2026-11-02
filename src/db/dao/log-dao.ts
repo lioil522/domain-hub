@@ -31,16 +31,21 @@ export async function writeLog(
  *
  * NOTE: 可选按 categories 过滤（传入分类数组，如 ["api","sync","renew"]）。
  */
-export async function getLogs(db: D1Database, limit = 100, categories?: string[]): Promise<DBLog[]> {
+export async function getLogs(db: D1Database, limit = 100, categories?: string[], afterId?: number): Promise<DBLog[]> {
+  if (afterId !== undefined) {
+    const values = [afterId, ...categories ?? [], limit];
+    const { results } = await db.prepare(`SELECT * FROM logs WHERE id>? ${categories?.length ? `AND category IN (${categories.map(() => "?").join(",")})` : ""} ORDER BY id DESC LIMIT ?`).bind(...values).all<DBLog>();
+    return results || [];
+  }
   if (categories && categories.length > 0) {
     const placeholders = categories.map(() => "?").join(",");
     const { results } = await db.prepare(
-      `SELECT * FROM logs WHERE category IN (${placeholders}) ORDER BY created_at DESC LIMIT ?`
+      `SELECT * FROM logs WHERE category IN (${placeholders}) ORDER BY id DESC LIMIT ?`
     ).bind(...categories, limit).all<DBLog>();
     return results || [];
   }
   const { results } = await db.prepare(
-    "SELECT * FROM logs ORDER BY created_at DESC LIMIT ?"
+    "SELECT * FROM logs ORDER BY id DESC LIMIT ?"
   ).bind(limit).all<DBLog>();
   return results || [];
 }

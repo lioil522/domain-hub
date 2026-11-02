@@ -7,8 +7,8 @@ export class LogRepository {
     return this.db.writeLog(type, category, message, details);
   }
 
-  list(limit = 100, categories?: string[]) {
-    return this.db.getLogs(limit, categories);
+  list(limit = 100, categories?: string[], afterId?: number) {
+    return this.db.getLogs(limit, categories, afterId);
   }
 
   clear() {

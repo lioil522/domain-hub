@@ -6,7 +6,7 @@
 
 import { getSetting, setSetting } from "./settings-dao";
 import { encryptText, decryptText, hashPassword, generateSalt, timingSafeEqual, sha256Hex } from "../crypto";
-import { toBeijingString } from "../time-utils";
+import { toBeijingString, getBeijingNow } from "../time-utils";
 import type { AuthConfig } from "../types";
 
 /** 会话有效期：7 天 */
@@ -16,6 +16,10 @@ export const SESSION_TTL_SECONDS = 7 * 24 * 3600;
 export const SESSION_PREFIX = "dh_sess_";
 
 // ===== 鉴权配置 =====
+
+export class AuthStorageError extends Error {
+  constructor() { super("鉴权存储暂不可用，请稍后重试"); this.name = "AuthStorageError"; }
+}
 
 /**
  * 读取管理员鉴权配置
@@ -29,25 +33,33 @@ export async function getAuthConfig(db: D1Database, aesKey?: string): Promise<Au
     "auth_pass_salt",
     "auth_2fa_enabled",
     "auth_2fa_secret",
+    "auth_initialized",
   ];
 
   const values = new Map<string, string>();
   try {
-    const { results } = await db
+    const response = await db
       .prepare(
         `SELECT key, value FROM settings WHERE key IN (${AUTH_KEYS.map(() => "?").join(", ")})`
       )
       .bind(...AUTH_KEYS)
       .all<{ key: string; value: string }>();
-    for (const row of results || []) {
+    if (!response.success || !Array.isArray(response.results)) throw new AuthStorageError();
+    for (const row of response.results) {
       values.set(row.key, String(row.value));
     }
   } catch (e) {
     console.error("getAuthConfig read error:", e);
+    throw new AuthStorageError();
   }
 
   const passHash = values.get("auth_pass_hash") || "";
   const encryptedSecret = values.get("auth_2fa_secret") || "";
+  const passSalt = values.get("auth_pass_salt") || "";
+  // A partial/failed legacy initialization is not an empty installation.
+  if ((values.has("auth_pass_hash") || values.has("auth_pass_salt") || values.has("auth_initialized")) && (!passHash || !passSalt)) {
+    throw new AuthStorageError();
+  }
 
   let twoFaSecret = "";
   if (encryptedSecret) {
@@ -55,13 +67,16 @@ export async function getAuthConfig(db: D1Database, aesKey?: string): Promise<Au
       twoFaSecret = await decryptText(encryptedSecret, aesKey);
     } catch (e) {
       console.error("Failed to decrypt 2FA secret:", e);
+      throw new AuthStorageError();
     }
   }
+
+  if (values.get("auth_2fa_enabled") === "1" && !twoFaSecret) throw new AuthStorageError();
 
   return {
     username: values.get("auth_username") || "admin",
     passHash,
-    passSalt: values.get("auth_pass_salt") || "",
+    passSalt,
     twoFaEnabled: values.get("auth_2fa_enabled") === "1",
     twoFaSecret,
     initialized: !!passHash,
@@ -74,9 +89,31 @@ export async function getAuthConfig(db: D1Database, aesKey?: string): Promise<Au
 export async function setPassword(db: D1Database, username: string, password: string): Promise<void> {
   const salt = generateSalt();
   const hash = await hashPassword(password, salt);
-  await setSetting(db, "auth_username", username);
-  await setSetting(db, "auth_pass_hash", hash);
-  await setSetting(db, "auth_pass_salt", salt);
+  await db.batch(passwordStatements(db, username, hash, salt));
+}
+
+function passwordStatements(db: D1Database, username: string, hash: string, salt: string, claim?: string): D1PreparedStatement[] {
+  return [["auth_username", username], ["auth_pass_hash", hash], ["auth_pass_salt", salt]].map(([key, value]) =>
+    db.prepare(`INSERT INTO settings (key, value, updated_at)
+      SELECT ?, ?, ? WHERE ${claim ? "EXISTS (SELECT 1 FROM settings WHERE key = 'auth_initialized' AND value = ?)" : "1"}
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`)
+      .bind(key, value, getBeijingNow(), ...(claim ? [claim] : []))
+  );
+}
+
+/** Claim + credentials are one transaction; losing requests never overwrite the winner. */
+export async function initializePassword(db: D1Database, username: string, password: string): Promise<boolean> {
+  const salt = generateSalt();
+  const hash = await hashPassword(password, salt);
+  const claim = crypto.randomUUID();
+  const result = await db.batch([
+    db.prepare(`INSERT INTO settings (key, value, updated_at)
+      SELECT 'auth_initialized', ?, ? WHERE NOT EXISTS (
+        SELECT 1 FROM settings WHERE key IN ('auth_pass_hash', 'auth_pass_salt', 'auth_initialized')
+      ) ON CONFLICT(key) DO NOTHING`).bind(claim, getBeijingNow()),
+    ...passwordStatements(db, username, hash, salt, claim),
+  ]);
+  return result[0].meta.changes === 1;
 }
 
 /**
@@ -117,7 +154,8 @@ export async function createSession(db: D1Database, ttlSeconds = SESSION_TTL_SEC
   const token = `${SESSION_PREFIX}${crypto.randomUUID()}`;
   const digest = await sha256Hex(token);
   const expiresAt = Math.floor(Date.now() / 1000) + ttlSeconds;
-  await setSetting(db, `sess_${digest}`, String(expiresAt));
+  await db.prepare("INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)")
+    .bind(`sess_${digest}`, String(expiresAt), getBeijingNow()).run();
   return token;
 }
 
@@ -127,7 +165,8 @@ export async function createSession(db: D1Database, ttlSeconds = SESSION_TTL_SEC
 export async function validateSession(db: D1Database, token: string): Promise<boolean> {
   if (!token.startsWith(SESSION_PREFIX)) return false;
   const digest = await sha256Hex(token);
-  const stored = await getSetting(db, `sess_${digest}`);
+  const row = await db.prepare("SELECT value FROM settings WHERE key = ?").bind(`sess_${digest}`).first<{ value: string }>();
+  const stored = row?.value;
   if (!stored) return false;
   const expiresAt = Number(stored);
   return Number.isFinite(expiresAt) && expiresAt > Math.floor(Date.now() / 1000);
@@ -197,9 +236,9 @@ export async function recordLoginFailure(db: D1Database, scope: string, windowSe
     await db.prepare(
       `INSERT INTO cache (key, value, expires_at) VALUES (?, '1', ?)
        ON CONFLICT(key) DO UPDATE SET
-         value = CAST(CAST(value AS INTEGER) + 1 AS TEXT),
-         expires_at = excluded.expires_at`
-    ).bind(`login_fail:${scope}`, expiresAt).run();
+          value = CASE WHEN cache.expires_at <= ? THEN '1' ELSE CAST(CAST(value AS INTEGER) + 1 AS TEXT) END,
+          expires_at = excluded.expires_at`
+    ).bind(`login_fail:${scope}`, expiresAt, Math.floor(Date.now() / 1000)).run();
   } catch (e) {
     console.error("recordLoginFailure error:", e);
   }

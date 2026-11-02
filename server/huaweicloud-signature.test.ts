@@ -12,6 +12,7 @@
  * 本文件的核心就是那一条金标准断言 —— 它曾直接定位出「规范 URI 漏了尾斜杠」
  * 这个让华为云账号**永远绑不上**的缺陷。
  */
+import "../tests/helpers/block-outbound";
 import assert from "node:assert/strict";
 
 import { buildHuaweiCanonicalRequest, HuaweiCloudClient } from "../src/huaweicloud";
@@ -165,7 +166,7 @@ async function main(): Promise<void> {
       const host = new URL(String(input)).host;
       hosts.push(host);
       if (host === "dns.myhuaweicloud.com") throw new TypeError("fetch failed");
-      return new Response(JSON.stringify({ zones: [{ id: "z1", name: "example.com." }] }), {
+      return new Response(JSON.stringify({ zones: [{ id: "z1", name: "example.com." }], metadata: { total_count: 1 } }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
       });

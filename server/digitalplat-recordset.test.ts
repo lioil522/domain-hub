@@ -1,3 +1,4 @@
+import "../tests/helpers/block-outbound";
 import assert from "node:assert/strict";
 import { DigitalPlatClient, normalizeDpName } from "../src/digitalplat";
 

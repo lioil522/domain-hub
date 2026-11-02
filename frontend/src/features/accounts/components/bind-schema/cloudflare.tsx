@@ -30,7 +30,7 @@ export const CF_SCHEMA: BindProviderSchema = {
     onSuccess: async (data, _v, deps) => {
       await deps.fetchAccounts();
       if (data.account?.id) {
-        await deps.waitForAccountDomainSync([Number(data.account.id)], "Cloudflare 账号绑定成功", undefined, () => "cloudflare");
+        await deps.waitForAccountDomainSync([Number(data.account.id)], "Cloudflare 账号绑定成功", data.actionId, () => "cloudflare");
       } else {
         await deps.fetchCfZones();
       }
@@ -70,7 +70,7 @@ export const CF_SCHEMA: BindProviderSchema = {
       const ids: number[] = (data.account_ids || []).map(Number);
       if (ids.length > 0) {
         // 后台逐个同步 zones，落库后自动刷新（fetchCfZones 在等待函数末尾统一调用）
-        await deps.waitForAccountDomainSync(ids, `${ids.length} 个 Cloudflare 账号绑定成功`, undefined, () => "cloudflare");
+        await deps.waitForAccountDomainSync(ids, `${ids.length} 个 Cloudflare 账号绑定成功`, data.actionId, () => "cloudflare");
       } else {
         await deps.fetchCfZones();
       }

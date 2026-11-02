@@ -12,6 +12,7 @@
  *   · 外键级联（deleteAccount 依赖 ON DELETE CASCADE 清 domains_cache）
  *   · AES-GCM / PBKDF2 在 Node 的 WebCrypto 上与 Workers 行为一致
  */
+import "../tests/helpers/block-outbound";
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 
@@ -19,6 +20,8 @@ import { DatabaseManager, DATA_EXPORT_VERSION } from "../src/db";
 import type { UpstreamSubdomain } from "../src/db";
 import { pickAccountBatch } from "../src/cron";
 import { createD1FromSqlite } from "./d1-sqlite";
+import { encryptText } from "../src/db/crypto";
+import { mapZoneToUpstream } from "../src/cloudflare";
 
 const AES_KEY = "test-only-key-do-not-reuse";
 
@@ -373,7 +376,7 @@ await it("exportAllData() 只导出业务表，且不泄漏 settings/cache/logs"
   assert.ok((snap.data.accounts as unknown[]).length > 0, "应有账号数据");
 });
 
-await it("importAllData() 合并 upsert：新增 + 覆盖，且不删除现有行", async () => {
+await it("importAllData() 映射本地 ID：只追加、不覆盖、不删除，冲突整批拒绝", async () => {
   const target = freshDb();
   await target.dbm.ensureTables();
 
@@ -383,13 +386,14 @@ await it("importAllData() 合并 upsert：新增 + 覆盖，且不删除现有�
     .bind(900, "本地独有账号", "cfsd_local_only", "plain:c2VjcmV0")
     .run();
 
-  // 备份：1 号账号（覆盖目标库同名 id）+ 901 号账号（目标库没有，应新增）
+  // incoming 900 collides with local 900: remap, never overwrite the local row.
   const snapshot = {
     version: DATA_EXPORT_VERSION,
+    exported_at: "2026-01-01T00:00:00Z",
     data: {
       accounts: [
-        { id: 1, alias: "改过的别名", api_key: "k1", api_secret: "s1", provider: "dnshe", website: null, created_at: "2026-01-01 00:00:00" },
-        { id: 901, alias: "备份新增账号", api_key: "k901", api_secret: "s901", provider: "dnshe", website: null, created_at: "2026-01-01 00:00:00" },
+        { id: 900, alias: "备份账号", api_key: "k1", api_secret: await encryptText("s1", AES_KEY), provider: "dnshe", website: null, created_at: "2026-01-01 00:00:00" },
+        { id: 901, alias: "备份新增账号", api_key: "k901", api_secret: await encryptText("s901", AES_KEY), provider: "dnshe", website: null, created_at: "2026-01-01 00:00:00" },
       ],
       domains_cache: [
         { id: 7001, account_id: 901, subdomain: "a", rootdomain: "cn.mt", full_domain: "a.cn.mt", status: "已解析", created_at: "2026-01-01 00:00:00", expires_at: "2027-01-01 00:00:00", last_renewed_at: null, has_dns: 1, dns_provider: "system", provider_account_id: null, remote_id: null, updated_at: "2026-01-01 00:00:00" },
@@ -400,28 +404,38 @@ await it("importAllData() 合并 upsert：新增 + 覆盖，且不删除现有�
     },
   };
 
-  const { imported } = await target.dbm.importAllData(snapshot);
+  const { imported, mappings } = await target.dbm.importAllData(snapshot);
   assert.equal(imported.accounts, 2);
   assert.equal(imported.domains_cache, 1);
   assert.equal(imported.custom_domains, 0, "备份里没有的表应报 0");
 
   const accounts = await target.dbm.getAccounts();
-  assert.equal(accounts.find((a) => a.id === 1)?.alias, "改过的别名", "同 id 应被覆盖");
-  assert.ok(accounts.some((a) => a.id === 901), "备份里的新账号应被插入");
+  assert.equal(mappings.accounts[900], 901);
+  assert.equal(mappings.accounts[901], 902);
+  assert.equal(accounts.find((a) => a.id === 901)?.alias, "备份账号");
+  assert.equal(accounts.find((a) => a.id === 900)?.alias, "本地独有账号", "同 id 不得覆盖");
+  assert.ok(accounts.some((a) => a.id === 902), "备份里的新账号应被插入");
   assert.ok(accounts.some((a) => a.id === 900), "本地独有账号绝不能被删掉（合并语义）");
   assert.equal((await target.dbm.getDomainById(7001))?.full_domain, "a.cn.mt");
+  assert.equal((await target.dbm.getDomainById(7001))?.account_id, 902);
   assert.equal((await target.dbm.getDateOverrides()).length, 1);
+  const conflicting = structuredClone(snapshot);
+  conflicting.data.domains_cache[0].expires_at = "2029-01-01 00:00:00";
+  await assert.rejects(() => target.dbm.importAllData(conflicting), /冲突/);
+  assert.equal((await target.dbm.getDomainById(7001))?.expires_at, "2027-01-01 00:00:00");
+  assert.equal((await target.dbm.getAccounts()).length, 3);
 
   target.sqlite.close();
 });
 
-await it("importAllData() 反复导入幂等（同 id 不会重复插入）", async () => {
+await it("importAllData() 反复导入幂等（已验证凭据身份不重复插入）", async () => {
   const target = freshDb();
   await target.dbm.ensureTables();
   const snapshot = {
     version: DATA_EXPORT_VERSION,
+    exported_at: "2026-01-01T00:00:00Z",
     data: {
-      accounts: [{ id: 1, alias: "A", api_key: "k1", api_secret: "s1", provider: "dnshe", website: null, created_at: "2026-01-01 00:00:00" }],
+      accounts: [{ id: 1, alias: "A", api_key: "k1", api_secret: await encryptText("s1", AES_KEY), provider: "dnshe", website: null, created_at: "2026-01-01 00:00:00" }],
     },
   };
   await target.dbm.importAllData(snapshot);
@@ -437,27 +451,29 @@ await it("importAllData() 版本不匹配 / 结构非法时拒绝（不静默降
 
   await assert.rejects(
     () => target.dbm.importAllData({ version: 999, data: {} }),
-    /版本不支持/,
+    /备份无效/,
     "版本不符必须明确拒绝"
   );
   await assert.rejects(
     () => target.dbm.importAllData({ version: DATA_EXPORT_VERSION }),
-    /缺少 data 字段/
+    /备份无效/
   );
   // 拒绝之后库里不该留下任何痕迹
   assert.equal((await target.dbm.getAccounts()).length, 0);
   target.sqlite.close();
 });
 
-await it("importAllData() 外键悬空时整批回滚（不留半截数据）", async () => {
+await it("importAllData() 父子归属悬空时整批拒绝（不留半截数据）", async () => {
   const target = freshDb();
   await target.dbm.ensureTables();
-  // domains_cache 指向不存在的 account_id，外键约束必须让整批失败
+  // Otherwise-valid snapshot points at a missing parent; no account may commit.
+  const credential = await encryptText("s1", AES_KEY);
   await assert.rejects(() =>
     target.dbm.importAllData({
       version: DATA_EXPORT_VERSION,
+      exported_at: "2026-01-01T00:00:00Z",
       data: {
-        accounts: [{ id: 1, alias: "A", api_key: "k1", api_secret: "s1", provider: "dnshe", website: null, created_at: "2026-01-01 00:00:00" }],
+        accounts: [{ id: 1, alias: "A", api_key: "k1", api_secret: credential, provider: "dnshe", website: null, created_at: "2026-01-01 00:00:00" }],
         domains_cache: [{ id: 7001, account_id: 12345, subdomain: "a", rootdomain: "cn.mt", full_domain: "a.cn.mt", status: "已解析", created_at: "2026-01-01 00:00:00", expires_at: "2027-01-01 00:00:00", last_renewed_at: null, has_dns: 1, dns_provider: "system", provider_account_id: null, remote_id: null, updated_at: "2026-01-01 00:00:00" }],
       },
     })
@@ -494,6 +510,26 @@ await it("export → import 往返一致（同库自洽）", async () => {
 
   src.sqlite.close();
   dst.sqlite.close();
+});
+
+await it("业务备份保留真实 CF apex/未知到期字段；不伪造日期或丢失远端 ID", async () => {
+  const src = freshDb(), dst = freshDb();
+  try {
+    await src.dbm.ensureTables(); await dst.dbm.ensureTables();
+    await src.d1.prepare("INSERT INTO accounts(alias,api_key,api_secret,provider) VALUES('offline-cf','offline-id',?,'cloudflare')")
+      .bind(await encryptText("offline-token", AES_KEY)).run();
+    const zone = mapZoneToUpstream({ id: "a".repeat(32), name: "example.test", status: "active" });
+    await src.dbm.upsertDomain(1, zone);
+    const snapshot = await src.dbm.exportAllData();
+    await dst.dbm.importAllData(snapshot);
+    assert.equal((await dst.dbm.getDomainById(zone.id))?.subdomain, "");
+    assert.equal((await dst.dbm.getDomainById(zone.id))?.remote_id, "a".repeat(32));
+    assert.equal((await dst.dbm.getDomainById(zone.id))?.expires_at, "0000-00-00 00:00:00");
+    snapshot.data.domains_cache[0].expires_at = "";
+    const empty = freshDb();
+    try { await empty.dbm.ensureTables(); await empty.dbm.importAllData(snapshot); assert.equal((await empty.dbm.getDomainById(zone.id))?.expires_at, ""); }
+    finally { empty.sqlite.close(); }
+  } finally { src.sqlite.close(); dst.sqlite.close(); }
 });
 
 await it("日志写入与按分类过滤", async () => {

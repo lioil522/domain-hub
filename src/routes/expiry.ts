@@ -4,6 +4,8 @@ import { DatabaseManager } from "../db";
 import { toASCII, isRegistrableDomain } from "../punycode";
 import { successRes, errorRes } from "./response";
 import { RDAP_CACHE_PREFIX } from "../db";
+import type { InvocationCounter } from "../services/invocation-budget";
+import { invocationFetch } from "../services/invocation-fetch";
 
 /**
  * RDAP 查询域名在注册商侧的到期时间
@@ -54,10 +56,10 @@ interface RdapExpiryResult {
   error?: string;
 }
 
-async function fetchExpiryViaRdap(domain: string): Promise<RdapExpiryResult> {
-  const res = await fetch(`https://rdap.org/domain/${encodeURIComponent(domain)}`, {
+async function fetchExpiryViaRdap(domain: string, budget?: InvocationCounter): Promise<RdapExpiryResult> {
+  const res = await invocationFetch(`https://rdap.org/domain/${encodeURIComponent(domain)}`, {
     headers: { accept: "application/rdap+json", "user-agent": RDAP_USER_AGENT }
-  });
+  }, budget);
   // 404 = 该名字不是可注册域名（多为子域 zone）或注册局无此记录
   if (res.status === 404) {
     return { found: false, source: "rdap" };
@@ -118,10 +120,10 @@ function isStackryzeDomain(domain: string): boolean {
   return STACKRYZE_SUFFIXES.some((suffix) => domain.endsWith(suffix));
 }
 
-async function fetchExpiryViaStackryze(domain: string): Promise<RdapExpiryResult> {
-  const res = await fetch(`${STACKRYZE_WHOIS_ENDPOINT}?query=${encodeURIComponent(domain)}`, {
+async function fetchExpiryViaStackryze(domain: string, budget?: InvocationCounter): Promise<RdapExpiryResult> {
+  const res = await invocationFetch(`${STACKRYZE_WHOIS_ENDPOINT}?query=${encodeURIComponent(domain)}`, {
     headers: { accept: "application/json", "user-agent": RDAP_USER_AGENT }
-  });
+  }, budget);
   if (res.status === 404) {
     return { found: false, source: "stackryze" };
   }
@@ -141,10 +143,10 @@ async function fetchExpiryViaStackryze(domain: string): Promise<RdapExpiryResult
  * 到期时间查询总入口：先走 RDAP（权威、覆盖所有正式 TLD），
  * 查不到且域名属于 Stackryze 免费后缀时，用其 WHOIS 接口补查注册/到期时间。
  */
-async function lookupDomainExpiry(domain: string): Promise<RdapExpiryResult> {
+async function lookupDomainExpiry(domain: string, budget?: InvocationCounter): Promise<RdapExpiryResult> {
   let rdapFailed: string | undefined;
   try {
-    const rdap = await fetchExpiryViaRdap(domain);
+    const rdap = await fetchExpiryViaRdap(domain, budget);
     if (rdap.found) return rdap;
   } catch (err) {
     // RDAP 失败不直接返回错误：Stackryze 后缀还有兜底查询的机会
@@ -152,7 +154,7 @@ async function lookupDomainExpiry(domain: string): Promise<RdapExpiryResult> {
   }
   if (isStackryzeDomain(domain)) {
     try {
-      return await fetchExpiryViaStackryze(domain);
+      return await fetchExpiryViaStackryze(domain, budget);
     } catch (err) {
       const stackryzeError = err instanceof Error ? err.message : "Stackryze 查询失败";
       return { found: false, source: "stackryze", error: rdapFailed ? `${rdapFailed}; ${stackryzeError}` : stackryzeError };
@@ -210,7 +212,7 @@ app.get("/api/expiry", async (c) => {
   //    只缓存成功结论（含正常的 404 未查到）；带 error 的失败结果不落缓存，下次请求重试。
   const settled = await Promise.allSettled(
     toQuery.map((d) =>
-      lookupDomainExpiry(d)
+      lookupDomainExpiry(d, dbManager.invocationBudget)
         .then(async (result) => {
           if (!result.error) {
             await dbManager.setCache(`${RDAP_CACHE_KEY_PREFIX}${d}`, JSON.stringify(result), RDAP_CACHE_TTL);

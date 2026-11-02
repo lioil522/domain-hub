@@ -1,16 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Activity, CheckCircle2, XCircle, PauseCircle, Clock, RefreshCw, X } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Activity, CheckCircle2, AlertTriangle, XCircle, PauseCircle, Clock, RefreshCw, X } from "lucide-react";
+import { mergeSyncActions, isExecutingAction, type ActionItem } from "../../lib/action-center-state";
+import { syncStatusText } from "../../lib/sync-status";
+import type { SliceState } from "../../lib/sliced-sync";
 import type { ApiFetch } from "../../api/client";
-import { actionsApi } from "../../api/endpoints/actions";
-
-type ActionItem = {
-  id: string;
-  type: string;
-  status: "queued" | "running" | "completed" | "failed" | "cancelled";
-  progress: number;
-  error?: string | null;
-  metadata?: unknown;
-};
+import { createActionFeed } from "../../lib/action-feed";
+import type { OperationEvent } from "../../lib/operation-activity";
 
 function label(type: string): string {
   const labels: Record<string, string> = {
@@ -30,6 +25,8 @@ function statusText(status: ActionItem["status"]): string {
   switch (status) {
     case "completed":
       return "已完成";
+    case "partial":
+      return "部分完成";
     case "failed":
       return "执行失败";
     case "cancelled":
@@ -45,63 +42,62 @@ function statusText(status: ActionItem["status"]): string {
 
 function StatusIcon({ status }: { status: ActionItem["status"] }) {
   if (status === "completed") return <CheckCircle2 className="w-4 h-4 text-accent flex-shrink-0" />;
+  if (status === "partial") return <AlertTriangle className="w-4 h-4 text-state-warn-fg flex-shrink-0" />;
   if (status === "failed") return <XCircle className="w-4 h-4 text-[var(--state-danger-fg)] flex-shrink-0" />;
   if (status === "cancelled") return <PauseCircle className="w-4 h-4 text-content-muted flex-shrink-0" />;
   if (status === "queued") return <Clock className="w-4 h-4 text-content-muted flex-shrink-0" />;
   return <Activity className="w-4 h-4 text-accent animate-pulse flex-shrink-0" />;
 }
 
-export function ActionCenter({ apiFetch }: { apiFetch: ApiFetch }) {
+export function ActionCenter({ apiFetch, sessionToken, syncStates, syncEnabled, onActivityChange }: { apiFetch: ApiFetch; sessionToken: string | null; syncStates: Record<number, SliceState>; syncEnabled: boolean; onActivityChange: (active: boolean) => void }) {
   const [open, setOpen] = useState(false);
   const [actions, setActions] = useState<ActionItem[]>([]);
   const [loading, setLoading] = useState(false);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
-
-  const load = useCallback(async () => {
-    setLoading(true);
-    try {
-      const response = await actionsApi.list(apiFetch, 12) as { actions?: ActionItem[] };
-      if (Array.isArray(response?.actions)) setActions(response.actions);
-    } catch {
-      // Action Center is auxiliary UI; failures must not break the shell.
-    } finally {
-      setLoading(false);
-    }
-  }, [apiFetch]);
+  const feed = useMemo(() => createActionFeed(apiFetch, sessionToken, setActions, setLoading), [apiFetch, sessionToken]);
+  const load = feed.load;
+  const items = useMemo(() => mergeSyncActions(actions, syncStates), [actions, syncStates]);
 
   // 计算当前活动中的任务数（排队中或运行中）
   const activeCount = useMemo(
-    () => actions.filter((item) => item.status === "queued" || item.status === "running").length,
-    [actions]
+    () => items.filter(item => isExecutingAction(item, syncEnabled)).length,
+    [items, syncEnabled]
   );
+  useEffect(() => { onActivityChange(activeCount > 0); }, [activeCount, onActivityChange]);
 
   // 1. 首次挂载只拉取一次（初始徽标）
   useEffect(() => {
+    feed.start(); setActions([]); setLoading(false);
     void load();
-  }, [load]);
+    return () => feed.stop();
+  }, [feed, load]);
 
-  // 2. 自适应智能轮询：仅在有活动任务或展开面板时轮询，闲置时自动休眠
+  // 2. 仅活动期间读取本地状态；展开空闲面板不启动定时轮询
   useEffect(() => {
-    const shouldPoll = open || activeCount > 0;
+    const shouldPoll = activeCount > 0;
     if (!shouldPoll) return;
 
-    const interval = activeCount > 0 ? 3000 : 6000;
+    const interval = 3000;
     const timer = window.setInterval(() => {
       if (document.hidden) return;
       void load();
     }, interval);
 
     return () => window.clearInterval(timer);
-  }, [open, activeCount, load]);
+  }, [activeCount, load]);
 
   // 3. 监听全局 action 触发唤醒事件
   useEffect(() => {
-    const handleWakeup = () => void load();
+    const handleWakeup = () => void load(true);
     window.addEventListener("action:refresh", handleWakeup);
-    return () => window.removeEventListener("action:refresh", handleWakeup);
-  }, [load]);
+    const operation = (event: Event) => { const detail = (event as CustomEvent<OperationEvent>).detail; if (detail.session === sessionToken && detail.phase === "end" && detail.actionsChanged) void load(true); };
+    const visibility = () => { if (!document.hidden) void load(); };
+    window.addEventListener("domain-hub:operation", operation);
+    document.addEventListener("visibilitychange", visibility);
+    return () => { window.removeEventListener("action:refresh", handleWakeup); window.removeEventListener("domain-hub:operation", operation); document.removeEventListener("visibilitychange", visibility); };
+  }, [load, sessionToken]);
 
   // 4. 全方位自动收起交互：
   //    ① 监听 pointerdown（触控/鼠标点击外部自动收起）
@@ -147,7 +143,7 @@ export function ActionCenter({ apiFetch }: { apiFetch: ApiFetch }) {
     const next = !open;
     setOpen(next);
     if (next) {
-      void load(); // 展开瞬间立即拉取一次最新状态
+      void load(true); // 展开瞬间立即拉取一次最新状态
     }
   };
 
@@ -215,13 +211,13 @@ export function ActionCenter({ apiFetch }: { apiFetch: ApiFetch }) {
 
           {/* 任务列表 */}
           <div className="space-y-2 overflow-y-auto flex-1 pr-0.5">
-            {actions.length === 0 ? (
+            {items.length === 0 ? (
               <div className="py-8 text-center text-xs text-content-muted">
                 暂无后台操作记录
               </div>
             ) : (
-              actions.map((item) => {
-                const progressPct = Math.max(0, Math.min(100, Number(item.progress) || 0));
+              items.map((item) => {
+                const progressPct = Math.round(Math.max(0, Math.min(100, Number(item.progress) || 0)));
                 return (
                   <div
                     key={item.id}
@@ -232,16 +228,21 @@ export function ActionCenter({ apiFetch }: { apiFetch: ApiFetch }) {
                         <StatusIcon status={item.status} />
                         <span className="font-semibold text-content-primary truncate">{label(item.type)}</span>
                         <span className="text-[10px] text-content-muted font-mono bg-elevated px-1.5 py-0.5 rounded border border-border-base/30">
-                          {statusText(item.status)}
+                          {item.sync_status ? item.advancing ? "同步中" : item.sync_status === "queued" ? "等待继续" : item.sync_status === "blocked" ? "需处理" : item.sync_status === "paused" ? "暂缓" : statusText(item.status) : statusText(item.status)}
                         </span>
                       </div>
                       <span className="text-xs font-semibold text-accent font-mono ml-2 flex-shrink-0">
                         {progressPct}%
                       </span>
                     </div>
+                    {item.sync_status && <div className="text-[11px] text-content-muted space-y-1">
+                      <div className="font-medium text-content-secondary truncate">{item.alias || `账号 ${item.accountId}`}</div>
+                      <div>{syncStatusText({ ...item, accountId: item.accountId ?? 0, status: item.sync_status }, syncEnabled)}</div>
+                      {item.last_completed_at && <div>最后完整成功 {new Date(item.last_completed_at * 1000).toLocaleString()}</div>}
+                    </div>}
 
                     {/* 进度条槽体与动态填充 */}
-                    <div className="h-1.5 rounded-full bg-elevated/90 border border-border-base/40 overflow-hidden">
+                    <div role="progressbar" aria-label={`${label(item.type)}进度`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={progressPct} className="h-1.5 rounded-full bg-elevated/90 border border-border-base/40 overflow-hidden">
                       <div
                         className="h-full rounded-full bg-gradient-to-r from-accent to-accent-hover transition-all duration-300 shadow-[0_0_8px_rgb(var(--accent-rgb)/0.4)]"
                         style={{ width: `${progressPct}%` }}

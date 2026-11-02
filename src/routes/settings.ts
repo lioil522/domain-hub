@@ -1,11 +1,12 @@
 import type { Hono } from "hono";
 import type { AppEnv } from "./types";
+import type { InvocationCounter } from "../services/invocation-budget";
 import { successRes, errorRes } from "./response";
 import type { WebhookType } from "../cron";
 
 interface SettingsDeps {
-  sendTelegramNotification: (botToken: string, chatId: string, message: string) => Promise<{ ok: boolean; status?: number; detail?: string }>;
-  sendWebhookNotification: (url: string, message: string, type: WebhookType) => Promise<{ ok: boolean; status?: number; detail?: string }>;
+  sendTelegramNotification: (botToken: string, chatId: string, message: string, budget?: InvocationCounter) => Promise<{ ok: boolean; status?: number; detail?: string }>;
+  sendWebhookNotification: (url: string, message: string, type: WebhookType, budget?: InvocationCounter) => Promise<{ ok: boolean; status?: number; detail?: string }>;
 }
 
 function maskSecret(value: string): string {
@@ -18,7 +19,7 @@ export function registerSettingsRoutes(app: Hono<AppEnv>, deps: SettingsDeps) {
   app.get("/api/settings", async (c) => {
     const db = c.get("db");
     try {
-      const cfg = await db.getAllAppSettings();
+      const cfg = await db.getAuthoritativeAppSettings();
       const masked = { ...cfg };
       if (masked.tg_token) masked.tg_token = maskSecret(cfg.tg_token);
       if (masked.webhook_url) masked.webhook_url = maskSecret(cfg.webhook_url);
@@ -37,13 +38,15 @@ export function registerSettingsRoutes(app: Hono<AppEnv>, deps: SettingsDeps) {
       const body = await c.req.json().catch(() => ({}));
       const allowedKeys = [
         "webhook_url", "webhook_type", "tg_token", "tg_chat_id",
-        "renew_threshold_days", "auto_renew", "dns_records_cache_mode",
+        "renew_threshold_days", "auto_renew", "dns_records_cache_mode", "login_sync_enabled", "sync_freshness_seconds", "dnshe_renew_window_days",
       ];
       const sensitiveKeys = ["tg_token", "webhook_url"];
       for (const key of allowedKeys) {
         if (!(key in body)) continue;
         let value = String(body[key] ?? "");
         if (key === "dns_records_cache_mode") value = value === "always" ? "always" : "scheduled";
+        if (key === "login_sync_enabled" && !["true", "false"].includes(value)) throw new Error("同步开关无效");
+        if (["sync_freshness_seconds", "dnshe_renew_window_days", "renew_threshold_days"].includes(key)) configuredInteger(value, 0, key === "sync_freshness_seconds" ? 60 : key === "renew_threshold_days" ? 1 : 0, key === "sync_freshness_seconds" ? 86400 : key === "renew_threshold_days" ? 3650 : 365);
         if (sensitiveKeys.includes(key) && (value === "" || value.startsWith("****"))) continue;
         await db.setAppSetting(key, value);
       }
@@ -62,7 +65,7 @@ export function registerSettingsRoutes(app: Hono<AppEnv>, deps: SettingsDeps) {
       const token = body.tg_token && !String(body.tg_token).startsWith("****") ? String(body.tg_token) : cfg.tg_token;
       const chatId = String(body.tg_chat_id || cfg.tg_chat_id || "");
       if (!token || !chatId) return c.json(errorRes("请先填写 Telegram Bot Token 与 Chat ID", "bad_request"), 400);
-      const result = await deps.sendTelegramNotification(token, chatId, "🎉 Domain Hub 测试推送：Telegram 通知配置成功！");
+      const result = await deps.sendTelegramNotification(token, chatId, "🎉 Domain Hub 测试推送：Telegram 通知配置成功！", db.invocationBudget);
       if (!result.ok) {
         return c.json(errorRes(result.detail || `Telegram 推送失败（HTTP ${result.status ?? "?"}）`), 400);
       }
@@ -81,7 +84,7 @@ export function registerSettingsRoutes(app: Hono<AppEnv>, deps: SettingsDeps) {
       const type = String(body.webhook_type || cfg.webhook_type || "custom") as WebhookType;
       if (!url) return c.json(errorRes(type === "serverchan" ? "请先填写 SendKey" : "请先填写 Webhook 地址", "bad_request"), 400);
       if (type !== "serverchan" && !/^https?:\/\//i.test(url)) return c.json(errorRes("Webhook 地址必须以 http:// 或 https:// 开头", "bad_request"), 400);
-      const result = await deps.sendWebhookNotification(url, "🎉 Domain Hub 测试推送：Webhook 通知配置成功！", type);
+      const result = await deps.sendWebhookNotification(url, "🎉 Domain Hub 测试推送：Webhook 通知配置成功！", type, db.invocationBudget);
       if (!result.ok) {
         let detail = result.detail || `推送失败（HTTP ${result.status ?? "?"}）`;
         if (type === "serverchan" && /^https?:\/\//i.test(url) && !/\.send(\?|$)/i.test(url)) {
@@ -95,3 +98,4 @@ export function registerSettingsRoutes(app: Hono<AppEnv>, deps: SettingsDeps) {
     }
   });
 }
+import { configuredInteger } from "../services/automation-settings";

@@ -16,13 +16,16 @@
  *   2. 没有 zone id —— 域名本身就是路径参数（remote_id 存域名）；
  *   3. 记录名 `name` 是**相对名**（`@` / `www`），与 DNSPod / 阿里云相同、与 CF 相反；
  *   4. 分页用 `limit` + `since`/`until` 游标，不是页码。这里用 limit 一次拉满
- *      （Vercel 上限 100），需要更多时按 since 续拉。
+ *      （Vercel 上限 100），需要更多时按 until 续拉。
  *   5. 带 Team 的账号需要在 query 里附加 `teamId`；本客户端在构造时可选接收，
  *      teamId 从域名详情里自动探测并缓存。
  */
 
 import type { ActionResponse, CreateDnsRecordResponse, DnsRecordInfo, ListDnsRecordsResponse } from "./dnshe";
 import type { UpstreamSubdomain } from "./db";
+import { ProviderApiError, incompleteResponse } from "./errors/provider-api-error";
+import { parseProviderJson, requestProviderText, type ProviderRequestLimits } from "./providers/provider-request";
+import { CompleteList, domainKey, hasText, isCount, isObject } from "./providers/list-integrity";
 import { zoneIdToNumericId } from "./cloudflare";
 
 const VERCEL_API_BASE = "https://api.vercel.com";
@@ -30,8 +33,20 @@ const VERCEL_API_BASE = "https://api.vercel.com";
 /** 单次列表请求的条数（Vercel 上限 100） */
 const VERCEL_PAGE_SIZE = 100;
 
-/** 列表接口最多翻多少页（Vercel 用 since 游标续拉，这里设一个上限防御死循环） */
+/** 列表接口最多翻多少页；耗尽预算不是完整列表。 */
 const VERCEL_MAX_PAGES = 20;
+
+function nextUntil(pagination: unknown, length: number, previous?: number): number | null {
+  if (!isObject(pagination) || !isCount(pagination.count) || pagination.count !== length) {
+    throw incompleteResponse("vercel");
+  }
+  if (pagination.next === null) return null;
+  const next = pagination.next;
+  if (!isCount(next) || next === 0 || length === 0 || (previous !== undefined && next >= previous)) {
+    throw incompleteResponse("vercel");
+  }
+  return next;
+}
 
 /**
  * 判断一个字符串是否形如 Vercel Access Token
@@ -109,7 +124,7 @@ function mapVercelRecord(rec: VercelDnsRecord, domainName: string): DnsRecordInf
   const rawPriority = Number(rec.mxPriority ?? rec.priority);
 
   return {
-    id: rec.id,
+    id: rec.id || rec.uid!,
     name: fqdn,
     type: String(rec.type || "").toUpperCase(),
     content: String(rec.value || ""),
@@ -181,7 +196,7 @@ export class VercelClient {
   private token: string;
   private teamId: string;
 
-  constructor(token: string, teamId?: string) {
+  constructor(token: string, teamId?: string, private readonly requestLimits: ProviderRequestLimits = {}) {
     this.token = String(token || "").trim();
     this.teamId = String(teamId || "").trim();
   }
@@ -216,36 +231,28 @@ export class VercelClient {
       url.searchParams.append("teamId", this.teamId);
     }
 
-    let response: Response;
-    try {
-      response = await fetch(url.toString(), {
-        method,
-        headers: {
-          Authorization: `Bearer ${this.token}`,
-          "Content-Type": "application/json",
-        },
-        body: options.body === undefined ? undefined : JSON.stringify(options.body),
-      });
-    } catch (e: unknown) {
-      const message = e instanceof Error ? e.message : "网络请求失败";
-      throw new Error(`Vercel API 请求失败：${message}`);
-    }
+    const result = await requestProviderText("vercel", url.toString(), {
+      method,
+      headers: {
+        Authorization: `Bearer ${this.token}`,
+        "Content-Type": "application/json",
+      },
+      body: options.body === undefined ? undefined : JSON.stringify(options.body),
+    }, this.requestLimits);
+    const { response, retryAfterMs } = result;
 
     if (response.status === 204) {
       return {} as T;
     }
 
-    let data: unknown;
-    try {
-      data = await response.json();
-    } catch {
-      throw new Error(`Vercel API 响应异常 (HTTP ${response.status})`);
-    }
+    const data = parseProviderJson("vercel", result);
 
-    if (!response.ok) {
+    if (!response.ok || (isObject(data) && isObject(data.error))) {
       const body = data as VercelErrorBody;
-      throw new Error(
-        translateVercelError(body?.error?.code || "", body?.error?.message || body?.message || "", response.status)
+      throw new ProviderApiError("vercel", response.status, body?.error?.code || "request_failed",
+        result.rateLimited ? "Vercel API 请求过于频繁被限流，请稍后重试"
+          : translateVercelError(body?.error?.code || "", body?.error?.message || body?.message || "", response.status),
+        undefined, retryAfterMs, result.rateLimited
       );
     }
 
@@ -265,38 +272,43 @@ export class VercelClient {
    * 列出 Token 可访问的全部域名
    *
    * NOTE: Vercel 的分页是 `limit` + `since`/`until` 时间游标（不是页码）。这里先取
-   * 一页 100 条；若满员则用最后一条的 createdAt 作为 since 继续往前翻（Vercel 按
-   * 创建时间倒序返回）。上限 VERCEL_MAX_PAGES 页，防御异常导致死循环。
+   * 一页 100 条；用 pagination.next 作为 until 向旧数据翻页，只有显式 next=null
+   * 才结束。不能靠短页或最后一条的时间戳推测完成。
    *
    * Team 探测：Vercel 的 /v5/domains 在个人 Token 下会返回个人账号 + 其所属 Team 的
    * 域名（取决于 Token 权限），每条自带 teamId。这里在拿到列表后把第一个出现的
    * teamId 记下来供后续记录类请求使用。
    */
+  async listDomainsPage(until?: number) {
+    const res = await this.request<{ domains?: VercelDomainInfo[]; pagination?: unknown }>("GET", "/v5/domains", { query: { limit: VERCEL_PAGE_SIZE, until } });
+    const list = new CompleteList<VercelDomainInfo>("vercel");
+    list.add(res.domains, d => hasText(d.id) && hasText(d.name) && domainKey(d.name) ? [`id:${d.id}`, `name:${domainKey(d.name)}`] : null, VERCEL_PAGE_SIZE);
+    return { items: list.items, next: nextUntil(res.pagination, list.items.length, until) };
+  }
+
   async listDomains(): Promise<VercelDomainInfo[]> {
-    const domains: VercelDomainInfo[] = [];
-    let since: number | undefined;
+    const domains = new CompleteList<VercelDomainInfo>("vercel");
+    let until: number | undefined;
 
     for (let page = 0; page < VERCEL_MAX_PAGES; page++) {
-      const res = await this.request<{ domains?: VercelDomainInfo[]; pagination?: { next?: number | null } }>(
+      const res = await this.request<{ domains?: VercelDomainInfo[]; pagination?: unknown }>(
         "GET",
         "/v5/domains",
-        { query: { limit: VERCEL_PAGE_SIZE, since } }
+        { query: { limit: VERCEL_PAGE_SIZE, until } }
       );
-      const list = Array.isArray(res.domains) ? res.domains : [];
-      domains.push(...list.filter((d) => String(d.name || "").trim() !== ""));
-      if (list.length < VERCEL_PAGE_SIZE) break;
-
-      // 续拉游标：优先用响应给的 pagination.next（时间戳），拿不到就用最后一条的 createdAt
-      const next = Number(res.pagination?.next);
-      since = Number.isFinite(next) && next > 0 ? next : Number(list[list.length - 1]?.createdAt) || undefined;
-      if (!since) break;
+      domains.add(res?.domains, d => hasText(d.id) && hasText(d.name) && domainKey(d.name)
+        ? [`id:${d.id}`, `name:${domainKey(d.name)}`] : null, VERCEL_PAGE_SIZE);
+      const next = nextUntil(res?.pagination, res.domains!.length, until);
+      if (next === null) {
+        // Team 上下文只在确认完整后更新，不受失败分页影响。
+        const teamId = domains.items.find(d => hasText(d.teamId))?.teamId;
+        if (teamId) this.setTeamId(teamId);
+        return domains.items;
+      }
+      until = next;
     }
 
-    // Team 探测：记下第一个 teamId，供后续记录请求附加
-    const teamId = domains.find((d) => String(d.teamId || "").trim() !== "")?.teamId;
-    if (teamId) this.setTeamId(String(teamId));
-
-    return domains;
+    throw incompleteResponse("vercel", "Vercel 域名分页达到上限，旧缓存保持不变");
   }
 
   /**
@@ -331,25 +343,26 @@ export class VercelClient {
       throw new Error("Vercel 解析记录列表需要域名作为参数");
     }
 
-    const records: DnsRecordInfo[] = [];
-    let since: number | undefined;
+    const records = new CompleteList<VercelDnsRecord>("vercel");
+    let until: number | undefined;
 
     for (let page = 0; page < VERCEL_MAX_PAGES; page++) {
-      const res = await this.request<{ records?: VercelDnsRecord[]; pagination?: { next?: number | null } }>(
+      const res = await this.request<{ records?: VercelDnsRecord[]; pagination?: unknown }>(
         "GET",
         `/v5/domains/${encodeURIComponent(domainName)}/records`,
-        { query: { limit: VERCEL_PAGE_SIZE, since } }
+        { query: { limit: VERCEL_PAGE_SIZE, until } }
       );
-      const list = Array.isArray(res.records) ? res.records : [];
-      records.push(...list.map((rec) => mapVercelRecord(rec, domainName)));
-      if (list.length < VERCEL_PAGE_SIZE) break;
-
-      const next = Number(res.pagination?.next);
-      since = Number.isFinite(next) && next > 0 ? next : Number(list[list.length - 1]?.created) || undefined;
-      if (!since) break;
+      records.add(res?.records, r => (hasText(r.id) || hasText(r.uid)) && typeof r.name === "string" &&
+        hasText(r.type) && typeof r.value === "string"
+          ? [`id:${r.id || r.uid}`] : null, VERCEL_PAGE_SIZE);
+      const next = nextUntil(res?.pagination, res.records!.length, until);
+      if (next === null) {
+        return { success: true, complete: true, records: records.items.map(rec => mapVercelRecord(rec, domainName)) };
+      }
+      until = next;
     }
 
-    return { success: true, records };
+    throw incompleteResponse("vercel", "Vercel DNS 分页达到上限，旧缓存保持不变");
   }
 
   /**

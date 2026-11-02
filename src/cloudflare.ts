@@ -13,6 +13,10 @@ import type {
   ListDnsRecordsResponse,
 } from "./dnshe";
 import type { UpstreamSubdomain } from "./db";
+import { sha256Hex } from "./db/crypto";
+import { ProviderApiError, incompleteResponse } from "./errors/provider-api-error";
+import { parseProviderJson, requestProviderText, type ProviderRequestLimits } from "./providers/provider-request";
+import { pageTotal } from "./providers/sync-page";
 
 /**
  * 把 Cloudflare zone id 映射为 domains_cache 的数值主键
@@ -43,6 +47,7 @@ interface CfResponse<T> {
   errors: Array<{ code: number; message: string }>;
   messages?: unknown[];
   result?: T;
+  result_info?: { page?: number; per_page?: number; count?: number; total_count?: number; total_pages?: number };
 }
 
 /** zone 信息（listZones 返回，只保留面板需要的字段） */
@@ -73,6 +78,7 @@ export interface ZonePage {
   /** 下一次续拉应请求的页码（本页满员时指向下一页） */
   nextPage: number;
   hasMore: boolean;
+  total?: number;
 }
 
 /** Cloudflare 账号信息（listAccounts 返回） */
@@ -219,9 +225,12 @@ export class CloudflareClient {
   private apiToken: string;
   private baseUrl = "https://api.cloudflare.com/client/v4";
 
-  constructor(apiToken: string) {
+  constructor(apiToken: string, private readonly requestLimits: ProviderRequestLimits = {}) {
     this.apiToken = String(apiToken || "").trim();
   }
+
+  /** Opaque scope for persisted sync cursors; never persist the actual token. */
+  async syncScope(): Promise<string> { return sha256Hex(this.apiToken); }
 
   /**
    * 通用请求封装 —— 非 2xx 或 success=false 时抛出带 CF 错误信息的异常
@@ -230,7 +239,8 @@ export class CloudflareClient {
     method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE",
     path: string,
     query?: Record<string, unknown>,
-    body?: unknown
+    body?: unknown,
+    validateResponse?: (data: CfResponse<T>) => void
   ): Promise<T> {
     const url = new URL(this.baseUrl + path);
     if (query) {
@@ -241,25 +251,24 @@ export class CloudflareClient {
       }
     }
 
-    const response = await fetch(url.toString(), {
+    const result = await requestProviderText("cloudflare", url.toString(), {
       method,
       headers: {
         Authorization: `Bearer ${this.apiToken}`,
         "Content-Type": "application/json",
       },
       body: body === undefined ? undefined : JSON.stringify(body),
-    });
-
-    let data: CfResponse<T>;
-    try {
-      data = (await response.json()) as CfResponse<T>;
-    } catch {
-      throw new Error(`Cloudflare API 响应异常 (HTTP ${response.status})`);
+    }, this.requestLimits);
+    const { response, retryAfterMs } = result;
+    const data = parseProviderJson("cloudflare", result) as CfResponse<T>;
+    if (!data || typeof data !== "object" || typeof data.success !== "boolean") {
+      throw new ProviderApiError("cloudflare", response.status, "invalid_response", "Cloudflare API 响应格式异常", undefined, retryAfterMs);
     }
 
     if (!response.ok || !data.success) {
-      const firstCode = (data.errors || [])[0]?.code;
-      const detail = (data.errors || [])
+      const errors = Array.isArray(data.errors) ? data.errors : [];
+      const firstCode = errors[0]?.code;
+      const detail = errors
         .map((err) => err?.message)
         .filter(Boolean)
         .join("; ");
@@ -272,13 +281,14 @@ export class CloudflareClient {
         firstCode === 10000 ||
         /authentication error|invalid bearer|not authorized|missing authorization/i.test(detail);
       if (isAuthError) {
-        throw new Error(
-          "Cloudflare API 认证失败：请到 Cloudflare 控制台编辑该账号绑定的 API Token，确认包含 Zone:Read 与 Zone DNS:Edit 权限，且 zone 范围覆盖此域名（Include 指定账号或 All zones），改完无需重新绑定即可重试"
+        throw new ProviderApiError("cloudflare", response.status, String(firstCode ?? "authentication_error"),
+          "Cloudflare API 认证失败：请到 Cloudflare 控制台编辑该账号绑定的 API Token，确认包含 Zone:Read 与 Zone DNS:Edit 权限，且 zone 范围覆盖此域名（Include 指定账号或 All zones），改完无需重新绑定即可重试", undefined, retryAfterMs
         );
       }
-      throw new Error(`Cloudflare API 错误: ${detail || `HTTP ${response.status}`}`);
+      throw new ProviderApiError("cloudflare", response.status, String(firstCode ?? "request_failed"), `Cloudflare API 错误: ${detail || `HTTP ${response.status}`}`, undefined, retryAfterMs);
     }
 
+    validateResponse?.(data);
     return data.result as T;
   }
 
@@ -293,10 +303,10 @@ export class CloudflareClient {
   /**
    * 列出 Token 可访问的 Cloudflare 账号（用于别名解析与唯一键）
    */
-  async listAccounts(): Promise<CfAccountInfo[]> {
+  async listAccounts(maxPages = 10): Promise<CfAccountInfo[]> {
     const accounts: CfAccountInfo[] = [];
     let page = 1;
-    while (page <= 10) {
+    while (page <= Math.min(10, maxPages)) {
       const results = await this.request<CfAccountInfo[]>("GET", "/accounts", { page, per_page: 50 });
       accounts.push(...(results || []));
       if (!results || results.length < 50) break;
@@ -316,18 +326,37 @@ export class CloudflareClient {
    * NOTE: 返回值带 hasMore —— 调用方据此区分「已拉全」与「配额用尽被迫中断」，
    * 前者才能让 syncAccountDomains 做差集删除（否则会把没拉到的 zone 误删）。
    */
-  async listZones(opts: { startPage?: number; maxPages?: number } = {}): Promise<ZonePage> {
+  async listZones(opts: { startPage?: number; maxPages?: number; expectedTotal?: number } = {}): Promise<ZonePage> {
     const startPage = Math.max(1, Math.floor(opts.startPage ?? 1) || 1);
     const maxPages = Math.max(1, Math.floor(opts.maxPages ?? 50) || 1);
     const perPage = 50;
     const zones: CfZoneInfo[] = [];
     let page = startPage;
     let hasMore = false;
+    let total = opts.expectedTotal;
 
     for (let fetched = 0; fetched < maxPages; fetched++, page++) {
-      const results = await this.request<CfZoneInfo[]>("GET", "/zones", { page, per_page: perPage });
-      zones.push(...(results || []));
-      if (!results || results.length < perPage) {
+      const results = await this.request<CfZoneInfo[]>("GET", "/zones", { page, per_page: perPage }, undefined, data => {
+        const info = data.result_info;
+        if (!Array.isArray(data.result) || data.result.length > perPage) throw incompleteResponse("cloudflare");
+        if (info) {
+          if (info.page !== page || info.per_page !== perPage || info.count !== data.result.length) throw incompleteResponse("cloudflare");
+          total = pageTotal("cloudflare", info.total_count, (page - 1) * perPage, data.result.length, total);
+          if (info.total_pages !== undefined && info.total_pages !== Math.max(1, Math.ceil(total / perPage)) && !(total === 0 && info.total_pages === 0)) throw incompleteResponse("cloudflare");
+        } else if (total !== undefined) throw incompleteResponse("cloudflare");
+      });
+      const seen = new Set(zones.map(z => z.id));
+      const names = new Set(zones.map(z => z.name.toLowerCase()));
+      for (const z of results) {
+        if (!z || typeof z.id !== "string" || !z.id || typeof z.name !== "string" || !z.name || seen.has(z.id) || names.has(z.name.toLowerCase())) throw incompleteResponse("cloudflare");
+        seen.add(z.id); names.add(z.name.toLowerCase());
+      }
+      zones.push(...results);
+      if (total !== undefined) {
+        if ((page - 1) * perPage + results.length === total) { hasMore = false; break; }
+        if (results.length !== perPage) throw incompleteResponse("cloudflare");
+      }
+      if (results.length < perPage) {
         hasMore = false;
         break;
       }
@@ -335,7 +364,7 @@ export class CloudflareClient {
       hasMore = true;
     }
 
-    return { zones, nextPage: page, hasMore };
+    return { zones, nextPage: page, hasMore, ...(total === undefined ? {} : { total }) };
   }
 
   /**
@@ -387,13 +416,15 @@ export class CloudflareClient {
         `/zones/${encodeURIComponent(String(zoneId))}/dns_records`,
         { page, per_page: 100 }
       );
-      records.push(...(results || []).map(mapCfRecord));
-      if (!results || results.length < 100) break;
+      if (!Array.isArray(results)) throw incompleteResponse("cloudflare");
+      records.push(...results.map(mapCfRecord));
+      if (results.length < 100) break;
       page++;
     }
+    if (page > 50) throw incompleteResponse("cloudflare");
     // 合并 Worker 绑定信息（失败不阻塞解析记录返回）
     await this.attachWorkerNames(zoneId, records);
-    return { success: true, records };
+    return { success: true, records, complete: true };
   }
 
   /**

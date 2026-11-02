@@ -5,6 +5,7 @@
 import type { HuaweiCloudClient } from "../../huaweicloud";
 import type { DnsRecordInput } from "../../types/dns";
 import { normalizeDnsRecordName } from "../../services/dns-operations";
+import { requireCompleteDnsRecords } from "../../services/dns-snapshot";
 import type { DnsProviderAdapter, DnsProviderContext } from "./types";
 
 export class HuaweiCloudDnsAdapter implements DnsProviderAdapter {
@@ -12,7 +13,7 @@ export class HuaweiCloudDnsAdapter implements DnsProviderAdapter {
     const hwClient = client as HuaweiCloudClient;
     const remoteId = String(domain.remote_id || "");
     const res = await hwClient.listDnsRecords(remoteId);
-    return { success: Boolean(res?.success), records: res?.records || [], message: res?.message };
+    return { success: true, records: requireCompleteDnsRecords(res), message: res.message };
   }
 
   async createRecord({ domain, client }: DnsProviderContext, input: DnsRecordInput) {

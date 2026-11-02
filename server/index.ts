@@ -15,10 +15,8 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { serve } from "@hono/node-server";
 
-import worker from "../src/index";
+import worker, { runScheduledInvocation } from "../src/index";
 import { DatabaseManager } from "../src/db";
-import { runDailySyncAndRenewal } from "../src/cron";
-import type { WebhookType } from "../src/cron";
 import { createD1FromSqlite } from "./d1-sqlite";
 import { createStaticHandler } from "./static";
 
@@ -217,14 +215,13 @@ function toBeijingText(date: Date): string {
 
 function scheduleCron(): void {
   const delay = msUntilNextUtc(CRON_UTC_HOUR, CRON_UTC_MINUTE);
-  console.log(`[cron] 下一次域名同步与自动续期：${toBeijingText(new Date(Date.now() + delay))}（北京时间）`);
+  console.log(`[cron] 下一次本地到期提醒与 DNSHE 自动续期（不完整同步）：${toBeijingText(new Date(Date.now() + delay))}（北京时间）`);
 
   cronTimer = setTimeout(() => {
     void (async () => {
       try {
-        const webhookType = (env.WEBHOOK_TYPE || "custom") as WebhookType;
         // 定时触发：isScheduled=true，DP 账号跳过上游拉取（NS 已持久化），省 API Key 调用
-        await runDailySyncAndRenewal(new DatabaseManager(db, aesKey), env.WEBHOOK_URL, webhookType, true);
+        await runScheduledInvocation(env);
       } catch (e) {
         console.error("[cron] 定时任务执行失败：", e);
       } finally {

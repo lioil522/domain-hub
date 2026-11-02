@@ -16,6 +16,7 @@ import type { JumpSource } from "../types/provider";
 import type { AppLog } from "../types/log";
 import type { ApiFetch } from "../api/client";
 import { ActionCenter } from "../components/patterns/ActionCenter";
+import type { SliceState } from "../lib/sliced-sync";
 import { useAppLayout } from "./useAppLayout";
 import { NAV_ICONS, type NavigationItem, type TabKey } from "./navigation";
 
@@ -72,6 +73,10 @@ export interface AppShellProps {
 
   /** 后端 API 请求器，由 AppDataProvider 注入 */
   apiFetch: ApiFetch;
+  sessionToken: string | null;
+  syncStates: Record<number, SliceState>;
+  syncEnabled: boolean;
+  onTaskActivityChange: (active: boolean) => void;
   /** 主内容区(App 渲染的当前标签页与覆盖层) */
   children: React.ReactNode;
 }
@@ -317,7 +322,7 @@ export function AppShell(props: AppShellProps) {
           <div className="hidden sm:block flex-1" />
 
           {/* 操作中心 */}
-          <ActionCenter apiFetch={apiFetch} />
+          <ActionCenter apiFetch={apiFetch} sessionToken={props.sessionToken} syncStates={props.syncStates} syncEnabled={props.syncEnabled} onActivityChange={props.onTaskActivityChange} />
 
           {/* 通知铃铛 */}
           <div className="relative flex-shrink-0" ref={notifRef}>

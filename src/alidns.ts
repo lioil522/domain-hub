@@ -16,7 +16,7 @@
  *
  * 与 Cloudflare 的关键结构差异：
  *   1. 阿里云是 RPC 风格 —— 参数走 query string（POST 但 URL 带参），
- *      响应是 XML（这里用正则解析出需要的字段，不引入 XML 依赖）；
+ *      请求 JSON 响应，同时保留严格的 XML 兼容解析；
  *   2. 域名与解析记录两级资源，列表都带分页（PageNumber / PageSize）；
  *   3. 记录的 RR 字段是**相对名**（`@` / `www`），与 DNSPod 相同、与 CF 相反；
  *   4. MX / SRV 的优先级写在 **Value 前缀**（`10 mail.example.com`），没有独立字段。
@@ -24,6 +24,10 @@
 
 import type { ActionResponse, CreateDnsRecordResponse, DnsRecordInfo, ListDnsRecordsResponse } from "./dnshe";
 import type { UpstreamSubdomain } from "./db";
+import { ProviderApiError, incompleteResponse } from "./errors/provider-api-error";
+import { requestProviderText, type ProviderRequestLimits } from "./providers/provider-request";
+import { CompleteList, domainKey, hasText, isCount, isObject } from "./providers/list-integrity";
+import { parseAlidnsResponse } from "./providers/alidns-response";
 import { zoneIdToNumericId } from "./cloudflare";
 
 const ALIDNS_ENDPOINT = "https://alidns.aliyuncs.com/";
@@ -74,40 +78,6 @@ async function hmacSha1Base64(secret: string, message: string): Promise<string> 
     binary += String.fromCharCode(bytes[i]);
   }
   return btoa(binary);
-}
-
-/**
- * 从 XML 响应里取出某个标签的文本内容
- *
- * NOTE: 不引入 XML 解析依赖 —— 阿里云的响应结构扁平稳定，正则足够且没有 XXE 风险。
- * 只取第一个匹配（响应里的同名标签都是列表项级别的，调用方按 <Record> / <Domain>
- * 分块后再逐个取值）。
- */
-function pickXml(xml: string, tag: string): string {
-  const m = xml.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, "i"));
-  return m ? decodeXmlEntities(m[1]) : "";
-}
-
-/** 按标签名切出全部区块（用于列表响应逐项解析） */
-function pickXmlBlocks(xml: string, tag: string): string[] {
-  const blocks: string[] = [];
-  const re = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, "gi");
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(xml)) !== null) {
-    blocks.push(m[1]);
-  }
-  return blocks;
-}
-
-/** 还原 XML 实体（域名 / 记录值里可能出现 & < > " '） */
-function decodeXmlEntities(input: string): string {
-  return input
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&#(\d+);/g, (_, code: string) => String.fromCharCode(Number(code)))
-    .replace(/&amp;/g, "&");
 }
 
 /** 阿里云域名信息（DescribeDomains 返回，只保留面板需要的字段） */
@@ -226,24 +196,24 @@ export function mapAlidnsDomainToUpstream(domain: AlidnsDomainInfo): UpstreamSub
 /**
  * 阿里云云解析 DNS API 请求封装类
  *
- * 全部请求走 POST + query string 参数，响应是 XML。
+ * 全部请求走 POST + RPC 参数，JSON/XML 归一化为同一响应对象。
  */
 export class AlidnsClient {
   private accessKeyId: string;
   private accessKeySecret: string;
 
-  constructor(accessKeyId: string, accessKeySecret: string) {
+  constructor(accessKeyId: string, accessKeySecret: string, private readonly requestLimits: ProviderRequestLimits = {}) {
     this.accessKeyId = String(accessKeyId || "").trim();
     this.accessKeySecret = String(accessKeySecret || "").trim();
   }
 
   /**
-   * 通用请求封装 —— 组装 RPC 参数、签名，返回原始 XML
+   * 通用请求封装 —— 组装 RPC 参数、签名，返回已解析的响应
    *
    * NOTE: 签名串要求除 Signature 以外的全部参数按 key 字典序排列，且 key/value 都
    * 经过 percentEncode。POST 请求的待签串固定是 `POST&%2F&<encoded query>`。
    */
-  private async requestXml(action: string, params: Record<string, unknown> = {}): Promise<string> {
+  private async requestRpc(action: string, params: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
     const common: Record<string, string> = {
       Format: "JSON",
       Version: ALIDNS_API_VERSION,
@@ -270,62 +240,64 @@ export class AlidnsClient {
     const signature = await hmacSha1Base64(this.accessKeySecret, stringToSign);
     const query = `${canonical}&Signature=${percentEncode(signature)}`;
 
-    let response: Response;
-    try {
-      response = await fetch(ALIDNS_ENDPOINT, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: query,
-      });
-    } catch (e: unknown) {
-      const message = e instanceof Error ? e.message : "网络请求失败";
-      throw new Error(`阿里云 DNS API 请求失败：${message}`);
+    const result = await requestProviderText("alidns", ALIDNS_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: query,
+    }, this.requestLimits);
+    const { response, text, retryAfterMs } = result;
+    let data: Record<string, unknown>;
+    try { data = parseAlidnsResponse(text, action); }
+    catch (error) {
+      if (response.ok) throw error;
+      throw new ProviderApiError("alidns", response.status, "invalid_response", `阿里云 DNS API 响应异常 (HTTP ${response.status})`, undefined, retryAfterMs);
     }
-
-    const text = await response.text();
-
-    // 阿里云失败时返回 4xx + JSON 错误体（{"Code":"...","Message":"..."}），
-    // 成功时返回 XML。两种都要看一眼 Code 字段。
-    if (!response.ok || /<Code>/.test(text.slice(0, 400))) {
-      const jsonCode = text.match(/"Code"\s*:\s*"([^"]+)"/)?.[1];
-      const jsonMessage = text.match(/"Message"\s*:\s*"([^"]*)"/)?.[1];
-      const code = jsonCode || pickXml(text, "Code");
-      const message = jsonMessage || pickXml(text, "Message");
-      if (code || message) {
-        throw new Error(translateAlidnsError(code, message));
-      }
-      throw new Error(`阿里云 DNS API 错误: HTTP ${response.status}`);
+    if (!response.ok || hasText(data.Code)) {
+      const code = hasText(data.Code) ? data.Code : "http_error";
+      const message = typeof data.Message === "string" ? data.Message : `HTTP ${response.status}`;
+      throw new ProviderApiError("alidns", response.status, code,
+        result.rateLimited ? "阿里云 API 请求过于频繁被限流，请稍后重试" : translateAlidnsError(code, message),
+        undefined, retryAfterMs, result.rateLimited);
     }
-
-    return text;
+    return data;
   }
 
   /**
    * 列出账号下全部域名（同时用于绑定时的 AccessKey 有效性校验）
    */
+  async listDomainsPage(page = 1, expectedTotal?: number) {
+    const res = await this.requestRpc("DescribeDomains", { PageNumber: page, PageSize: ALIDNS_PAGE_SIZE });
+    const list = new CompleteList<AlidnsDomainInfo>("alidns");
+    list.add(isObject(res.Domains) ? res.Domains.Domain : undefined, d => hasText(d.DomainName) && domainKey(d.DomainName) && hasText(d.DomainId)
+      ? [`id:${d.DomainId}`, `name:${domainKey(d.DomainName)}`] : null, ALIDNS_PAGE_SIZE);
+    if (res.PageNumber !== page || res.PageSize !== ALIDNS_PAGE_SIZE) throw incompleteResponse("alidns");
+    const total = pageTotal("alidns", res.TotalCount, (page - 1) * ALIDNS_PAGE_SIZE, list.items.length, expectedTotal);
+    const ended = (page - 1) * ALIDNS_PAGE_SIZE + list.items.length === total;
+    if (!ended && list.items.length !== ALIDNS_PAGE_SIZE) throw incompleteResponse("alidns");
+    return { items: list.items, total, next: ended ? null : page + 1 };
+  }
+
   async listDomains(): Promise<AlidnsDomainInfo[]> {
-    const domains: AlidnsDomainInfo[] = [];
+    const domains = new CompleteList<AlidnsDomainInfo>("alidns");
     for (let page = 1; page <= ALIDNS_MAX_PAGES; page++) {
-      const xml = await this.requestXml("DescribeDomains", {
+      const res = await this.requestRpc("DescribeDomains", {
         PageNumber: page,
         PageSize: ALIDNS_PAGE_SIZE,
       });
-      const blocks = pickXmlBlocks(xml, "Domain");
-      for (const block of blocks) {
-        const name = pickXml(block, "DomainName");
-        if (!name) continue;
-        const nsRaw = pickXmlBlocks(block, "DnsServer").map((ns) => decodeXmlEntities(ns).trim()).filter(Boolean);
-        domains.push({
-          DomainName: name,
-          DomainId: pickXml(block, "DomainId"),
-          RecordCount: Number(pickXml(block, "RecordCount")) || 0,
-          DnsServers: nsRaw.length > 0 ? { DnsServer: nsRaw } : undefined,
-          AliDomain: /true/i.test(pickXml(block, "AliDomain")),
-        });
-      }
-      if (blocks.length < ALIDNS_PAGE_SIZE) break;
+      const list = isObject(res.Domains) ? res.Domains.Domain : undefined;
+      domains.add(list, d => hasText(d.DomainName) && domainKey(d.DomainName) && hasText(d.DomainId)
+        ? [`id:${d.DomainId}`, `name:${domainKey(d.DomainName)}`] : null, ALIDNS_PAGE_SIZE);
+      if (this.pageEnded(res, page, (list as unknown[]).length, domains)) return domains.items;
     }
-    return domains;
+    throw incompleteResponse("alidns", "阿里云域名分页达到上限，旧缓存保持不变");
+  }
+
+  private pageEnded<T>(res: Record<string, unknown>, page: number, length: number, list: CompleteList<T>): boolean {
+    if (res.PageNumber !== page || res.PageSize !== ALIDNS_PAGE_SIZE) throw incompleteResponse("alidns");
+    const ended = list.ended(res.TotalCount);
+    // Page-number pagination cannot advance a short non-final page without skipping rows.
+    if (!ended && length !== ALIDNS_PAGE_SIZE) throw incompleteResponse("alidns");
+    return ended;
   }
 
   /**
@@ -338,17 +310,17 @@ export class AlidnsClient {
     if (!trimmed) {
       throw new Error("域名不能为空");
     }
-    const xml = await this.requestXml("AddDomain", {
+    const res = await this.requestRpc("AddDomain", {
       DomainName: trimmed,
     });
-    const id = pickXml(xml, "DomainId");
-    const name = pickXml(xml, "DomainName") || trimmed;
-    const nsRaw = pickXmlBlocks(xml, "DnsServer").map((ns) => decodeXmlEntities(ns).trim()).filter(Boolean);
+    const id = hasText(res.DomainId) ? res.DomainId : undefined;
+    const name = hasText(res.DomainName) ? res.DomainName : trimmed;
     return {
       DomainId: id,
       DomainName: name,
       RecordCount: 0,
-      DnsServers: nsRaw.length > 0 ? { DnsServer: nsRaw } : undefined,
+      DnsServers: isObject(res.DnsServers) && Array.isArray(res.DnsServers.DnsServer)
+        ? { DnsServer: res.DnsServers.DnsServer.filter(hasText) } : undefined,
     };
   }
 
@@ -364,34 +336,21 @@ export class AlidnsClient {
       throw new Error("阿里云 DNS 解析记录列表需要域名作为参数");
     }
 
-    const records: DnsRecordInfo[] = [];
+    const records = new CompleteList<AlidnsRecord>("alidns");
     for (let page = 1; page <= ALIDNS_MAX_PAGES; page++) {
-      const xml = await this.requestXml("DescribeDomainRecords", {
+      const res = await this.requestRpc("DescribeDomainRecords", {
         DomainName: domainName,
         PageNumber: page,
         PageSize: ALIDNS_PAGE_SIZE,
       });
-      const blocks = pickXmlBlocks(xml, "Record");
-      for (const block of blocks) {
-        records.push(
-          mapAlidnsRecord(
-            {
-              RecordId: pickXml(block, "RecordId"),
-              RR: pickXml(block, "RR"),
-              Type: pickXml(block, "Type"),
-              Value: pickXml(block, "Value"),
-              TTL: Number(pickXml(block, "TTL")) || 600,
-              Line: pickXml(block, "Line"),
-              Priority: Number(pickXml(block, "Priority")) || undefined,
-              Status: pickXml(block, "Status"),
-            },
-            domainName
-          )
-        );
+      const list = isObject(res.DomainRecords) ? res.DomainRecords.Record : undefined;
+      records.add(list, r => hasText(r.RecordId) && hasText(r.RR) && hasText(r.Type) &&
+        typeof r.Value === "string" && isCount(r.TTL) ? [`id:${r.RecordId}`] : null, ALIDNS_PAGE_SIZE);
+      if (this.pageEnded(res, page, (list as unknown[]).length, records)) {
+        return { success: true, complete: true, records: records.items.map(rec => mapAlidnsRecord(rec, domainName)) };
       }
-      if (blocks.length < ALIDNS_PAGE_SIZE) break;
     }
-    return { success: true, records };
+    throw incompleteResponse("alidns", "阿里云 DNS 分页达到上限，旧缓存保持不变");
   }
 
   /**
@@ -445,8 +404,8 @@ export class AlidnsClient {
     line?: string;
     record_id?: string | number;
   }): Promise<CreateDnsRecordResponse> {
-    const xml = await this.requestXml("AddDomainRecord", this.buildRecordPayload(params));
-    const recordId = pickXml(xml, "RecordId");
+    const res = await this.requestRpc("AddDomainRecord", this.buildRecordPayload(params));
+    const recordId = hasText(res.RecordId) ? res.RecordId : undefined;
     return {
       success: true,
       record: recordId
@@ -480,7 +439,7 @@ export class AlidnsClient {
     priority?: number;
     line?: string;
   }): Promise<ActionResponse> {
-    await this.requestXml("UpdateDomainRecord", {
+    await this.requestRpc("UpdateDomainRecord", {
       ...this.buildRecordPayload(params),
       RecordId: String(params.record_id),
     });
@@ -494,7 +453,7 @@ export class AlidnsClient {
    * 与其余三个客户端的方法签名保持一致（路由层统一传 remoteId, recordId）。
    */
   async deleteDnsRecord(_domain: string | number, recordId: string | number): Promise<ActionResponse> {
-    await this.requestXml("DeleteDomainRecord", { RecordId: String(recordId) });
+    await this.requestRpc("DeleteDomainRecord", { RecordId: String(recordId) });
     return { success: true };
   }
 }
@@ -537,3 +496,4 @@ export function translateAlidnsError(code: string, message: string): string {
   const detail = m ? `${c || "未知错误"}: ${m}` : c || "未知错误";
   return `阿里云 DNS API 错误: ${detail}`;
 }
+import { pageTotal } from "./providers/sync-page";

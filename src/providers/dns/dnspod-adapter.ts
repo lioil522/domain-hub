@@ -5,6 +5,7 @@
 import type { DnspodClient } from "../../dnspod";
 import type { DnsRecordInput } from "../../types/dns";
 import { normalizeDnsRecordName } from "../../services/dns-operations";
+import { requireCompleteDnsRecords } from "../../services/dns-snapshot";
 import type { DnsProviderAdapter, DnsProviderContext } from "./types";
 
 export class DnspodDnsAdapter implements DnsProviderAdapter {
@@ -12,7 +13,7 @@ export class DnspodDnsAdapter implements DnsProviderAdapter {
     const dnspodClient = client as DnspodClient;
     const targetDomain = domain.full_domain;
     const res = await dnspodClient.listDnsRecords(targetDomain);
-    return { success: Boolean(res?.success), records: res?.records || [], message: res?.message };
+    return { success: true, records: requireCompleteDnsRecords(res), message: res.message };
   }
 
   async createRecord({ domain, client }: DnsProviderContext, input: DnsRecordInput) {

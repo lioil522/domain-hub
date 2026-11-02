@@ -5,11 +5,33 @@
  * 使所有调用方获得编译期的字段提示和类型校验。
  */
 
+import { ProviderApiError, incompleteResponse } from "./errors/provider-api-error";
+import { parseProviderJson, requestProviderText, type ProviderRequestLimits, type ProviderTextResponse } from "./providers/provider-request";
+import type { RequestBudget } from "./services/dnshe-request-budget";
+import { dnsheResetAfter } from "./providers/provider-rate-limit";
+
+export interface OffsetPagination {
+  mode?: "offset";
+  page?: number;
+  per_page?: number;
+  total?: number;
+  has_more: boolean;
+  next_page?: number;
+}
+export interface CursorPagination {
+  cursor?: number | string;
+  per_page?: number;
+  has_more: boolean;
+  next_cursor?: number | string | null;
+}
+
 /** 通用基础响应 */
 export interface BaseResponse {
   success: boolean;
   message?: string;
   error?: string;
+  error_code?: string;
+  details?: unknown;
 }
 
 /** 配额查询响应 */
@@ -29,6 +51,7 @@ export interface ListSubdomainsResponse extends BaseResponse {
   total?: number;
   page?: number;
   per_page?: number;
+  pagination?: OffsetPagination;
 }
 
 /** 子域名信息 */
@@ -66,6 +89,7 @@ export interface SubdomainInfo {
 export interface GetSubdomainResponse extends BaseResponse {
   subdomain?: SubdomainInfo;
   records?: DnsRecordInfo[];
+  dns_records?: DnsRecordInfo[];
 }
 
 /** 续期响应 */
@@ -76,6 +100,8 @@ export interface RenewResponse extends BaseResponse {
 /** DNS 记录列表响应 */
 export interface ListDnsRecordsResponse extends BaseResponse {
   records?: DnsRecordInfo[];
+  pagination?: CursorPagination;
+  complete?: boolean;
 }
 
 /** DNS 记录信息 */
@@ -101,6 +127,8 @@ export interface DnsRecordInfo {
 /** 创建 DNS 记录响应 */
 export interface CreateDnsRecordResponse extends BaseResponse {
   record?: DnsRecordInfo;
+  id?: number | string;
+  record_id?: string;
 }
 
 /** API 密钥信息 */
@@ -121,7 +149,10 @@ export interface ListApiKeysResponse extends BaseResponse {
 }
 
 /** 通用操作响应（用于更新、删除等不返回额外数据的操作） */
-export interface ActionResponse extends BaseResponse {}
+export interface ActionResponse extends BaseResponse {
+  id?: number | string;
+  record_id?: string;
+}
 
 /** 注册子域名响应 */
 export interface RegisterSubdomainResponse extends BaseResponse {
@@ -134,13 +165,16 @@ export interface CreateDnsRecordParams {
   subdomain_id: number;
   type: string;
   name?: string;
-  content: string;
+  content?: string;
   ttl?: number;
   priority?: number;
   line?: string;
   weight?: number;
   port?: number;
   target?: string;
+  caa_flag?: number;
+  caa_tag?: string;
+  caa_value?: string;
 }
 
 /** 更新 DNS 记录参数 */
@@ -156,7 +190,8 @@ export class DNSHEClient {
   private apiSecret: string;
   private baseUrl: string;
 
-  constructor(apiKey: string, apiSecret: string) {
+  constructor(apiKey: string, apiSecret: string, private readonly budget?: RequestBudget,
+    private readonly requestLimits: ProviderRequestLimits = {}) {
     this.apiKey = apiKey;
     this.apiSecret = apiSecret;
     // 从文档得知 API 地址
@@ -170,7 +205,9 @@ export class DNSHEClient {
     endpoint: string,
     action: string,
     method: "GET" | "POST",
-    params: Record<string, unknown> = {}
+    params: Record<string, unknown> = {},
+    signal?: AbortSignal,
+    beforeDispatch?: () => Promise<void>
   ): Promise<T> {
     let url = `${this.baseUrl}?m=domain_hub&endpoint=${endpoint}&action=${action}`;
     
@@ -183,6 +220,7 @@ export class DNSHEClient {
     const options: RequestInit = {
       method,
       headers,
+      signal,
     };
 
     if (method === "GET") {
@@ -200,25 +238,40 @@ export class DNSHEClient {
       options.body = JSON.stringify(params);
     }
 
+    await this.budget?.reserve();
+    let result: ProviderTextResponse;
+    let data: T | null;
     try {
-      const response = await fetch(url, options);
-      if (!response.ok) {
-        const errData = (await response.json().catch(() => ({}))) as Record<string, unknown>;
-        const errMsg = 
-          (typeof errData.message === "string" && errData.message) ||
-          (typeof errData.msg === "string" && errData.msg) ||
-          (typeof errData.error === "string" && errData.error) ||
-          (typeof errData.detail === "string" && errData.detail) ||
-          `HTTP error! status: ${response.status}`;
-        throw new Error(errMsg);
+      result = await requestProviderText("dnshe", url, options, { ...this.requestLimits, beforeDispatch });
+      data = parseProviderJson("dnshe", result) as T | null;
+    } catch (error) {
+      if (error instanceof ProviderApiError && (error.status === 429 || error.rateLimited) && !error.error_code.startsWith("scheduler_")) {
+        // Preserve the original unread/unknown transport outcome if cooldown
+        // coordination also fails. Persistence is not guaranteed by this error.
+        try { await this.budget?.block(Math.max(error.retryAfterMs ?? 60_000, 1000)); } catch { /* primary error wins */ }
       }
-      const data: T = await response.json();
-      return data;
-    } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : "Unknown error";
-      console.error(`DNSHE API Error [${endpoint}/${action}]:`, message);
       throw error;
     }
+    const { response } = result;
+    if (!data || typeof data !== "object" || typeof data.success !== "boolean") {
+      if (response.status === 429) await this.budget?.block(Math.max(result.retryAfterMs ?? 60_000, 1000));
+      throw new ProviderApiError("dnshe", response.status, "invalid_response", `DNSHE 返回无效响应（HTTP ${response.status}）`, undefined, result.retryAfterMs);
+    }
+    if (!response.ok || !data.success) {
+      let retryAfterMs = result.retryAfterMs;
+      if (response.status === 429 || result.rateLimited) {
+        retryAfterMs = Math.max(retryAfterMs ?? 60_000, dnsheResetAfter(data.details) ?? 0, 1000);
+        await this.budget?.block(retryAfterMs);
+        if (!result.rateLimited) await this.requestLimits.scheduler?.block(retryAfterMs);
+      }
+      throw new ProviderApiError("dnshe", response.status, data.error_code || "request_failed",
+        data.message || data.error || `DNSHE 请求失败（HTTP ${response.status}）`,
+        (response.status === 429 || result.rateLimited) && this.requestLimits.scheduler?.scope
+          ? { ...(data.details && typeof data.details === "object" ? data.details : {}), scope: this.requestLimits.scheduler.scope }
+          : data.details,
+        Number.isFinite(retryAfterMs) ? retryAfterMs : undefined, result.rateLimited);
+    }
+    return data;
   }
 
   /**
@@ -271,10 +324,10 @@ export class DNSHEClient {
   /**
    * 续期子域名
    */
-  async renewSubdomain(subdomainId: number): Promise<RenewResponse> {
+  async renewSubdomain(subdomainId: number, beforeDispatch?: () => Promise<void>): Promise<RenewResponse> {
     return this.request<RenewResponse>("subdomains", "renew", "POST", {
       subdomain_id: subdomainId
-    });
+    }, undefined, beforeDispatch);
   }
 
   /**
@@ -292,10 +345,37 @@ export class DNSHEClient {
    * NOTE: 参数放宽为 number | string —— 路由层对 DNSHE / Cloudflare 客户端做联合分发时
    * 传同一个 remote_id（DNSHE 行是数字主键，CF 行是 zone id 字符串），实际只走数字。
    */
+  async listDnsRecordsPage(subdomainId: number | string, cursor: number | string = 0): Promise<ListDnsRecordsResponse> {
+    return this.request<ListDnsRecordsResponse>("dns_records", "list", "GET", { subdomain_id: subdomainId, cursor, per_page: 100 });
+  }
+
   async listDnsRecords(subdomainId: number | string): Promise<ListDnsRecordsResponse> {
-    return this.request<ListDnsRecordsResponse>("dns_records", "list", "GET", {
-      subdomain_id: subdomainId
-    });
+    const records: DnsRecordInfo[] = [];
+    const cursors = new Set<string>(["0"]);
+    const ids = new Set<string>();
+    let cursor: number | string = 0;
+    for (let page = 0; page < 50; page++) {
+      const response: ListDnsRecordsResponse = await this.request<ListDnsRecordsResponse>("dns_records", "list", "GET", {
+        subdomain_id: subdomainId, cursor, per_page: 100,
+      });
+      if (!Array.isArray(response.records)) throw incompleteResponse("dnshe");
+      for (const record of response.records) {
+        if (!record || record.id === undefined || ids.has(String(record.id))) throw incompleteResponse("dnshe");
+        ids.add(String(record.id));
+        records.push(record);
+      }
+      const pagination = response.pagination;
+      if (pagination && typeof pagination.has_more !== "boolean") throw incompleteResponse("dnshe");
+      if (pagination?.has_more === false || (!pagination && response.records.length < 100)) {
+        return { ...response, records, complete: true };
+      }
+      const next = pagination?.next_cursor;
+      if (!pagination || !response.records.length || next == null || cursors.has(String(next)) ||
+        (typeof next !== "string" && typeof next !== "number")) throw incompleteResponse("dnshe");
+      cursors.add(String(next));
+      cursor = next;
+    }
+    throw incompleteResponse("dnshe", "DNSHE DNS 分页达到安全上限，未覆盖旧缓存");
   }
 
   /**
@@ -314,7 +394,7 @@ export class DNSHEClient {
   async updateDnsRecord(params: UpdateDnsRecordParams): Promise<ActionResponse> {
     const payload: Record<string, unknown> = { ...params };
     const numId = Number(params.record_id);
-    if (!isNaN(numId) && numId > 0) {
+    if (Number.isSafeInteger(numId) && numId > 0) {
       payload.id = numId;
     }
     payload.record_id = String(params.record_id);
@@ -334,7 +414,7 @@ export class DNSHEClient {
     
     // 如果是纯数字或数值型字符串，作为内部 id 传递；同时补充 record_id 保证兼容
     const numId = Number(recordId);
-    if (!isNaN(numId) && numId > 0) {
+    if (Number.isSafeInteger(numId) && numId > 0) {
       params.id = numId;
       params.record_id = String(recordId);
     } else {
@@ -347,9 +427,9 @@ export class DNSHEClient {
   /**
    * WHOIS 查询域名可注册性
    */
-  async whois(domain: string): Promise<{ success: boolean; domain?: string; registered?: boolean; status?: string; registered_at?: string; expires_at?: string; registrant_email?: string; nameservers?: string[]; message?: string }> {
+  async whois(domain: string, signal?: AbortSignal): Promise<{ success: boolean; domain?: string; registered?: boolean; status?: string; registered_at?: string; expires_at?: string; registrant_email?: string; nameservers?: string[]; message?: string }> {
     return this.request<{ success: boolean; domain?: string; registered?: boolean; status?: string; registered_at?: string; expires_at?: string; registrant_email?: string; nameservers?: string[]; message?: string }>("whois", "", "GET", {
       domain
-    });
+    }, signal);
   }
 }

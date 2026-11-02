@@ -6,6 +6,12 @@
  */
 
 import { DNSHEClient } from "../../dnshe";
+import { databaseBudget } from "../budget-d1";
+import { InvocationBudgetError } from "../../services/invocation-budget";
+import { DnsheAccountRequestScheduler } from "../../services/dnshe-account-scheduler";
+import { SharedProviderRequestScheduler } from "../../services/provider-request-scheduler";
+import { AppError } from "../../errors";
+import { ProviderApiError } from "../../errors/provider-api-error";
 import { CloudflareClient } from "../../cloudflare";
 import { DigitalPlatClient } from "../../digitalplat";
 import { DnspodClient, looksLikeTencentSecretId } from "../../dnspod";
@@ -22,6 +28,22 @@ import {
   normalizeCfAlias,
 } from "../types";
 
+const requestLimits = (db: D1Database, provider: Exclude<AccountProvider, "custom">) => ({
+  budget: databaseBudget(db),
+  scheduler: new SharedProviderRequestScheduler(db, provider),
+});
+const dnsheLimits = (db: D1Database, apiKey: string) => ({ budget: databaseBudget(db), scheduler: new DnsheAccountRequestScheduler(db, apiKey) });
+
+function validationFailure(error: unknown, prefix: string): Error {
+  // Do not turn a typed 429/transport/coordination failure into an ordinary 400.
+  return error instanceof AppError ? error : new Error(`${prefix}: ${error instanceof Error ? error.message : "未知错误"}`);
+}
+
+function propagateAdmissionFailure(error: unknown): void {
+  if (error instanceof InvocationBudgetError) throw error;
+  if (error instanceof ProviderApiError && (error.statusCode === 429 || error.error_code.startsWith("scheduler_"))) throw error;
+}
+
 /**
  * 通过 keys/list 接口校验 API 密钥有效性，并尝试自动解析密钥名称作为别名
  */
@@ -34,8 +56,7 @@ export async function resolveAliasFromKey(client: DNSHEClient, apiKey: string): 
       if (keyName) return keyName;
     }
   } catch (e: unknown) {
-    const message = e instanceof Error ? e.message : "未知错误";
-    throw new Error(`无法验证 API 密钥有效性: ${message}`);
+    throw validationFailure(e, "无法验证 API 密钥有效性");
   }
   return null;
 }
@@ -63,12 +84,12 @@ export async function addAccount(
     uniqueKey = `custom:${await sha256Hex(`custom:${finalAlias}`)}`;
     credential = "";
   } else if (provider === "cloudflare") {
-    const cfClient = new CloudflareClient(apiSecret);
+    const cfClient = new CloudflareClient(apiSecret, requestLimits(db, "cloudflare"));
     let verify: { token_id: string; status: string };
     try {
       verify = await cfClient.verifyToken();
     } catch (e: unknown) {
-      throw new Error(`Cloudflare Token 校验失败: ${e instanceof Error ? e.message : "未知错误"}`);
+      throw validationFailure(e, "Cloudflare Token 校验失败");
     }
     if (verify.status && verify.status.toLowerCase() !== "active") {
       throw new Error(`Cloudflare Token 状态异常 (${verify.status})，请检查 Token 是否被禁用`);
@@ -76,14 +97,16 @@ export async function addAccount(
 
     let cfAccount: { id?: string; name?: string } | undefined;
     try {
-      cfAccount = (await cfClient.listAccounts())[0];
-    } catch {
+      cfAccount = (await cfClient.listAccounts(1))[0];
+    } catch (error) {
+      propagateAdmissionFailure(error);
       cfAccount = undefined;
     }
     if (!cfAccount) {
       try {
         cfAccount = (await cfClient.listZones({ maxPages: 1 })).zones.find((z) => z.account?.id)?.account;
-      } catch {
+      } catch (error) {
+        propagateAdmissionFailure(error);
         cfAccount = undefined;
       }
     }
@@ -94,11 +117,11 @@ export async function addAccount(
     if (!finalAlias) finalAlias = `Cloudflare ${String(verify.token_id).slice(0, 8)}`;
     if (uniqueKey === apiKey) uniqueKey = `cf:token:${verify.token_id}`;
   } else if (provider === "digitalplat") {
-    const dpClient = new DigitalPlatClient(credential);
+    const dpClient = new DigitalPlatClient(credential, requestLimits(db, "digitalplat"));
     try {
       await dpClient.listDomains();
     } catch (e: unknown) {
-      throw new Error(`DigitalPlat API Key 校验失败: ${e instanceof Error ? e.message : "未知错误"}`);
+      throw validationFailure(e, "DigitalPlat API Key 校验失败");
     }
     if (!finalAlias) {
       finalAlias = `DigitalPlat ••••${credential.slice(-4)}`;
@@ -111,11 +134,11 @@ export async function addAccount(
           "请注意 DNSPod 控制台里的「API Token」是另一套凭据，本面板使用腾讯云 API 密钥"
       );
     }
-    const dnspodClient = new DnspodClient(apiKey, credential);
+    const dnspodClient = new DnspodClient(apiKey, credential, requestLimits(db, "dnspod"));
     try {
-      await dnspodClient.listDomains();
+      await dnspodClient.listDomainsPage();
     } catch (e: unknown) {
-      throw new Error(`DNSPod 凭据校验失败: ${e instanceof Error ? e.message : "未知错误"}`);
+      throw validationFailure(e, "DNSPod 凭据校验失败");
     }
     if (!finalAlias) finalAlias = `DNSPod ••••${apiKey.slice(-6)}`;
     uniqueKey = dualCredentialApiKey("dnspod", apiKey);
@@ -125,19 +148,20 @@ export async function addAccount(
         "阿里云 AccessKey ID 格式不正确（应以 LTAI 开头，来自阿里云控制台「访问控制 → 用户 → 创建 AccessKey」）"
       );
     }
-    const alidnsClient = new AlidnsClient(apiKey, credential);
+    const alidnsClient = new AlidnsClient(apiKey, credential, requestLimits(db, "alidns"));
     try {
-      await alidnsClient.listDomains();
+      await alidnsClient.listDomainsPage();
     } catch (e: unknown) {
-      throw new Error(`阿里云 DNS 凭据校验失败: ${e instanceof Error ? e.message : "未知错误"}`);
+      throw validationFailure(e, "阿里云 DNS 凭据校验失败");
     }
     if (!finalAlias) finalAlias = `阿里云 DNS ••••${apiKey.slice(-6)}`;
     uniqueKey = dualCredentialApiKey("alidns", apiKey);
   } else if (provider === "huaweicloud") {
-    const huaweiClient = new HuaweiCloudClient(apiKey, credential);
+    const huaweiClient = new HuaweiCloudClient(apiKey, credential, undefined, requestLimits(db, "huaweicloud"));
     try {
-      await huaweiClient.listDomains();
+      await huaweiClient.listDomainsPage();
     } catch (e: unknown) {
+      if (e instanceof AppError) throw e;
       const detail = e instanceof Error ? e.message : "未知错误";
       const shapeHint = looksLikeHuaweiAccessKeyId(apiKey)
         ? ""
@@ -147,12 +171,12 @@ export async function addAccount(
     if (!finalAlias) finalAlias = `华为云 DNS ••••${apiKey.slice(-6)}`;
     uniqueKey = dualCredentialApiKey("huaweicloud", apiKey);
   } else if (provider === "vercel") {
-    const vercelClient = new VercelClient(credential);
+    const vercelClient = new VercelClient(credential, undefined, requestLimits(db, "vercel"));
     let vercelUser: { id: string; username?: string; email?: string };
     try {
       vercelUser = await vercelClient.verifyToken();
     } catch (e: unknown) {
-      throw new Error(`Vercel Token 校验失败: ${e instanceof Error ? e.message : "未知错误"}`);
+      throw validationFailure(e, "Vercel Token 校验失败");
     }
     if (!finalAlias) {
       finalAlias = vercelUser.username
@@ -164,7 +188,7 @@ export async function addAccount(
       : `vercel:${(await sha256Hex(credential)).slice(0, 32)}`;
   } else {
     // DNSHE
-    const client = new DNSHEClient(apiKey, apiSecret);
+    const client = new DNSHEClient(apiKey, apiSecret, undefined, dnsheLimits(db, apiKey));
     if (!finalAlias) {
       const resolved = await resolveAliasFromKey(client, apiKey);
       if (!resolved) {
@@ -175,19 +199,21 @@ export async function addAccount(
       try {
         await client.getQuota();
       } catch (e: unknown) {
-        const message = e instanceof Error ? e.message : "未知错误";
-        throw new Error(`无法验证 API 密钥有效性: ${message}`);
+        throw validationFailure(e, "无法验证 API 密钥有效性");
       }
     }
   }
 
   const encryptedSecret = await encryptText(credential, aesKey);
 
+  let result: DBAccount | null;
   try {
-    await db.prepare(
-      "INSERT INTO accounts (alias, api_key, api_secret, provider, website) VALUES (?, ?, ?, ?, ?)"
-    ).bind(finalAlias, uniqueKey, encryptedSecret, provider, finalWebsite).run();
+    result = await db.prepare(
+      "INSERT INTO accounts (alias, api_key, api_secret, provider, website) VALUES (?, ?, ?, ?, ?) RETURNING id,alias,api_key,provider,website,created_at"
+    ).bind(finalAlias, uniqueKey, encryptedSecret, provider, finalWebsite).first<DBAccount>();
+    if (!result) throw new Error("账户入库未确认，请读取账号列表核对，不要重复绑定");
   } catch (e: unknown) {
+    if (e instanceof AppError) throw e;
     const raw = e instanceof Error ? e.message : String(e);
     if (raw.includes("UNIQUE") || raw.toLowerCase().includes("unique constraint")) {
       throw new Error(
@@ -198,10 +224,6 @@ export async function addAccount(
     }
     throw new Error(`账户入库失败: ${raw}`);
   }
-
-  const result = await db.prepare(
-    "SELECT id, alias, api_key, provider, website, created_at FROM accounts WHERE api_key = ?"
-  ).bind(uniqueKey).first<DBAccount>();
 
   if (!aesKey) {
     await writeLog(db, "warning", "operation", `账户 [${finalAlias}] 已绑定，但由于未配置 AES_KEY，秘钥将以不安全的方式（弱 Base64 编码）存储在 D1 中！`);
@@ -252,30 +274,37 @@ export async function updateAccount(
   if (existingRow.provider === "cloudflare") {
     const newToken = (apiSecret || "").trim();
     if (newToken) {
-      const cfClient = new CloudflareClient(newToken);
+      const cfClient = new CloudflareClient(newToken, requestLimits(db, "cloudflare"));
       try {
         const verify = await cfClient.verifyToken();
         if (verify.status && verify.status.toLowerCase() !== "active") {
           throw new Error(`Token 状态异常 (${verify.status})`);
         }
       } catch (e: unknown) {
-        const message = e instanceof Error ? e.message : "未知错误";
-        throw new Error(`无法验证新 Cloudflare Token: ${message}`);
+        throw validationFailure(e, "无法验证新 Cloudflare Token");
       }
       finalEncryptedSecret = await encryptText(newToken, aesKey);
     }
   } else if (existingRow.provider === "digitalplat") {
     const newKey = (apiSecret || "").trim();
     if (newKey) {
-      const dpClient = new DigitalPlatClient(newKey);
+      const dpClient = new DigitalPlatClient(newKey, requestLimits(db, "digitalplat"));
       try {
         await dpClient.listDomains();
       } catch (e: unknown) {
-        const message = e instanceof Error ? e.message : "未知错误";
-        throw new Error(`无法验证新 DigitalPlat API Key: ${message}`);
+        throw validationFailure(e, "无法验证新 DigitalPlat API Key");
       }
       finalApiKey = `dp:${(await sha256Hex(newKey)).slice(0, 32)}`;
       finalEncryptedSecret = await encryptText(newKey, aesKey);
+    }
+  } else if (existingRow.provider === "vercel") {
+    const newToken = (apiSecret || "").trim();
+    if (newToken) {
+      let user: { id: string };
+      try { user = await new VercelClient(newToken, undefined, requestLimits(db, "vercel")).verifyToken(); }
+      catch (e: unknown) { throw validationFailure(e, "无法验证新 Vercel Token"); }
+      finalApiKey = user.id ? `vercel:${user.id}` : `vercel:${(await sha256Hex(newToken)).slice(0, 32)}`;
+      finalEncryptedSecret = await encryptText(newToken, aesKey);
     }
   } else if (
     existingRow.provider === "dnspod" ||
@@ -290,12 +319,11 @@ export async function updateAccount(
         throw new Error("更换凭据时，AccessKey ID 与 Secret 必须同时填写");
       }
       try {
-        if (provider === "dnspod") await new DnspodClient(newKey, newSecret).listDomains();
-        else if (provider === "alidns") await new AlidnsClient(newKey, newSecret).listDomains();
-        else await new HuaweiCloudClient(newKey, newSecret).listDomains();
+        if (provider === "dnspod") await new DnspodClient(newKey, newSecret, requestLimits(db, "dnspod")).listDomainsPage();
+        else if (provider === "alidns") await new AlidnsClient(newKey, newSecret, requestLimits(db, "alidns")).listDomainsPage();
+        else await new HuaweiCloudClient(newKey, newSecret, undefined, requestLimits(db, "huaweicloud")).listDomainsPage();
       } catch (e: unknown) {
-        const message = e instanceof Error ? e.message : "未知错误";
-        throw new Error(`无法验证新凭据有效性: ${message}`);
+        throw validationFailure(e, "无法验证新凭据有效性");
       }
       finalApiKey = dualCredentialApiKey(provider, newKey);
       finalEncryptedSecret = await encryptText(newSecret, aesKey);
@@ -308,33 +336,31 @@ export async function updateAccount(
       if (!newKey || !newSecret) {
         throw new Error("更换 API 密钥时，API Key 与 API Secret 必须同时填写");
       }
-      const client = new DNSHEClient(newKey, newSecret);
+      const client = new DNSHEClient(newKey, newSecret, undefined, dnsheLimits(db, newKey));
       try {
         await client.getQuota();
       } catch (e: unknown) {
-        const message = e instanceof Error ? e.message : "未知错误";
-        throw new Error(`无法验证新 API 密钥有效性: ${message}`);
+        throw validationFailure(e, "无法验证新 API 密钥有效性");
       }
       finalApiKey = newKey;
       finalEncryptedSecret = await encryptText(newSecret, aesKey);
     }
   }
 
+  let result: DBAccount | null;
   try {
-    await db.prepare(
-      "UPDATE accounts SET alias = ?, api_key = ?, api_secret = ? WHERE id = ?"
-    ).bind(finalAlias, finalApiKey, finalEncryptedSecret, id).run();
+    result = await db.prepare(
+      "UPDATE accounts SET alias = ?, api_key = ?, api_secret = ? WHERE id = ? RETURNING id,alias,api_key,provider,website,created_at"
+    ).bind(finalAlias, finalApiKey, finalEncryptedSecret, id).first<DBAccount>();
+    if (!result) throw new Error("账户更新未确认，请读取账号列表核对");
   } catch (e: unknown) {
+    if (e instanceof AppError) throw e;
     const raw = e instanceof Error ? e.message : String(e);
     if (raw.includes("UNIQUE") || raw.toLowerCase().includes("unique constraint")) {
       throw new Error("该 API Key 已被其他账号绑定，请勿重复使用");
     }
     throw new Error(`账户更新失败: ${raw}`);
   }
-
-  const result = await db.prepare(
-    "SELECT id, alias, api_key, provider, website, created_at FROM accounts WHERE id = ?"
-  ).bind(id).first<DBAccount>();
 
   await writeLog(db, "success", "operation", `账户 [${finalAlias}] 信息已更新`);
   return result as DBAccount;
@@ -388,25 +414,25 @@ export async function getClientForAccount(
     );
   }
   if (typedAccount.provider === "cloudflare") {
-    return { client: new CloudflareClient(apiSecret), alias: typedAccount.alias, provider: "cloudflare" };
+    return { client: new CloudflareClient(apiSecret, requestLimits(db, "cloudflare")), alias: typedAccount.alias, provider: "cloudflare" };
   }
   if (typedAccount.provider === "digitalplat") {
-    return { client: new DigitalPlatClient(apiSecret), alias: typedAccount.alias, provider: "digitalplat" };
+    return { client: new DigitalPlatClient(apiSecret, requestLimits(db, "digitalplat")), alias: typedAccount.alias, provider: "digitalplat" };
   }
   if (typedAccount.provider === "dnspod") {
-    return { client: new DnspodClient(accessKeyIdFromApiKey(typedAccount.api_key), apiSecret), alias: typedAccount.alias, provider: "dnspod" };
+    return { client: new DnspodClient(accessKeyIdFromApiKey(typedAccount.api_key), apiSecret, requestLimits(db, "dnspod")), alias: typedAccount.alias, provider: "dnspod" };
   }
   if (typedAccount.provider === "alidns") {
-    return { client: new AlidnsClient(accessKeyIdFromApiKey(typedAccount.api_key), apiSecret), alias: typedAccount.alias, provider: "alidns" };
+    return { client: new AlidnsClient(accessKeyIdFromApiKey(typedAccount.api_key), apiSecret, requestLimits(db, "alidns")), alias: typedAccount.alias, provider: "alidns" };
   }
   if (typedAccount.provider === "huaweicloud") {
-    return { client: new HuaweiCloudClient(accessKeyIdFromApiKey(typedAccount.api_key), apiSecret), alias: typedAccount.alias, provider: "huaweicloud" };
+    return { client: new HuaweiCloudClient(accessKeyIdFromApiKey(typedAccount.api_key), apiSecret, undefined, requestLimits(db, "huaweicloud")), alias: typedAccount.alias, provider: "huaweicloud" };
   }
   if (typedAccount.provider === "vercel") {
-    return { client: new VercelClient(apiSecret), alias: typedAccount.alias, provider: "vercel" };
+    return { client: new VercelClient(apiSecret, undefined, requestLimits(db, "vercel")), alias: typedAccount.alias, provider: "vercel" };
   }
   if (typedAccount.provider === "custom") {
     return { client: new DNSHEClient("", ""), alias: typedAccount.alias, provider: "custom" };
   }
-  return { client: new DNSHEClient(typedAccount.api_key, apiSecret), alias: typedAccount.alias, provider: "dnshe" };
+  return { client: new DNSHEClient(typedAccount.api_key, apiSecret, undefined, dnsheLimits(db, typedAccount.api_key)), alias: typedAccount.alias, provider: "dnshe" };
 }

@@ -1,10 +1,11 @@
-import type { Dispatch, MutableRefObject, SetStateAction } from "react";
+import { useRef, type Dispatch, type MutableRefObject, type SetStateAction } from "react";
 import type { ApiFetch } from "../../../api/client";
 import type { Account } from "../../../types/account";
 import type { AvailableDomain, ScanCursor, ScanLog, ScanStatus, ScannerParams } from "../utils/scanner-types";
 import { createBatchPlan, type ScannerTask } from "../utils/scanner-batch-planner";
 import { primeScannerSkipPool } from "../utils/scanner-batch-pool";
 import { runScannerWorkers } from "../utils/scanner-batch-executor";
+import { scannerPauseReason, scannerAccountPauseReason } from "../utils/scanner-pause-reason";
 import { clearScanCursor as clearPersistedScanCursor, saveScanCursor as persistScanCursor } from "../utils/scanner-storage";
 
 type Toast = (kind: "success" | "error" | "info" | "warning", message: string) => void;
@@ -43,6 +44,8 @@ export function useScannerBatchScan({
   availableDomainsList, setAvailableDomainsList, setScanLogs,
   setScanCursor, scanCursorRef
 }: Options) {
+  const pendingRequests = useRef(new Set<AbortController>());
+  const cancelPending = () => { for (const controller of pendingRequests.current) controller.abort(); };
   const updateScanStatus = (status: ScanStatus) => {
     scanControlRef.current = status;
     setScanStatus(status);
@@ -78,6 +81,10 @@ export function useScannerBatchScan({
 
     if (selectedRoots.length === 0) {
       showToast("error", "请至少勾选一个根域名后缀！");
+      return;
+    }
+    if (dnsheAccounts.length === 0) {
+      showToast("error", "请先绑定 DNSHE 账号，当前服务不支持匿名查重");
       return;
     }
 
@@ -160,8 +167,8 @@ export function useScannerBatchScan({
       return;
     }
 
-    // 多账号并发查重：调度器只负责领取任务、暂停/恢复、查重池跳过和账号限频。
-    const RATE_LIMIT_MS = 1200;
+    // 每账号独立一路；后端跨实例凭据滚动窗口是最终保护。
+    const RATE_LIMIT_MS = 2100;
     const workerAccounts = dnsheAccounts.length > 0 ? dnsheAccounts : [null];
     const workerCount = workerAccounts.length;
 
@@ -169,35 +176,61 @@ export function useScannerBatchScan({
     setScanProgress({ total: totalTasks.length, checked: 0, available: availableDomainsList.length });
     showToast(
       "info",
-      `🚀 开始多账号并发查重！绑定 ${workerCount} 个 API 账号，${workerCount} 条流水线并行（每个 API 独立保障 1.2s 限频），查重吞吐提升约 ${workerCount} 倍！`
+      `🚀 开始查重：${workerCount} 个账号各自独立一路，每账号间隔至少 2.1 秒；后端保证同一 Key 滚动 60 秒最多 30 次（含后台及其他标签页），无固定总并发槽`
     );
 
     let checkedCount = 0;
+    let failedCount = 0;
+    let frontier = 0;
+    const persistProgress = () => {
+      const task = totalTasks[frontier];
+      scanCursorRef.current = { lastCandidate: task?.sub || "", taskIndex: frontier, checked: checkedCount };
+      if (task) saveScanCursor(task.sub, frontier, checkedCount);
+      return task?.sub || "";
+    };
 
     const processTask = async (
       task: ScannerTask,
       account: (typeof workerAccounts)[number],
-      nextTaskIndex: number,
     ) => {
       const accountQuery = account ? `&account_id=${account.id}` : "";
       const accAlias = account ? account.alias : "公共轮询";
       const nowTime = new Date().toLocaleTimeString();
+      const controller = new AbortController();
+      const cancelledResult = () => scanControlRef.current === "paused" || scanControlRef.current === "running"
+        ? "retry" as const : "failed" as const;
+      pendingRequests.current.add(controller);
       try {
-        const res = await apiFetch(`/api/whois?domain=${encodeURIComponent(task.queryFull)}${accountQuery}&batch=1`);
+        const res = await apiFetch(`/api/whois?domain=${encodeURIComponent(task.queryFull)}${accountQuery}&batch=1`, { signal: controller.signal });
         const data = await res.json();
+        if (controller.signal.aborted) return cancelledResult();
 
-        if (res.status === 429 || data.error_code === "rate_limited" || data.error_code === "quota_exceeded") {
-          saveScanCursor(task.sub, nextTaskIndex, checkedCount);
-          updateScanStatus("paused");
+        const accountPauseReason = scannerAccountPauseReason(res.status, data);
+        if (accountPauseReason) {
+          failedCount++;
+          persistProgress();
           setScanLogs(prev => [
-            { id: Date.now() + Math.random(), time: nowTime, text: `[${accAlias}] ⛔ 触发 API 限流/配额上限，已自动暂停（断点已保存至 ${task.sub}）`, status: "error" },
+            { id: Date.now() + Math.random(), time: nowTime, text: `[${accAlias}] ⛔ ${accountPauseReason}，本轮停用该账号，其他账号继续；未完成断点保留，不自动重试`, status: "error" },
             ...prev.slice(0, 49)
           ]);
-          showToast("warning", "⛔ 触发 API 限流，已自动暂停并保存断点，稍后可点击继续");
-          return;
+          showToast("warning", `[${accAlias}] 已暂停该账号，其他账号继续；未完成查询请稍后手动续查`);
+          return "account-paused" as const;
+        }
+        const pauseReason = scannerPauseReason(res.status, data);
+        if (pauseReason) {
+          const checkpoint = persistProgress();
+          const alreadyPaused = scanControlRef.current === "paused";
+          updateScanStatus("paused");
+          cancelPending();
+          setScanLogs(prev => [
+            { id: Date.now() + Math.random(), time: nowTime, text: `[${accAlias}] ⛔ ${pauseReason}，已自动暂停（断点已保存至 ${checkpoint}）`, status: "error" },
+            ...prev.slice(0, 49)
+          ]);
+          if (!alreadyPaused) showToast("warning", `⛔ ${pauseReason}，已暂停并保存断点`);
+          return "retry" as const;
         }
 
-        if (data.success && data.whois && data.whois.registered === false) {
+        if (res.ok && data.success && data.whois?.success !== false && data.whois && data.whois.registered === false) {
           setAvailableDomainsList(prev => [
             { fullDomain: task.full, subdomain: task.sub, rootdomain: task.root, time: nowTime },
             ...prev
@@ -208,21 +241,28 @@ export function useScannerBatchScan({
             { id: Date.now() + Math.random(), time: nowTime, text: `[${accAlias}] 校验域名 ${task.full} ➔ 🎉 尚未注册（可立即在线注册！）`, status: "available" },
             ...prev.slice(0, 49)
           ]);
-        } else {
+        } else if (res.ok && data.success && data.whois?.success !== false && data.whois?.registered === true) {
           checkedCount++;
           setScanProgress(p => ({ ...p, checked: checkedCount }));
           setScanLogs(prev => [
             { id: Date.now() + Math.random(), time: nowTime, text: `[${accAlias}] 校验域名 ${task.full} ➔ 已被他人注册`, status: "registered" },
             ...prev.slice(0, 49)
           ]);
+        } else {
+          throw new Error(data.message || "查询结果未知");
         }
       } catch (err) {
+        if (controller.signal.aborted) return cancelledResult();
+        failedCount++;
         checkedCount++;
         setScanProgress(p => ({ ...p, checked: checkedCount }));
         setScanLogs(prev => [
           { id: Date.now() + Math.random(), time: nowTime, text: `[${accAlias}] 校验域名 ${task.full} ➔ ⚠️ 查询请求异常，已跳过`, status: "error" },
           ...prev.slice(0, 49)
         ]);
+        return "failed" as const;
+      } finally {
+        pendingRequests.current.delete(controller);
       }
     };
 
@@ -237,9 +277,8 @@ export function useScannerBatchScan({
         }
       },
       shouldSkip: task => !ignorePool && skipSet.has(task.queryFull),
-      onTaskClaimed: (task, index) => {
-        scanCursorRef.current = { lastCandidate: task.sub, taskIndex: index, checked: checkedCount };
-      },
+      onTaskClaimed: () => {},
+      onProgress: index => { if (scanControlRef.current !== "idle") { frontier = index; persistProgress(); } },
       onSkipped: () => {
         checkedCount++;
         setScanProgress(p => ({ ...p, checked: checkedCount }));
@@ -249,7 +288,12 @@ export function useScannerBatchScan({
 
     if (scanControlRef.current === "running") {
       updateScanStatus("completed");
-      clearScanCursor(); // 正常跑完，断点光标不再需要
+      if (failedCount === 0) clearScanCursor();
+      else {
+        persistProgress();
+        showToast("warning", `扫描结束：${failedCount} 个查询失败或结果未知，未计为已注册；已保留最早失败断点供重试`);
+        return;
+      }
       showToast(
         "success",
         skippedCount > 0
@@ -279,6 +323,7 @@ export function useScannerBatchScan({
 
   const resetScan = () => {
     updateScanStatus("idle");
+    cancelPending();
     setAvailableDomainsList([]);
     setScanLogs([]);
     setScanProgress({ total: 0, checked: 0, available: 0 });
@@ -290,6 +335,7 @@ export function useScannerBatchScan({
     const c = scanCursorRef.current;
     saveScanCursor(c.lastCandidate, c.taskIndex, c.checked);
     updateScanStatus("paused");
+    cancelPending();
     showToast("info", `⏸️ 已暂停并保存断点（当前位置：${c.lastCandidate || "起点"}）`);
   };
 

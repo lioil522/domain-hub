@@ -13,7 +13,7 @@ export interface CronJob {
 /** Explicit job registry; new jobs can be added without changing the Worker entrypoint. */
 export const cronJobs: readonly CronJob[] = [
   {
-    id: "daily-sync",
+    id: "daily-sync", // compatibility ID; reminder/renewal only
     async run({ db }) {
       await runDailySyncAndRenewal(db);
     },

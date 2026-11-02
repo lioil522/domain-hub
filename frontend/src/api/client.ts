@@ -3,9 +3,11 @@
  *
  * 原实现是 App 组件体内的一个闭包，隐式依赖两个外部量：
  *   - backendUrl          用户在设置页保存的后端 Worker 地址（或构建期烘焙的 VITE_API_BASE_URL）
- *   - setSessionToken     会话失效（401/403）时把前端登录态清空
+   *   - setSessionToken     明确的面板鉴权错误时把前端登录态清空
  * 这里改为显式注入依赖的工厂函数，行为与原来逐行一致（含全部注释）。
  */
+
+import { operationNotification } from "../lib/operation-activity";
 
 /** 用户手动配置的后端地址在 localStorage 中的键 */
 export const BACKEND_URL_KEY = "DOMAIN_HUB_BACKEND_URL";
@@ -19,7 +21,7 @@ export const readSessionToken = (): string | null =>
 export interface ApiFetchDeps {
   /** 组件内已解析好的后端基准地址（含设置页覆盖值与构建期烘焙值） */
   backendUrl: string;
-  /** 会话失效（401/403 且非鉴权接口自身）时回调，用于清空前端登录态 */
+  /** 明确的会话失效（非鉴权接口自身）时回调，用于清空前端登录态 */
   onSessionExpired: () => void;
 }
 
@@ -62,12 +64,17 @@ export const createApiFetch = ({ backendUrl, onSessionExpired }: ApiFetchDeps): 
       headers.set("Authorization", `Bearer ${token}`);
     }
 
+    const notify = operationNotification(url, options.method ?? "GET", token);
+    notify?.("start");
     try {
       const res = await fetch(finalUrl, { ...options, headers });
       if (res.status === 401 || res.status === 403) {
-        // 会话失效：清理凭据并回到登录页（登录/初始化/状态接口自身除外，避免误清）
+        // Upstream permission errors must not log the user out. Read a clone, preserve caller body.
         const isAuthEndpoint = url.startsWith("/api/auth/login") || url.startsWith("/api/auth/setup") || url.startsWith("/api/auth/status");
-        if (!isAuthEndpoint) {
+        const body = await res.clone().json().catch(() => null) as { error_code?: string } | null;
+        const isSessionError = body?.error_code === "session_expired" || body?.error_code === "unauthorized" ||
+          (res.status === 403 && body?.error_code === "forbidden" && String(body && (body as { message?: string }).message || "").startsWith("认证失败："));
+        if (!isAuthEndpoint && isSessionError && readSessionToken() === token) {
           sessionStorage.removeItem(SESSION_KEY);
           localStorage.removeItem(SESSION_KEY);
           onSessionExpired();
@@ -78,6 +85,8 @@ export const createApiFetch = ({ backendUrl, onSessionExpired }: ApiFetchDeps): 
       // 遇网络连接异常自动提示配置后端服务
       console.error("API Fetch Error:", err);
       throw err;
+    } finally {
+      notify?.("end");
     }
   };
 };

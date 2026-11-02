@@ -7,6 +7,7 @@ import { LogRepository } from "../repositories/log-repository";
 import { BackupService } from "../services/backup-service";
 import { AuditRepository } from "../repositories/audit-repository";
 import { AuditService } from "../services/audit-service";
+import { bodyLimit } from "hono/body-limit";
 
 export interface BackupRouteDeps {
   loginMaxFailures: number;
@@ -17,6 +18,8 @@ export interface BackupRouteDeps {
 }
 
 export function registerBackupRoutes(app: Hono<AppEnv>, deps: BackupRouteDeps) {
+  const limitBody = bodyLimit({ maxSize: 8 * 1024 * 1024 + 8192,
+    onError: c => c.json(errorRes("备份请求过大，请使用数据库/AES成对备份", "bad_request"), 413) });
   const logs = (db: DatabaseManager) => new LogService(new LogRepository(db));
   const audit = (db: DatabaseManager) => new AuditService(new AuditRepository(db));
 
@@ -85,13 +88,13 @@ export function registerBackupRoutes(app: Hono<AppEnv>, deps: BackupRouteDeps) {
       await audit(dbManager).write({ actor: "session", action: "export", resourceType: "backup", result: "success", details: counts });
       return c.json(successRes(snapshot));
     } catch (e: unknown) {
-      const message = e instanceof Error ? e.message : "导出失败";
-      await logs(dbManager).write("error", "operation", `数据导出失败：${message}`);
+      const message = "导出失败：快照可能超过500行/8MiB或包含无效数据；请使用停写后的数据库/AES成对备份";
+      await logs(dbManager).write("error", "operation", message).catch(() => {});
       return c.json(errorRes(message), 500);
     }
   });
 
-  app.post("/api/data/import", async (c) => {
+  app.post("/api/data/import", limitBody, async (c) => {
     const dbManager = c.get("db");
     try {
       const body = await c.req.json().catch(() => null);
@@ -111,35 +114,41 @@ export function registerBackupRoutes(app: Hono<AppEnv>, deps: BackupRouteDeps) {
       if (!backup.validate(snapshot)) {
         return c.json(errorRes("备份文件格式无效或版本不受支持", "bad_request"), 400);
       }
-      const { imported } = await backup.restore(snapshot);
+      const sourceAesKey = (body as Record<string, unknown>).sourceAesKey;
+      if (sourceAesKey !== undefined && (typeof sourceAesKey !== "string" || !sourceAesKey || sourceAesKey.length > 4096)) return c.json(errorRes("源AES密钥参数无效", "bad_request"), 400);
+      const { imported, mappings } = await backup.restore(snapshot, sourceAesKey as string | undefined);
       const summary = Object.entries(imported)
         .filter(([, n]) => n > 0)
         .map(([t, n]) => `${t} ${n} 条`)
         .join(" / ");
-      await logs(dbManager).write("success", "operation", `已导入业务数据：${summary || "无数据"}`);
-      await audit(dbManager).write({ actor: "session", action: "restore", resourceType: "backup", result: "success", details: imported });
+      // The restore audit is already committed with the business transaction.
+      // A secondary UI log must not turn a confirmed commit into a failed reply.
+      await logs(dbManager).write("success", "operation", `已导入业务数据：${summary || "无数据"}`).catch(() => {});
       return c.json(successRes({
         imported,
-        message: `导入完成（合并模式，未删除任何现有数据）：${summary || "备份中无数据"}`,
+        mappings,
+        message: `导入完成（本地ID映射，已有冲突不覆盖，未删除现有数据）：${summary || "无新增数据"}`,
       }));
     } catch (e: unknown) {
-      const message = e instanceof Error ? e.message : "导入失败";
-      await logs(dbManager).write("error", "operation", `数据导入失败：${message}`);
-      await audit(dbManager).write({ actor: "session", action: "restore", resourceType: "backup", result: "failure", details: { message } });
+      // SQL drivers can include bound values in failures. Never reflect/log
+      // arbitrary storage errors from a credential-bearing import.
+      const message = "导入失败或结果未确认；可能存在密钥、身份、归属或预算冲突。请检查审计/目标数据，不自动重试";
+      await logs(dbManager).write("error", "operation", `数据导入失败：${message}`).catch(() => {});
+      await audit(dbManager).write({ actor: "session", action: "restore", resourceType: "backup", result: "failure", details: { message } }).catch(() => {});
       return c.json(errorRes(message), 400);
     }
   });
 
-  app.post("/api/data/preview", async (c) => {
+  app.post("/api/data/preview", limitBody, async (c) => {
     const dbManager = c.get("db");
     try {
       const body = await c.req.json().catch(() => ({}));
       const denied = await checkDataOpTotp(c, dbManager, String(body?.token || ""), false);
       if (denied) return denied;
-      const diff = await new BackupService(dbManager).preview(body?.snapshot);
+      const diff = await new BackupService(dbManager).preview(body?.snapshot, body?.sourceAesKey);
       return c.json(successRes({ diff }));
     } catch (e: unknown) {
-      return c.json(errorRes(e instanceof Error ? e.message : "备份预览失败"), 400);
+      return c.json(errorRes("备份预览失败：请核对文件、源AES密钥和目标身份/归属；预览未写入业务数据"), 400);
     }
   });
 }

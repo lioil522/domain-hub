@@ -1,6 +1,7 @@
 import type { LucideIcon } from "lucide-react";
 import type { ReactNode } from "react";
 import type { MultiProviderKey } from "../../../../types/provider";
+import type { WaitForAccountDomainSync } from "../../../../lib/sync-action";
 
 export interface BindFieldSpec {
   /** 该字段在表单值袋里的键（alias 之外） */
@@ -30,12 +31,7 @@ export type BindFooterKind = "duo" | "solo";
  */
 export interface BindSyncDeps {
   fetchAccounts: () => Promise<void> | void;
-  waitForAccountDomainSync: (
-    accountIds: number[],
-    label: string,
-    baseline?: Map<number, string>,
-    providerLookup?: (id: number) => string | undefined
-  ) => Promise<void>;
+  waitForAccountDomainSync: WaitForAccountDomainSync;
   fetchCfZones: (accountIdFilter?: string) => Promise<void> | void;
   fetchDpDomains: (accountIdFilter?: string) => Promise<void> | void;
   fetchMultiProviderDomains: (key: MultiProviderKey, accountIdFilter?: string) => Promise<void> | void;
@@ -50,6 +46,8 @@ export interface BindApiData extends Record<string, unknown> {
   success_count?: number;
   account?: { id?: number | string; alias?: string };
   account_ids?: Array<number | string>;
+  actionId?: string;
+  syncWarning?: string;
 }
 
 export interface BindSingleSpec {
@@ -62,7 +60,7 @@ export interface BindSingleSpec {
   /**
    * 成功分支（不含 toast / onClose / 清空表单 —— 那三步由编排层统一做）：
    * 刷新账号列表 + 等待域名落库后刷新对应 provider 列表。
-   * 返回 Promise 表示编排层需 await（DNSHE 返回 void，原实现即 fire-and-forget）。
+   * 返回 Promise 表示编排层需 await 同步任务的结果消费。
    */
   onSuccess: (data: BindApiData, v: Record<string, string>, deps: BindSyncDeps) => void | Promise<void>;
   errorFallback: string;

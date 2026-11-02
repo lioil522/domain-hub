@@ -11,7 +11,7 @@ export const ACTION_TYPES = [
 
 export type ActionType = (typeof ACTION_TYPES)[number];
 
-export const ACTION_STATUSES = ["queued", "running", "completed", "failed", "cancelled"] as const;
+export const ACTION_STATUSES = ["queued", "running", "completed", "partial", "failed", "cancelled"] as const;
 export type ActionStatus = (typeof ACTION_STATUSES)[number];
 
 export interface Action {

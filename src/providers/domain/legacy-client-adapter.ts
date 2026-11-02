@@ -9,6 +9,7 @@ import { VercelClient, mapVercelDomainToUpstream } from "../../vercel";
 import { getProviderDefinition } from "../registry";
 import type { AccountProvider } from "../../db";
 import type { DomainProviderAdapter, DomainOperationResult } from "./types";
+import { requireCompleteDnsRecords } from "../../services/dns-snapshot";
 
 export class LegacyDomainProviderAdapter implements DomainProviderAdapter {
   constructor(private readonly provider: AccountProvider, private readonly client: UpstreamClient) {}
@@ -54,8 +55,12 @@ export class LegacyDomainProviderAdapter implements DomainProviderAdapter {
 
   async listDnsRecords(domain: DBDomain): Promise<DomainOperationResult<{ records: unknown[] }>> {
     if (this.client instanceof DNSHEClient || this.client instanceof CloudflareClient || this.client instanceof DigitalPlatClient || this.client instanceof DnspodClient || this.client instanceof AlidnsClient || this.client instanceof HuaweiCloudClient || this.client instanceof VercelClient) {
-      const response = await this.client.listDnsRecords(domain.remote_id || domain.id);
-      return { success: Boolean(response?.success), message: response?.message, data: { records: response?.records || [] } };
+      const target = this.client instanceof DNSHEClient ? domain.id
+        : this.client instanceof DnspodClient ? domain.full_domain
+        : domain.remote_id || domain.full_domain;
+      const response = await this.client.listDnsRecords(target);
+      const records = requireCompleteDnsRecords(response);
+      return { success: true, message: response.message, data: { records } };
     }
     return { success: false, message: "该服务商不支持 DNS 查询", data: { records: [] } };
   }

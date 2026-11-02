@@ -5,6 +5,7 @@
 import type { VercelClient } from "../../vercel";
 import type { DnsRecordInput } from "../../types/dns";
 import { normalizeDnsRecordName } from "../../services/dns-operations";
+import { requireCompleteDnsRecords } from "../../services/dns-snapshot";
 import type { DnsProviderAdapter, DnsProviderContext } from "./types";
 
 export class VercelDnsAdapter implements DnsProviderAdapter {
@@ -12,7 +13,7 @@ export class VercelDnsAdapter implements DnsProviderAdapter {
     const vercelClient = client as VercelClient;
     const remoteId = String(domain.remote_id || domain.full_domain);
     const res = await vercelClient.listDnsRecords(remoteId);
-    return { success: Boolean(res?.success), records: res?.records || [], message: res?.message };
+    return { success: true, records: requireCompleteDnsRecords(res), message: res.message };
   }
 
   async createRecord({ domain, client }: DnsProviderContext, input: DnsRecordInput) {

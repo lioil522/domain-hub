@@ -24,7 +24,18 @@
     "check:architecture": "node architecture-check.mjs",
     "verify:worker": "tsc --noEmit -p tsconfig.json",
     "build:worker": "esbuild src/index.ts --bundle --platform=neutral --target=es2022 --format=esm --outfile=dist-worker/index.mjs",
-    "test:invariants": "npm run test:unit:state && npm run test:unit:search && npm run test:unit:provider && npm run test:unit:scanner && npm run test:unit:scanner-sequence && npm run test:unit:scanner-batch-planner && npm run test:unit:scanner-batch-executor && npm run test:unit:telegram-notification && npm run test:unit:backup && npm run test:integration:architecture && npm run test:unit:api-http",
+    "test:invariants": "npm run test:p1 && npm run test:safety && npm run test:workers && npm run test:dnshe-contract && npm run test:provider-contract && npm run test:provider-request && npm run test:provider-scheduler && npm run test:dnshe-account-scheduler && npm run test:frontend-safety && npm run test:unit:state && npm run test:unit:search && npm run test:unit:provider && npm run test:unit:scanner && npm run test:unit:scanner-sequence && npm run test:unit:scanner-batch-planner && npm run test:unit:scanner-batch-executor && npm run test:unit:telegram-notification && npm run test:unit:backup && npm run test:integration:architecture && npm run test:unit:api-http",
+    "test:workers": "node --test tests/workers/runtime.test.mjs tests/workers/provider-request.test.mjs tests/workers/p1.test.mjs",
+    "test:p1": "esbuild tests/unit/invocation-budget.test.ts tests/unit/sync-task.test.ts tests/unit/automation.test.ts --bundle --platform=node --target=node22 --format=esm --out-extension:.js=.mjs --outdir=dist-node/p1-tests && node --test dist-node/p1-tests/invocation-budget.test.mjs dist-node/p1-tests/sync-task.test.mjs dist-node/p1-tests/automation.test.mjs",
+    "test:frontend-safety": "esbuild tests/unit/frontend-safety.test.ts --bundle --alias:react=./frontend/node_modules/react --alias:react-dom=./frontend/node_modules/react-dom --platform=node --target=node22 --format=esm --outfile=dist-node/frontend-safety.test.mjs && node --test dist-node/frontend-safety.test.mjs",
+    "test:browser:lifecycle": "node tests/browser/run-sync-lifecycle.mjs",
+    "bench:sync": "esbuild tests/benchmarks/sync-scale.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/sync-scale.mjs && node dist-node/sync-scale.mjs",
+    "test:safety": "esbuild tests/integration/safety-regressions.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/safety-regressions.test.mjs && node --test dist-node/safety-regressions.test.mjs",
+    "test:dnshe-contract": "esbuild tests/unit/dnshe-contract.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/dnshe-contract.test.mjs && node --test dist-node/dnshe-contract.test.mjs",
+    "test:provider-contract": "esbuild tests/unit/provider-list-contract.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/provider-list-contract.test.mjs && node --test dist-node/provider-list-contract.test.mjs",
+    "test:provider-request": "esbuild tests/unit/provider-request.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/provider-request.test.mjs && node --test dist-node/provider-request.test.mjs",
+    "test:provider-scheduler": "esbuild tests/unit/provider-scheduler.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/provider-scheduler.test.mjs && node --test dist-node/provider-scheduler.test.mjs",
+    "test:dnshe-account-scheduler": "esbuild tests/unit/dnshe-account-scheduler.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/dnshe-account-scheduler.test.mjs && node --test dist-node/dnshe-account-scheduler.test.mjs",
     "test:unit:state": "esbuild tests/unit/dns-state-machine.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/dns-state-machine.test.mjs && node --test dist-node/dns-state-machine.test.mjs",
     "test:unit:search": "esbuild tests/unit/search-ranking.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/search-ranking.test.mjs && node --test dist-node/search-ranking.test.mjs",
     "test:unit:provider": "esbuild tests/unit/provider-registry.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/provider-registry.test.mjs && node --test dist-node/provider-registry.test.mjs",
@@ -42,14 +53,15 @@
     "node": ">=22.5.0"
   },
   "dependencies": {
-    "@hono/node-server": "^2.1.1",
-    "hono": "^4.1.0"
+    "@hono/node-server": "^2.1.6",
+    "hono": "^4.13.16"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20260828.1",
+    "@cloudflare/workers-types": "^5.20261102.1",
     "@types/node": "^26.2.0",
     "esbuild": "^0.28.2",
+    "miniflare": "5.20261102.0-beta",
     "typescript": "^5.4.3",
-    "wrangler": "^4.127.0"
+    "wrangler": "^4.156.2"
   }
 }

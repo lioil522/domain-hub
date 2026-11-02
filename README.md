@@ -6,6 +6,8 @@ Domain Hub 2.0 是一个 **Cloudflare Worker + React/Vite** 架构的域名管�
 
 当前代码库处于 **Phase 4 架构重构完成 / 持续硬化阶段**。本阶段重点不是增加大量业务功能，而是降低巨型文件耦合、建立明确的 Controller / ViewModel / Feature / API 边界，并用架构检查阻止重构成果回退。
 
+2026-11-03 授权依赖升级收尾：**根/frontend审计0漏洞，Node22/24各661项测试 + 13项浏览器验证通过**，详见[升级验收](docs/dependency-upgrade-acceptance.md)及[前批优化](docs/follow-up-all-acceptance.md)。DNSHE确认30/min、同账号多Key共享与到期前180天免费；跨Key账号归并尚未实现。其他服务商调查与云端部署暂缓，原服务未切换。
+
 ---
 
 ## 目录
@@ -16,6 +18,7 @@ Domain Hub 2.0 是一个 **Cloudflare Worker + React/Vite** 架构的域名管�
 - [前端架构](#前端架构)
 - [后端架构](#后端架构)
 - [Scanner 架构](#scanner-架构)
+- [Cron 与分片同步](#cron-与分片同步)
 - [主题系统](#主题系统)
 - [Phase 4 重构内容](#phase-4-重构内容)
 - [本地开发](#本地开发)
@@ -23,14 +26,14 @@ Domain Hub 2.0 是一个 **Cloudflare Worker + React/Vite** 架构的域名管�
 - [架构约束](#架构约束)
 - [生产构建与部署](#生产构建与部署)
   - [部署方式选择](#部署方式选择)
-  - [方案 A：Cloudflare Worker 手动部署](#方案-a-cloudflare-worker-手动部署)
-  - [方案 B：GitHub Actions 自动部署到 Cloudflare](#方案-b-github-actions-自动部署到-cloudflare)
+  - [方案 A：Cloudflare Worker 手动部署](#方案-acloudflare-worker-手动部署)
+  - [方案 B：GitHub Actions 审批发布到 Cloudflare](#方案-bgithub-actions-审批发布到-cloudflare)
   - [Cloudflare API Token 创建](#cloudflare-api-token-创建)
   - [Cloudflare Token 必要权限](#cloudflare-token-必要权限)
   - [GitHub Secrets 配置](#github-secrets-配置)
-  - [首次工作流部署](#首次工作流部署)
+  - [首次工作流部署](#github-actions-首次工作流部署)
   - [Cloudflare 部署验收](#cloudflare-部署验收)
-  - [方案 C：Docker / 自建部署](#方案-c-docker--自建部署)
+  - [方案 C：Docker / 自建部署](#方案-cdocker--自建部署)
   - [Docker Compose 使用 GHCR 镜像](#docker-compose-使用-ghcr-镜像)
   - [Docker 从源码构建](#docker-从源码构建)
   - [Docker GitHub Actions 自动构建](#docker-github-actions-自动构建)
@@ -38,8 +41,8 @@ Domain Hub 2.0 是一个 **Cloudflare Worker + React/Vite** 架构的域名管�
   - [Docker 数据、备份与升级](#docker-数据备份与升级)
   - [反向代理与 HTTPS](#反向代理与-https)
   - [发布与回滚](#发布与回滚)
-- [开发约定](#开发约定)
-- [后续工作](#后续工作)
+- [开发流程](#开发流程)
+- [当前阶段](#当前阶段)
 
 ---
 
@@ -82,6 +85,7 @@ Domain Hub 2.0 是一个 **Cloudflare Worker + React/Vite** 架构的域名管�
 - 日志
 - 配额
 - 数据备份
+- 版本1业务快照最多500行/8MiB；异密钥迁移先预览、再确认追加，本地ID映射、冲突不覆盖，见 [迁移与发布手册](docs/release-and-migration.md)
 - Telegram / Webhook 通知
 - 自动化任务与 Cron
 - 统一 API 请求及错误处理
@@ -118,6 +122,14 @@ Domain Hub 2.0 是一个 **Cloudflare Worker + React/Vite** 架构的域名管�
 Node.js >= 22.5.0
 npm
 ```
+
+## Cron 与分片同步
+
+Cron 现在只基于本地缓存提醒与执行有界 DNSHE 续期，不再刷新域名列表、DNS 或实时 RDAP。完整同步由有效登录后的可见页面或手动操作调用 `sync-step` 逐片完成，手动同步不续期。
+
+升级默认 `login_sync_enabled="false"`；续期窗口 `dnshe_renew_window_days="0"`，未明确配置时不发送新自动续期。未知已发送续期只 GET 核验，不盲目重复 POST。账号绑定/换凭据不再启动完整后台 Action。
+
+配置、兼容接口变化、分页上限和升级边界见 [Cron 与页面分片完整同步](docs/cron-sliced-sync.md)。本轮未部署、未重启原服务；离线门禁不代表 Cloudflare 免费版 CPU 或真实续期验收。
 
 ---
 
@@ -646,8 +658,8 @@ Domain Hub 2.0 当前提供三条正式部署路径：
 A. Cloudflare Worker 手动部署
    本地电脑 → Wrangler → Cloudflare Worker + D1
 
-B. GitHub Actions 自动部署
-   push main / 手动运行 Workflow → GitHub Actions → Cloudflare Worker + D1
+B. GitHub Actions 审批发布
+   手动选择 main 完整 SHA + production 审批 + 验证/审计 → Cloudflare Worker + D1
 
 C. Docker / 自建部署
    GHCR 镜像 或 本地 Docker Build → Docker Compose → Node + SQLite
@@ -662,6 +674,8 @@ C. Docker / 自建部署
 | Docker | Hono / Node | SQLite | Node 内置定时器 | Node 同端口静态托管 |
 
 > 推荐生产环境优先使用 **GitHub Actions → Cloudflare Worker**。它最适合持续发布，并且仓库已经提供 `.github/workflows/deploy.yml`。如果希望完全脱离 Cloudflare Worker，则使用 Docker。
+
+> 依赖已获授权升级并在独立副本完整复验，两树审计0漏洞；工作区已更新清单/锁文件，但原依赖目录和运行服务未切换。离线通过不是发布许可，云端staging/容量与部署暂缓；未提交、推送、部署或重启。见 [发布与回退手册](docs/release-and-migration.md)。
 
 ---
 
@@ -683,14 +697,16 @@ Node.js >= 22.5.0
 安装依赖：
 
 ```bash
-npm install
-npm --prefix frontend install
+npm ci
+npm --prefix frontend ci
 ```
 
 然后执行完整验证：
 
 ```bash
 npm run verify:all
+npm audit
+npm --prefix frontend audit
 ```
 
 生产部署前至少应该看到：
@@ -717,7 +733,7 @@ Theme / Contrast         PASS
 - Workers Static Assets
 - 全球边缘部署
 - 不维护服务器
-- GitHub push 后自动发布
+- GitHub 手动审批后发布（push 不触发生产部署）
 
 ### 选择 Docker，如果你需要
 
@@ -741,7 +757,7 @@ npx wrangler whoami
 
 `wrangler login` 适合本地交互开发；CI/CD 推荐使用 API Token，因为 Token 可以按账号、Worker、Zone 精细限制权限。Cloudflare 当前文档也将 API Token 定位为 CI/CD、脚本和自动化系统的推荐凭据。[Cloudflare Workers 授权与 API Token](https://developers.cloudflare.com/workers/authorization/)
 
-### A-2. 创建 D1
+### A-2. 新站创建 D1；升级必须复用明确的原 UUID
 
 ```bash
 npx wrangler d1 create domain-hub-db
@@ -763,7 +779,7 @@ database_name = "domain-hub-db"
 database_id = "你的 D1 database_id"
 ```
 
-### A-3. 初始化远程 D1
+### A-3. 新空站初始化远程 D1；已有库先验证增量 schema
 
 ```bash
 npx wrangler d1 execute domain-hub-db --remote --file=./schema.sql
@@ -771,9 +787,11 @@ npx wrangler d1 execute domain-hub-db --remote --file=./schema.sql
 
 生产数据库请明确使用 `--remote`，不要误把本地数据库当成线上库。
 
-### A-4. 配置加密密钥
+已有库先按[发布手册](docs/release-and-migration.md)备份并在独立 staging 验证增量变更；不能把新站初始化当作恢复或清库流程。
 
-推荐主动生成并保存：
+### A-4. 新空站单独配置加密密钥；升级不得生成新 Key
+
+下面只用于确认没有加密业务数据的新空站。已有站点必须恢复与数据库配对的原 AES，不得以“缺失”为由重新生成：
 
 ```bash
 node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
@@ -818,7 +836,7 @@ frontend/dist/assets/*
 ### A-6. 部署
 
 ```bash
-npm run deploy
+npx --no-install wrangler deploy --keep-vars
 ```
 
 当前 `wrangler.toml` 使用：
@@ -886,90 +904,19 @@ Worker: domain-hub
 
 | 类别 | 权限 | 范围 | 用途 |
 |---|---|---|---|
-| Account / Workers | Workers Scripts Edit（新权限模型可对应 Workers Editor） | `domain-hub` Worker 或账号 | `wrangler deploy`、Worker 代码更新、Secret 写入 |
-| Account / D1 | D1 Edit | 当前 Cloudflare Account | **仅当**让 Workflow 自动查找/创建 D1 时需要 |
-| Zone | Zone Read | 使用自定义域名的 Zone | Workflow 自动检测 Zone |
-| Zone | Workers Routes Read | 使用自定义域名的 Zone | Workflow 自动检测既有 Worker Route |
+| Account / Workers | Workers Scripts Edit（新权限模型可对应 Workers Editor） | `domain-hub` Worker 或账号 | 发布已有 Worker、读取 Secret 名称元信息，不轮换 Secret |
+| Account / D1 | D1 Read / Edit | 明确审批的数据库 | 仅独立数据库检查/初始化/迁移需要；发布工作流不创建或读写 D1 |
+| Zone | Workers Routes Write | 受影响的 Zone | 仅审批配置确需改变 Route/Custom Domain 时；无自动域名探测 |
 
 Cloudflare 当前文档规定：部署已经存在的 Worker 至少需要 Worker Editor；如果部署过程还需要变更 Route 或 Custom Domain，则还需要受影响 Zone 的 `Workers Routes Write`。绑定 D1 时，部署 Worker 本身不需要额外的 D1 权限；D1 权限主要用于直接读取/写入数据库或创建数据库。[Cloudflare Workers 权限模型](https://developers.cloudflare.com/workers/authorization/workers/)；[Cloudflare API Token 权限](https://developers.cloudflare.com/fundamentals/api/reference/permissions/)
 
-### 关于 D1：两种模式
+### 关于 D1：仅明确 UUID 绑定
 
-本仓库的 Workflow 支持两种方式。
-
-#### 模式 1：推荐的最小权限模式
-
-先手动创建 D1：
-
-```bash
-npx wrangler d1 create domain-hub-db
-```
-
-然后把 D1 ID 放进 GitHub Secret：
-
-```text
-CLOUDFLARE_D1_DATABASE_ID
-```
-
-这样 Workflow 会直接使用这个 ID，不需要调用“创建 D1”接口。
-
-这种模式下，CI Token 可以不授予 `D1 Edit`。
-
-#### 模式 2：一键创建 D1
-
-不配置：
-
-```text
-CLOUDFLARE_D1_DATABASE_ID
-```
-
-Workflow 会尝试：
-
-```text
-查询 domain-hub-db
-      ↓
-存在 → 使用现有数据库
-不存在 → 创建 domain-hub-db
-      ↓
-写回 wrangler.toml
-```
-
-此时 Token 必须有：
-
-```text
-Account → D1 Edit
-```
-
-Cloudflare 当前 API 权限表明确提供 `D1 Read` 和 `D1 Edit`，D1 通过 HTTP API 写入时也要求 D1 Edit。[Cloudflare API Token 权限](https://developers.cloudflare.com/fundamentals/api/reference/permissions/)；[Cloudflare D1 Release Notes](https://developers.cloudflare.com/d1/platform/release-notes/)
+`CLOUDFLARE_D1_DATABASE_ID` 必填，必须是已有数据库 UUID。缺失、格式错误、多个绑定或与已填配置不同立即停止；不查询名称猜库、不自动创建、不自动初始化 schema。新站初始化/已有库增量迁移必须单独授权，CI 发布可不授予 `D1 Edit`。
 
 ### 关于 Zone / Workers Routes 权限
 
-当前仓库的 Workflow 会自动尝试检测：
-
-```text
-Custom Domains
-Worker Routes
-workers.dev 子域
-```
-
-所以如果你希望“自动检测自定义域名并把访问 URL 写入 GitHub Actions Summary”，保留：
-
-```text
-Zone → Zone Read
-Zone → Workers Routes Read
-```
-
-即可。
-
-当前 Workflow **不会主动创建、修改或删除 Worker Route / Custom Domain**，因此仅为了当前自动检测逻辑，不需要 `Workers Routes Write`。
-
-如果以后修改 Workflow，让它自动创建/修改 Route 或 Custom Domain，再增加：
-
-```text
-Zone → Workers Routes Write
-```
-
-Cloudflare 当前官方文档对此权限要求有明确说明。[Cloudflare Workers 角色与权限](https://developers.cloudflare.com/workers/authorization/workers/)
+已移除自动探测及据此改写 `workers_dev` / `preview_urls` 的逻辑，避免查询失败被当成“未绑定”。Route/Custom Domain 和公开访问策略必须在审批配置中明确；Wrangler 会应用该配置，不能假设保留云端手工配置。摘要仅显示 `production` 的 `RELEASE_APP_URL`，不是自动发现或健康验收。若审批配置改变 Route，按官方规则准备对应 Zone 写权限。[Cloudflare Workers 角色与权限](https://developers.cloudflare.com/workers/authorization/workers/)
 
 ### 第一次创建 Worker 的权限
 
@@ -990,15 +937,9 @@ Workers & Pages
 
 创建后，CI Token 使用较小权限即可。
 
-#### 方案 B：允许首次 CI 创建 Worker
+#### 方案 B：独立新站引导
 
-临时使用：
-
-```text
-Workers → Admin
-```
-
-完成首次部署后立即更换为长期低权限 Token。
+在单独获批的新站初始化中创建 Worker/D1、设置并离线保管 AES、检查管理员初始化与 schema。生产发布工作流要求目标 Worker 已有 AES 元信息，不代办新站引导。已有站点不得按新站步骤覆盖。
 
 > 推荐方案 A。这样可以避免长期 CI Token 持有创建/删除所有 Worker 的权限。
 
@@ -1050,7 +991,7 @@ Invoke-RestMethod `
 
 ---
 
-## 方案 B：GitHub Actions 自动部署到 Cloudflare
+## 方案 B：GitHub Actions 审批发布到 Cloudflare
 
 仓库已经提供：
 
@@ -1058,46 +999,26 @@ Invoke-RestMethod `
 .github/workflows/deploy.yml
 ```
 
-它会在：
-
-```text
-push → main
-```
-
-或者：
+**仅手动运行，不监听 push**：
 
 ```text
 GitHub → Actions → Deploy to Cloudflare → Run workflow
 ```
 
-时执行。
+选择 `main`，填写已批准的完整40位 `approved_sha`；必须与运行 SHA 和 `production` 环境的 `RELEASE_APPROVED_SHA` 完全相等。仓库管理员须配置环境审批人、限制 main，建议禁止自行审批/绕过审批。
 
 ### Workflow 实际执行顺序
 
 ```text
-Checkout
-  ↓
-Node.js 22
-  ↓
-npm ci
-frontend npm ci
-  ↓
-D1 查询 / 创建 / 绑定
-  ↓
-检测 Custom Domain / Worker Routes
-  ↓
-frontend build
-  ↓
-wrangler deploy
-  ↓
-AES_KEY 检查 / 创建 / 同步
-  ↓
-可选 ADMIN_TOKEN / WEBHOOK_URL / ALLOWED_ORIGIN
-  ↓
-输出最终访问地址
+完整 verify + 两棵依赖树 npm audit（失败关闭，保留报告）
+  → production 人工审批 → 精确 SHA 复核
+  → Node 22 / npm ci → 明确已有 D1 UUID 绑定
+  → 发布前 AES_KEY 名称/类型元信息检查（不读 Key 值）
+  → 同源前端构建 → wrangler deploy --keep-vars
+  → 输出管理员配置的预期 URL → 独立健康/解密/容量验收
 ```
 
-也就是说，不能只把代码推到 GitHub 就认为部署完成；Cloudflare Token、Account ID 以及必要的 Secrets 必须先配置。
+流水线不生成/写回/轮换 AES，也不同步可选 Secret。不创建 D1、不初始化 schema、不探测域名改写访问策略。AES 名称存在仅证明元信息，**不能证明与数据库配对或解密成功**；这些须在独立 staging 和备份检查中确认。
 
 ---
 
@@ -1147,11 +1068,11 @@ Cloudflare Dashboard
 → Account ID
 ```
 
-### 强烈推荐
+### 必填数据库身份
 
 #### `CLOUDFLARE_D1_DATABASE_ID`
 
-推荐手动创建 D1 后填入：
+填入已审批的现有数据库 UUID：
 
 ```text
 xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
@@ -1159,37 +1080,15 @@ xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 
 这样 CI 不需要创建 D1，Token 可以进一步收权。
 
-### `AES_KEY`
+### Worker 已有 `AES_KEY`（不从 GitHub 同步）
 
-推荐主动配置。
+升级使用原 Worker Secret，并在受控存储保管与数据库配对的恢复材料。元信息检查失败就停止，不将查询失败当作缺失，也不自动补 Key。GitHub 里已有 `AES_KEY` 不会覆盖 Worker；真实跨密钥迁移见 [迁移手册](docs/release-and-migration.md)。
 
-生成：
+### production 环境变量与审批
 
-```bash
-node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
-```
-
-把输出保存为 GitHub Secret：
-
-```text
-AES_KEY
-```
-
-Workflow 的行为是：
-
-```text
-有 GitHub AES_KEY
-   ↓
-同步该值到 Worker
-
-没有 GitHub AES_KEY
-   ↓
-Worker 已存在 AES_KEY？
-   ├─ 是 → 保持原值
-   └─ 否 → 自动生成随机 AES_KEY
-```
-
-> 生产环境推荐你自己保存 `AES_KEY`，这样服务器、Cloudflare、备份系统之间的恢复关系更清晰。
+- `RELEASE_APPROVED_SHA`：审批过的完整40位 main SHA，变更后必须重新验收和审批。
+- `RELEASE_APP_URL`：可选的预期访问 URL，仅用于摘要；不要含 Token/密码。
+- Required reviewers / main 部署分支限制：必须由仓库管理员配置，YAML 的 `environment` 声明不会自动创建审批规则。
 
 ### 可选 Secret
 
@@ -1199,7 +1098,7 @@ Worker 已存在 AES_KEY？
 | `WEBHOOK_URL` | 全局 Webhook URL |
 | `ALLOWED_ORIGIN` | 前后端分离部署时的 CORS 白名单 |
 
-`ALLOWED_ORIGIN` 在当前同源部署中通常不需要。
+可选 Secret 在独立授权配置中管理，**当前工作流不自动同步**。`ALLOWED_ORIGIN` 在同源部署中通常不需要。
 
 ---
 
@@ -1211,7 +1110,6 @@ Worker 已存在 AES_KEY？
 CLOUDFLARE_API_TOKEN
 CLOUDFLARE_ACCOUNT_ID
 CLOUDFLARE_D1_DATABASE_ID
-AES_KEY
 ```
 
 这是最适合长期生产运行的组合：
@@ -1222,33 +1120,15 @@ CI Token 不需要 D1 Create
 AES_KEY 固定且可恢复
 ```
 
-### 一键创建 D1 组合
-
-```text
-CLOUDFLARE_API_TOKEN
-CLOUDFLARE_ACCOUNT_ID
-AES_KEY
-```
-
-同时给 Token：
-
-```text
-D1 Edit
-```
-
-Workflow 会自动查找或创建 `domain-hub-db`。
+没有“一键创建 D1”组合；不填 D1 UUID 就停止。另须有 Worker 原 AES 元信息、production 审批规则和精确批准 SHA。
 
 ---
 
 ## GitHub Actions 首次工作流部署
 
-### 第 1 步：创建 D1（推荐手动）
+### 第 1 步：独立完成新站引导或已有站点迁移验证
 
-```bash
-npx wrangler d1 create domain-hub-db
-```
-
-保存 database ID。
+新站自行获批创建 D1/Worker、初始化 schema、配置 AES；已有站点复用原库/原 AES并验证增量 schema。先做成对备份与 staging 验收，保存 UUID，不在流水线中猜测。
 
 ### 第 2 步：创建 Cloudflare API Token
 
@@ -1258,18 +1138,7 @@ npx wrangler d1 create domain-hub-db
 Workers Scripts Edit / Workers Editor
 ```
 
-如果不提前创建 D1，再增加：
-
-```text
-D1 Edit
-```
-
-如果需要自动检测自定义域名，再增加：
-
-```text
-Zone Read
-Workers Routes Read
-```
+不授权 CI 创建 D1；Route 变更权限只按审批配置给定。
 
 ### 第 3 步：把 Token 放进 GitHub Secret
 
@@ -1289,11 +1158,9 @@ CLOUDFLARE_ACCOUNT_ID
 CLOUDFLARE_D1_DATABASE_ID
 ```
 
-### 第 6 步：配置 AES_KEY
+### 第 6 步：核验原 AES 并配置 production 审批
 
-```text
-AES_KEY
-```
+Worker 已有 AES 与当前库配对；配置 Required reviewers/main 限制、`RELEASE_APPROVED_SHA` 和可选 `RELEASE_APP_URL`。依赖审计未通过不能上线。
 
 ### 第 7 步：执行 Workflow
 
@@ -1304,13 +1171,7 @@ GitHub
 → Run workflow
 ```
 
-或者：
-
-```bash
-git add .
-git commit -m "deploy: domain hub"
-git push origin main
-```
+填写完整 `approved_sha`，等待验证/安全检查和 production 审批。提交或 push 不触发生产发布；不要用 `git add .` 混入未知用户改动。
 
 ### 第 8 步：检查日志
 
@@ -1319,22 +1180,20 @@ git push origin main
 ```text
 Install Dependencies
         ↓
-Setup & Bind Cloudflare D1 Database
+Verify explicit release approval / Bind existing D1
         ↓
-Auto Detect Custom Domain
+Check existing AES secret metadata
         ↓
 Build Frontend
         ↓
 Deploy Worker
-        ↓
-Auto-Configure & Sync AES_KEY
         ↓
 Summarize Access URL
 ```
 
 ### 第 9 步：打开访问地址
 
-Workflow 最后会输出：
+Workflow 仅输出 `RELEASE_APP_URL` 配置的预期地址，例如：
 
 ```text
 ### 访问地址
@@ -1347,7 +1206,7 @@ https://你的域名
 https://domain-hub.<你的 workers.dev 子域>.workers.dev
 ```
 
-首次访问后，在登录页面创建管理员用户名和密码。
+已有站点必须保持原管理员/2FA/会话策略，不能重新初始化；只有独立引导的新空站创建管理员。部署成功仍须按下节及发布手册验收。
 
 ---
 
@@ -1512,7 +1371,7 @@ ghcr.io/lioil522/domain-hub:latest
 
 ### C-5. AES_KEY
 
-推荐生产环境主动配置：
+下面的生成步骤仅用于新空站。已有数据必须保留原配对 AES（环境变量或持久化 key 文件），不能生成新 Key 覆盖：
 
 ```dotenv
 AES_KEY=这里放64位十六进制随机字符串
@@ -1956,13 +1815,13 @@ CRON_UTC_HOUR=18
 CRON_UTC_MINUTE=0
 ```
 
-关闭自动同步/续期：
+关闭 Node 定时提醒/续期：
 
 ```dotenv
 DISABLE_CRON=1
 ```
 
-然后手动同步。
+该开关不控制登录后页面同步；页面自动推进另由 `login_sync_enabled` 控制（升级默认关闭），手动分片同步仍可使用。Cron 不再执行完整同步，详见 [配置说明](docs/cron-sliced-sync.md)。
 
 ---
 
@@ -2190,6 +2049,8 @@ docker compose up -d
 
 ### 回滚前不要删除数据卷
 
+回滚另需审批，并先在副本验证旧代码与新 schema/断点兼容；不能仅切 tag 就运行不理解新任务的旧 runner。具体止损、成对备份和恢复边界见[发布与回退手册](docs/release-and-migration.md)。
+
 代码版本可以回滚，但：
 
 ```text
@@ -2215,21 +2076,24 @@ docker compose up -d
 [ ] CLOUDFLARE_API_TOKEN 已加入 GitHub Secrets
 [ ] CLOUDFLARE_ACCOUNT_ID 已加入 GitHub Secrets
 [ ] CLOUDFLARE_D1_DATABASE_ID 已加入 GitHub Secrets
-[ ] AES_KEY 已加入 GitHub Secrets
+[ ] Worker 原 AES_KEY 已与最新库配对并安全备份（不从 GitHub 同步）
 [ ] ADMIN_TOKEN（可选）
 [ ] WEBHOOK_URL（可选）
 [ ] ALLOWED_ORIGIN（通常为空）
 [ ] npm run verify:all 本地通过
-[ ] Push main 或手动运行 Workflow
+[ ] 根/frontend npm audit 均通过（本轮独立副本双树0漏洞；发布时仍须重新审计）
+[ ] 独立 staging / 迁移 / 最新数据库+AES成对恢复验证通过
+[ ] production 审批人/main限制/RELEASE_APPROVED_SHA 已配置
+[ ] main 完整 approved_sha 手动运行 Workflow，并通过环境审批
 [ ] Workflow Build Frontend 通过
 [ ] Workflow Deploy Worker 通过
-[ ] AES_KEY Sync 通过
+[ ] 发布前 AES 元信息检查通过；不轮换 Key
 [ ] Actions Summary 出现访问地址
 [ ] 浏览器能打开首页
-[ ] 首次管理员初始化成功
+[ ] 新空站初始化成功；已有站点保留原管理员/2FA/凭据
 [ ] /api/auth/status 正常
 [ ] D1 表已存在
-[ ] Cron Trigger 正常
+[ ] Cron 配置经审批；不自动启用同步/续期，真实云端容量另验
 ```
 
 ---
@@ -2242,7 +2106,7 @@ docker compose up -d
 [ ] docker-compose.yml 已准备
 [ ] .env 已准备
 [ ] GHCR 为 Public，或服务器已 docker login ghcr.io
-[ ] AES_KEY 已准备或确认自动生成
+[ ] 新空站 AES 已保管；升级保留原库配对 AES，不重新生成
 [ ] /data 已持久化
 [ ] 端口仅本机暴露
 [ ] Nginx / Caddy HTTPS 已配置

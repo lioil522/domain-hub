@@ -11,6 +11,7 @@ dist
 # 运行期数据 —— 绝不能进镜像
 data
 .wrangler
+secret-backup
 
 # 仓库与工具目录
 .git

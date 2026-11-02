@@ -24,6 +24,7 @@ jobs:
       - run: npm run verify:all
         env:
           VITE_API_BASE_URL: /
+      - run: node --test scripts/backup-secret-envelope.test.mjs
       - run: npm run build:node
       - run: npm run build:selfhost
         working-directory: frontend

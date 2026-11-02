@@ -45,3 +45,6 @@ Thumbs.db
 .env.development.local
 .env.production.local
 *.log
+
+# Manual encrypted recovery workflow output (never source or build input)
+/secret-backup/

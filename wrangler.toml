@@ -1,7 +1,15 @@
-# NOTE: Domain-Hub 全新部署，前后端都在同一个 Worker 里，Worker 名直接叫 domain-hub。
+# 已有站点发布：保留原 Worker 和已核查的 Route；不转换成 Custom Domain。
 name = "domain-hub"
 main = "src/index.ts"
 compatibility_date = "2024-04-01"
+workers_dev = false
+preview_urls = false
+
+# 2026-11-03 已只读核查账号全部 7 个 Zone；原 Worker 仅使用这一条 Route。
+# 新站/其他目标须单独审查并替换，不能沿用本生产路由。
+[[routes]]
+pattern = "domain.licacv.com/*"
+zone_id = "61365e304fcd560431c460053e81e5f5"
 
 # 静态资源托管：前端产物与后端同源，同一个 Worker 发出，不再需要 Cloudflare Pages。
 #

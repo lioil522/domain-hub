@@ -1,6 +1,6 @@
 # 发布、迁移与回退手册
 
-更新：2026-11-03。此手册不授权任何真实写操作。依赖已获授权升级，两树审计0漏洞、Node22/24完整复验通过，见[升级验收](dependency-upgrade-acceptance.md)及[前批交付](follow-up-all-acceptance.md)。云端staging/容量/部署按用户要求暂缓；代码、离线测试与合成staging不等于生产可发布，原服务未切换。
+更新：2026-11-03。此手册不授权任何真实写操作。依赖已获授权升级，两树审计0漏洞、Node22/24完整复验通过，见[升级验收](dependency-upgrade-acceptance.md)及[前批交付](follow-up-all-acceptance.md)。后续已另获授权完成原云端D1/AES成对备份及独立云端staging部署；workers.dev仍返回1101，但用户接入的独立测试Custom Domain已完成合成数据小样本功能验收及实际CPU采样，见[当前云端验收状态](cloud-staging-status-20261103.md)。大历史容量与生产审批等前置条件仍未满足；代码、离线测试或部署成功不等于生产可发布，原服务未切换。
 
 ## 1. 业务 JSON 迁移
 
@@ -21,7 +21,7 @@
 1. 独立授权具体目标、变更、停写窗口和回退责任人；保存完整main SHA、代码/依赖锁/产物哈希。不得夹带未知用户改动。
 2. 在独立副本跑 `npm ci`（需另行允许安装）、`npm run verify:all`、Node构建、前端类型、独立13项浏览器和规模helper类型。根/frontend分别 `npm audit` 并保留JSON；任一审计失败停止，不用强制修复或降级门禁。
 3. 保存**最新数据库与原AES**恢复材料及其可用性验证，保留已有管理员/2FA/凭据/任务与用户新操作。运行服务期间不得复制单个SQLite主文件冒充一致备份；使用获批停写/备份流程并处理WAL。D1使用独立获批导出/恢复流程。
-4. 使用与生产完全隔离的staging Worker/D1或Node数据目录和测试凭据：验证增量schema/索引、原数据解密、JSON迁移预览/确认、ID冲突与审计回滚。**本轮只有本地workerd合成HTTP冒烟，不曾部署真实staging**。
+4. 使用与生产完全隔离的staging Worker/D1或Node数据目录和测试凭据：验证增量schema/索引、原数据解密、JSON迁移预览/确认、ID冲突与审计回滚。**原数据本机恢复、解密、增量迁移与审计回滚已通过；独立云端staging通过授权测试Custom Domain完成小样本功能验收。实际CPU样本不等于大历史容量通过，仍不能代填生产审批**。
 5. 升级schema为增量，不删表/任务/AES。首次建立历史索引本身可能扫描深历史；先在staging测迁移时间和成本，不因 `IF NOT EXISTS` 就认定无开销。
 6. 仓库管理员配置 `production` Required reviewers、main限制、建议禁止自行审批/绕过审批；填 `RELEASE_APPROVED_SHA`。YAML `environment: production` 不自动配置保护规则。
 7. 必填Cloudflare Token、Account ID、**已有D1 UUID**；原Worker必须已有 `AES_KEY` 的secret_text元信息。元信息不能证明配对，须另验解密。不查库名猜身份、不自动创建D1/初始化schema、不轮换AES/可选Secret。
@@ -29,7 +29,7 @@
 
 ## 3. 获批后发布与验收
 
-工作流只接受 `workflow_dispatch` 的main及完整 `approved_sha`；三处SHA必须相等，依赖verify/security成功后才进入production审批和发布。push不会生产部署，concurrency不取消在途发布。Wrangler pin已对齐4.156.2，本轮本地安全审计通过，但没有运行工作流或配置云端审批；发布时须刷新审计，**不要绕开门禁直接执行wrangler或Docker发布**。
+工作流只接受 `workflow_dispatch` 的main及完整 `approved_sha`；三处SHA必须相等，依赖verify/security成功后才进入production审批和发布。push不会生产部署，concurrency不取消在途发布。Wrangler pin已对齐4.156.2；此前生产工作流的verify/security成功，但因 `RELEASE_APPROVED_SHA` 缺失停在审批，未部署。补齐staging等前置条件后才可配置审批；发布时须刷新审计，**不要绕开门禁直接执行wrangler或Docker发布**。
 
 新空站的Worker/D1/schema/AES引导是独立流程；已有站点禁止“重新初始化”管理员或自动补一个新Key。生产前后端配套升级，Node须先停同库旧写入实例，不允许两个实例共享一库执行迁移。
 

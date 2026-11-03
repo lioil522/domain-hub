@@ -1,4 +1,3 @@
-import "../tests/helpers/block-outbound";
 import assert from "node:assert/strict";
 import {
   HuaweiCloudClient,
@@ -86,7 +85,7 @@ async function runTests() {
             }
           }
           if (typeQuery) list = list.filter((r) => r.type.toUpperCase() === typeQuery.toUpperCase());
-          return new Response(JSON.stringify({ recordsets: list, metadata: { total_count: list.length } }), {
+          return new Response(JSON.stringify({ recordsets: list }), {
             status: 200,
             headers: { "Content-Type": "application/json" },
           });

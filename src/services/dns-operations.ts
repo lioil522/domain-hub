@@ -8,7 +8,6 @@ import { HuaweiCloudClient } from "../huaweicloud";
 import { VercelClient } from "../vercel";
 import { computeDnsState } from "../dns-provider";
 import { toASCII } from "../punycode";
-import { requireCompleteDnsRecords } from "./dns-snapshot";
 
 export function resolveDnsRemoteId(client: UpstreamClient, domainInfo: DBDomain): string | number {
     if (client instanceof CloudflareClient) {
@@ -82,10 +81,10 @@ export async function syncDomainStatusAfterDnsChange(dbManager: DatabaseManager,
     try {
       const remoteId = resolveDnsRemoteId(client, domainInfo);
       const dnsRes = await client.listDnsRecords(remoteId);
-       const records = requireCompleteDnsRecords(dnsRes);
+      const records = (dnsRes && dnsRes.success && Array.isArray(dnsRes.records)) ? dnsRes.records : [];
 
       // 写操作回源后，将最新记录回填到缓存，后续读操作直接命中
-        await dbManager.replaceDnsRecordsCache(domainInfo.id, records);
+      await dbManager.setCache(`api_cache:dns:${domainInfo.id}`, JSON.stringify(records));
 
       if (client instanceof CloudflareClient) {
         // Cloudflare 托管的 zone：apex NS 记录必然指向 *.ns.cloudflare.com，computeDnsState

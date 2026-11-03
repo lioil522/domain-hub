@@ -6,7 +6,6 @@ import { LogService } from "../services/log-service";
 import { LogRepository } from "../repositories/log-repository";
 import { AuditService } from "../services/audit-service";
 import { AuditRepository } from "../repositories/audit-repository";
-import { AuthStorageError } from "../db/dao/auth-dao";
 
 export interface AuthRouteDeps {
   loginMaxFailures: number;
@@ -30,7 +29,7 @@ export function registerAuthRoutes(app: Hono<AppEnv>, deps: AuthRouteDeps) {
       const cfg = await db.getAuthConfig();
       return c.json(successRes({ initialized: cfg.initialized, two_fa_enabled: cfg.twoFaEnabled }));
     } catch (e: unknown) {
-      return c.json(errorRes("鉴权存储暂不可用，请稍后重试", "auth_storage_unavailable"), 503);
+      return c.json(errorRes(`读取鉴权状态失败: ${e instanceof Error ? e.message : "服务端内部错误"}`), 500);
     }
   });
 
@@ -44,16 +43,14 @@ export function registerAuthRoutes(app: Hono<AppEnv>, deps: AuthRouteDeps) {
       const password = String(body.password || "");
       if (!username || username.length < 3) return c.json(errorRes("用户名至少需要 3 个字符", "bad_request"), 400);
       if (password.length < 8) return c.json(errorRes("密码至少需要 8 个字符", "bad_request"), 400);
-      if (!(await db.initializePassword(username, password))) {
-        return c.json(errorRes("系统已完成初始化，无法再次通过此接口设置密码", "already_initialized"), 403);
-      }
+      await db.setPassword(username, password);
       await logs(db).write("success", "auth", `系统完成首次初始化，已创建管理员账户 [${username}]`);
       await audit(db).write({ actor: deps.capText(username), action: "setup", resourceType: "auth", result: "success" });
       const sessionToken = await db.createSession();
       return c.json(successRes({ session_token: sessionToken, message: "🎉 初始化成功！管理员账户已创建并自动登录" }));
     } catch (e: unknown) {
       console.error("Setup process error:", e);
-      return c.json(errorRes("初始化未完成，请检查鉴权状态或稍后重试", "auth_storage_unavailable"), 503);
+      return c.json(errorRes(`初始化失败: ${e instanceof Error ? e.message : "服务端内部错误"}`), 500);
     }
   });
 
@@ -110,7 +107,6 @@ export function registerAuthRoutes(app: Hono<AppEnv>, deps: AuthRouteDeps) {
       return c.json(successRes({ session_token: sessionToken, message: "🎉 登录成功" }));
     } catch (e: unknown) {
       console.error("Login process error:", e);
-      if (e instanceof AuthStorageError) return c.json(errorRes(e.message, "auth_storage_unavailable"), 503);
       return c.json(errorRes(`登录鉴权失败: ${e instanceof Error ? e.message : "服务端内部错误"}`), 500);
     }
   });

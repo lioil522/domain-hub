@@ -28,7 +28,7 @@ export const DP_SCHEMA: BindProviderSchema = {
     onSuccess: async (data, _v, deps) => {
       await deps.fetchAccounts();
       if (data.account?.id) {
-        await deps.waitForAccountDomainSync([Number(data.account.id)], "DigitalPlat 账号绑定成功", data.actionId, () => "digitalplat");
+        await deps.waitForAccountDomainSync([Number(data.account.id)], "DigitalPlat 账号绑定成功", undefined, () => "digitalplat");
       } else {
         await deps.fetchDpDomains();
       }
@@ -66,7 +66,7 @@ export const DP_SCHEMA: BindProviderSchema = {
     onSuccess: async (data, deps) => {
       await deps.fetchAccounts();
       if (Array.isArray(data.account_ids) && data.account_ids.length > 0) {
-        await deps.waitForAccountDomainSync(toAccountIds(data.account_ids), `${data.success_count} 个 DigitalPlat 账号绑定成功`, data.actionId, () => "digitalplat");
+        await deps.waitForAccountDomainSync(toAccountIds(data.account_ids), `${data.success_count} 个 DigitalPlat 账号绑定成功`, undefined, () => "digitalplat");
       } else {
         await deps.fetchDpDomains();
       }

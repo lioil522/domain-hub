@@ -17,10 +17,6 @@ import { successRes, errorRes } from "./response";
 import { UNDELETABLE_STATUS, translateDeleteError } from "../services/domain-operations";
 import { createDomainProviderAdapter } from "../providers/adapters";
 import { detectDnsProvider } from "../dns-provider";
-import { syncPlan } from "../services/sliced-sync-service";
-import { renewCachedDomain } from "../services/renewal-service";
-import { AppError } from "../errors";
-import type { SyncSummary } from "../services/sync-result";
 
 function accountService(db: DatabaseManager) { return new AccountService(new AccountRepository(db)); }
 function domainService(db: DatabaseManager) { return new DomainService(new DomainRepository(db)); }
@@ -28,7 +24,7 @@ function logService(db: DatabaseManager) { return new LogService(new LogReposito
 function auditService(db: DatabaseManager) { return new AuditService(new AuditRepository(db)); }
 
 export interface DomainRouteDeps {
-  resyncAccountsInBackground: (db: DatabaseManager, accountIds: number[], trigger?: "manual" | "auto") => Promise<SyncSummary>;
+  resyncAccountsInBackground: (db: DatabaseManager, accountIds: number[], trigger?: "manual" | "auto") => Promise<void>;
   fetchAllQuotas: (db: DatabaseManager) => Promise<{ accounts: Array<{ id: number; alias: string }>; quotas: unknown[] }>;
 }
 
@@ -163,7 +159,10 @@ export function registerDomainRoutes(app: Hono<AppEnv>, deps: DomainRouteDeps) {
   app.post("/api/domains/sync", async (c) => {
     const dbManager = c.get("db");
     try {
-      return c.json(successRes({ syncPlan: true, manual: true, ...await syncPlan(dbManager, { manual: true }), message: "完整同步由当前页面分片推进，不包含续期" }));
+      // 异步执行同步以防止 HTTP 响应超时 (Cloudflare Worker 允许在 waitUntil 里跑异步)
+      const webhookType = (c.env.WEBHOOK_TYPE || "custom") as WebhookType;
+      c.executionCtx.waitUntil(runDailySyncAndRenewal(dbManager, c.env.WEBHOOK_URL, webhookType));
+      return c.json(successRes({ message: "域名同步后台任务已启动，请稍后刷新查看最新数据" }));
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : "未知错误";
       return c.json(errorRes(message), 500);
@@ -186,9 +185,10 @@ export function registerDomainRoutes(app: Hono<AppEnv>, deps: DomainRouteDeps) {
     try {
       const { provider } = await dbManager.getClientForAccount(accountId);
       if (provider === "custom") {
-        return c.json(successRes({ skipped: true, message: "自定义分组无需同步（手动管理域名）" }));
+        return c.json(successRes({ message: "自定义分组无需同步（手动管理域名）" }));
       }
-      return c.json(successRes({ syncPlan: true, manual: true, account_ids: [accountId], ...await syncPlan(dbManager, { manual: true, accountIds: [accountId] }), message: "该账号由页面分片同步" }));
+      c.executionCtx.waitUntil(deps.resyncAccountsInBackground(dbManager, [accountId], "manual"));
+      return c.json(successRes({ message: "该账号的域名同步已在后台启动，请稍后刷新" }));
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : "未知错误";
       return c.json(errorRes(message), 500);
@@ -222,7 +222,7 @@ export function registerDomainRoutes(app: Hono<AppEnv>, deps: DomainRouteDeps) {
     const provider = String(c.req.param("provider") || "").trim().toLowerCase();
 
     if (provider === "custom") {
-      return c.json(successRes({ skipped: true, message: "自定义分组无需同步（手动管理域名）" }));
+      return c.json(successRes({ message: "自定义分组无需同步（手动管理域名）" }));
     }
     if (!(SYNCABLE_PROVIDERS as readonly string[]).includes(provider)) {
       return c.json(
@@ -232,8 +232,18 @@ export function registerDomainRoutes(app: Hono<AppEnv>, deps: DomainRouteDeps) {
     }
 
     try {
-      const plan = await syncPlan(dbManager, { manual: true, provider });
-      return c.json(successRes({ ...plan, syncPlan: true, manual: true, provider, skipped: !plan.plans.length, message: "服务商账号由页面逐片同步" }));
+      const accounts = await accountService(dbManager).list(provider as (typeof SYNCABLE_PROVIDERS)[number]);
+      if (accounts.length === 0) {
+        return c.json(successRes({ message: `没有绑定任何 ${provider} 账号，无需同步` }));
+      }
+      const ids = accounts.map((a) => a.id);
+      c.executionCtx.waitUntil(deps.resyncAccountsInBackground(dbManager, ids, "manual"));
+      return c.json(
+        successRes({
+          message: `${provider} 的 ${ids.length} 个账号同步已在后台启动，请稍后刷新`,
+          count: ids.length
+        })
+      );
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : "未知错误";
       return c.json(errorRes(message), 500);
@@ -248,13 +258,23 @@ export function registerDomainRoutes(app: Hono<AppEnv>, deps: DomainRouteDeps) {
       const domainInfo = await domainService(dbManager).get(domainId);
       if (!domainInfo) return c.json(errorRes("未在缓存中找到该域名的记录，请先同步数据", "not_found"), 404);
 
-      const result = await renewCachedDomain(dbManager, domainId);
-      let warning: string | undefined;
-      try { await auditService(dbManager).write({ actor: "session", action: "renew", resourceType: "domain", resourceId: String(domainId), provider: "dnshe", result: "success", details: result }); }
-      catch { warning = "续期已确认，审计未写入；请勿重复续期"; }
-      return c.json(successRes({ message: "续期成功", ...result, ...(warning ? { warning } : {}) }));
+      const { client, alias, provider } = await dbManager.getClientForAccount(domainInfo.account_id);
+      const adapter = createDomainProviderAdapter(provider, client);
+      const result = await adapter.renew(domainInfo);
+      if (!result.success) return c.json(errorRes(result.message || "续期失败", "not_supported"), 400);
+
+      const newExpiresAt = result.data?.newExpiresAt || "";
+      await domainService(dbManager).markRenewed(domainId, newExpiresAt);
+      await logService(dbManager).write("success", "api", `域名 [${domainInfo.full_domain}] (账户: ${alias}) 手动续期成功！新有效期至: ${newExpiresAt}`, result.data);
+      await auditService(dbManager).write({ actor: "session", action: "renew", resourceType: "domain", resourceId: String(domainId), provider, result: "success", details: result.data });
+      try {
+        const { accounts, quotas } = await deps.fetchAllQuotas(dbManager);
+        if (accounts.length > 0) await dbManager.setCache(QUOTA_CACHE_KEY, JSON.stringify(quotas));
+      } catch (e) {
+        console.error("续期后刷新配额缓存失败:", e);
+      }
+      return c.json(successRes({ message: "续期成功", new_expires_at: newExpiresAt }));
     } catch (e: unknown) {
-      if (e instanceof AppError) throw e;
       return c.json(errorRes(e instanceof Error ? e.message : "未知错误"), 400);
     }
   });
@@ -413,7 +433,6 @@ export function registerDomainRoutes(app: Hono<AppEnv>, deps: DomainRouteDeps) {
 
       const { client, alias, provider } = await dbManager.getClientForAccount(domainInfo.account_id);
       const adapter = createDomainProviderAdapter(provider, client);
-      await dbManager.executeRaw("UPDATE domains_cache SET updated_at=updated_at WHERE id=?", [domainId]);
       const result = await adapter.updateNameservers(domainInfo, nameservers);
       if (!result.success) return c.json(errorRes(result.message || "仅 DigitalPlat 域名支持在此修改 NS", "not_supported"), 400);
 

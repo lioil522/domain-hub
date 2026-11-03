@@ -25,9 +25,6 @@
 
 import type { ActionResponse, CreateDnsRecordResponse, DnsRecordInfo, ListDnsRecordsResponse } from "./dnshe";
 import type { UpstreamSubdomain } from "./db";
-import { ProviderApiError, incompleteResponse } from "./errors/provider-api-error";
-import { parseProviderJson, requestProviderText, type ProviderRequestLimits } from "./providers/provider-request";
-import { CompleteList, domainKey, hasText, isCount } from "./providers/list-integrity";
 import { zoneIdToNumericId } from "./cloudflare";
 
 /** DNSPod 服务端点（腾讯云 API 3.0 固定网关） */
@@ -304,7 +301,7 @@ export class DnspodClient {
   private secretKey: string;
   private baseUrl = `https://${DNSPOD_ENDPOINT}`;
 
-  constructor(secretId: string, secretKey: string, private readonly requestLimits: ProviderRequestLimits = {}) {
+  constructor(secretId: string, secretKey: string) {
     this.secretId = String(secretId || "").trim();
     this.secretKey = String(secretKey || "").trim();
   }
@@ -323,33 +320,42 @@ export class DnspodClient {
       timestamp
     );
 
-    const result = await requestProviderText("dnspod", `${this.baseUrl}/`, {
-      method: "POST",
-      headers: {
-        Authorization: authorization,
-        "Content-Type": "application/json; charset=utf-8",
-        Host: DNSPOD_ENDPOINT,
-        "X-TC-Action": action,
-        "X-TC-Version": DNSPOD_API_VERSION,
-        "X-TC-Timestamp": String(timestamp),
-        "X-TC-Region": DNSPOD_REGION,
-      },
-      body: payload,
-    }, this.requestLimits);
-    const { response, retryAfterMs } = result;
-    const data = parseProviderJson("dnspod", result) as TcResponse<T>;
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl}/`, {
+        method: "POST",
+        headers: {
+          Authorization: authorization,
+          "Content-Type": "application/json; charset=utf-8",
+          Host: DNSPOD_ENDPOINT,
+          "X-TC-Action": action,
+          "X-TC-Version": DNSPOD_API_VERSION,
+          "X-TC-Timestamp": String(timestamp),
+          "X-TC-Region": DNSPOD_REGION,
+        },
+        body: payload,
+      });
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : "网络请求失败";
+      throw new Error(`DNSPod API 请求失败：${message}`);
+    }
+
+    let data: TcResponse<T>;
+    try {
+      data = (await response.json()) as TcResponse<T>;
+    } catch {
+      throw new Error(`DNSPod API 响应异常 (HTTP ${response.status})`);
+    }
 
     const body = data?.Response;
-    if (!body || typeof body !== "object" || Array.isArray(body)) {
-      throw new ProviderApiError("dnspod", response.status, "invalid_response", `DNSPod API 响应格式异常 (HTTP ${response.status})`, undefined, retryAfterMs);
+    if (!body) {
+      throw new Error(`DNSPod API 响应格式异常 (HTTP ${response.status})`);
     }
     if (body.Error) {
-      throw new ProviderApiError("dnspod", response.status, body.Error.Code || "request_failed",
-        result.rateLimited ? "DNSPod API 请求过于频繁被限流，请稍后重试" : translateDnspodError(body.Error.Code, body.Error.Message),
-        undefined, retryAfterMs, result.rateLimited);
+      throw new Error(translateDnspodError(body.Error.Code, body.Error.Message));
     }
     if (!response.ok) {
-      throw new ProviderApiError("dnspod", response.status, "http_error", `DNSPod API 错误: HTTP ${response.status}`, undefined, retryAfterMs);
+      throw new Error(`DNSPod API 错误: HTTP ${response.status}`);
     }
     return body as T;
   }
@@ -361,31 +367,20 @@ export class DnspodClient {
    * 得对每个域名单独调 DescribeDomain（额外 N 次子请求）。面板的「当前 DNS 服务器」
    * 一栏在 DNSPod 标签页恒为 DNSPod 托管，故这里不额外拉 NS，省下配额。
    */
-  async listDomainsPage(offset = 0, expectedTotal?: number) {
-    const res = await this.request<{ DomainList?: DnspodDomainInfo[]; DomainCountInfo?: { AllTotal?: number } }>(
-      "DescribeDomainList", { Type: "ALL", Offset: offset, Limit: DNSPOD_PAGE_SIZE });
-    const list = new CompleteList<DnspodDomainInfo>("dnspod");
-    list.add(res.DomainList, d => hasText(d.Name) && domainKey(d.Name) && isCount(d.DomainId) && d.DomainId > 0
-      ? [`id:${d.DomainId}`, `name:${domainKey(d.Name)}`] : null, DNSPOD_PAGE_SIZE);
-    const total = pageTotal("dnspod", res.DomainCountInfo?.AllTotal, offset, list.items.length, expectedTotal);
-    return { items: list.items, total, next: offset + list.items.length === total ? null : offset + list.items.length };
-  }
-
   async listDomains(): Promise<DnspodDomainInfo[]> {
-    const domains = new CompleteList<DnspodDomainInfo>("dnspod");
+    const domains: DnspodDomainInfo[] = [];
     let offset = 0;
     for (let page = 0; page < DNSPOD_MAX_PAGES; page++) {
       const res = await this.request<{ DomainList?: DnspodDomainInfo[]; DomainCountInfo?: { AllTotal?: number } }>(
         "DescribeDomainList",
-        { Type: "ALL", Offset: offset, Limit: DNSPOD_PAGE_SIZE }
+        { Offset: offset, Limit: DNSPOD_PAGE_SIZE }
       );
-      domains.add(res?.DomainList, d =>
-        hasText(d.Name) && domainKey(d.Name) && isCount(d.DomainId) && d.DomainId > 0
-          ? [`id:${d.DomainId}`, `name:${domainKey(d.Name)}`] : null, DNSPOD_PAGE_SIZE);
-      if (domains.ended(res?.DomainCountInfo?.AllTotal)) return domains.items;
-      offset = domains.items.length;
+      const list = Array.isArray(res.DomainList) ? res.DomainList : [];
+      domains.push(...list.filter((d) => String(d.Name || "").trim() !== ""));
+      if (list.length < DNSPOD_PAGE_SIZE) break;
+      offset += DNSPOD_PAGE_SIZE;
     }
-    throw incompleteResponse("dnspod", "DNSPod 域名分页达到上限，旧缓存保持不变");
+    return domains;
   }
 
   /**
@@ -487,27 +482,20 @@ export class DnspodClient {
       throw new Error("DNSPod 解析记录列表需要域名作为参数");
     }
 
-    const records = new CompleteList<DnspodRecord>("dnspod");
+    const records: DnsRecordInfo[] = [];
     let offset = 0;
     for (let page = 0; page < DNSPOD_MAX_PAGES; page++) {
-      const res = await this.request<{ RecordList?: DnspodRecord[]; RecordCountInfo?: { TotalCount?: number; ListCount?: number } }>("DescribeRecordList", {
+      const res = await this.request<{ RecordList?: DnspodRecord[] }>("DescribeRecordList", {
         Domain: domainName,
         Offset: offset,
         Limit: DNSPOD_PAGE_SIZE,
       });
-      records.add(res?.RecordList, r =>
-        isCount(r.RecordId) && r.RecordId > 0 && hasText(r.Name) && hasText(r.Type) &&
-        typeof r.Value === "string" && isCount(r.TTL)
-          ? [`id:${r.RecordId}`] : null, DNSPOD_PAGE_SIZE);
-      if (!isCount(res?.RecordCountInfo?.ListCount) || res.RecordCountInfo.ListCount !== res.RecordList!.length) {
-        throw incompleteResponse("dnspod");
-      }
-      if (records.ended(res.RecordCountInfo.TotalCount)) {
-        return { success: true, complete: true, records: records.items.map(rec => mapDnspodRecord(rec, domainName)) };
-      }
-      offset = records.items.length;
+      const list = Array.isArray(res.RecordList) ? res.RecordList : [];
+      records.push(...list.map((rec) => mapDnspodRecord(rec, domainName)));
+      if (list.length < DNSPOD_PAGE_SIZE) break;
+      offset += DNSPOD_PAGE_SIZE;
     }
-    throw incompleteResponse("dnspod", "DNSPod DNS 分页达到上限，旧缓存保持不变");
+    return { success: true, records };
   }
 
   /**
@@ -669,4 +657,3 @@ export function translateDnspodError(code: string, message: string): string {
   const detail = m ? `${c || "未知错误"}: ${m}` : c || "未知错误";
   return `DNSPod API 错误: ${detail}`;
 }
-import { pageTotal } from "./providers/sync-page";

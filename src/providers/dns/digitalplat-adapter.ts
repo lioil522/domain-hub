@@ -5,7 +5,6 @@
 import type { DigitalPlatClient } from "../../digitalplat";
 import type { DnsRecordInput } from "../../types/dns";
 import { normalizeDnsRecordName } from "../../services/dns-operations";
-import { requireCompleteDnsRecords } from "../../services/dns-snapshot";
 import type { DnsProviderAdapter, DnsProviderContext } from "./types";
 
 export class DigitalPlatDnsAdapter implements DnsProviderAdapter {
@@ -13,7 +12,7 @@ export class DigitalPlatDnsAdapter implements DnsProviderAdapter {
     const dpClient = client as DigitalPlatClient;
     const remoteId = String(domain.remote_id || domain.full_domain);
     const res = await dpClient.listDnsRecords(remoteId);
-    return { success: true, records: requireCompleteDnsRecords(res), message: res.message };
+    return { success: Boolean(res?.success), records: res?.records || [], message: res?.message };
   }
 
   async createRecord({ domain, client }: DnsProviderContext, input: DnsRecordInput) {

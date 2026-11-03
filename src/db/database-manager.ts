@@ -17,7 +17,6 @@ import * as logDao from "./dao/log-dao";
 import * as authDao from "./dao/auth-dao";
 import * as accountDao from "./dao/account-dao";
 import * as domainDao from "./dao/domain-dao";
-import * as syncDao from "./dao/sync-dao";
 import * as customDao from "./dao/custom-dao";
 import * as backupDao from "./dao/backup-dao";
 import type {
@@ -31,10 +30,6 @@ import type {
   UpstreamSubdomain,
 } from "./types";
 import { NON_QUOTA_PROVIDERS } from "./types";
-import { databaseBudget } from "./budget-d1";
-import { SYNC_TASK_SCHEMA } from "./sync-task-schema";
-import { AUTOMATION_SCHEMA } from "./automation-schema";
-import { LEGACY_TABLE_SCHEMA } from "./legacy-schema";
 
 export class DatabaseManager {
   private db: D1Database;
@@ -45,10 +40,6 @@ export class DatabaseManager {
     this.aesKey = aesKey;
   }
 
-  get invocationBudget() { return databaseBudget(this.db); }
-  /** Internal DAO composition; retains the invocation's counted connection. */
-  get connection() { return this.db; }
-
   // ===== Schema 自举 =====
 
   /**
@@ -56,60 +47,149 @@ export class DatabaseManager {
    */
   async ensureTables(): Promise<boolean> {
     try {
-      // One read transaction: no business rows or persistent "ready" marker.
-      // Missing tables have empty PRAGMA results; their CREATE includes all columns.
-      const snapshots = await this.db.batch<{ name: string; type?: string }>([
-        this.db.prepare(`SELECT lower(name) AS name, type FROM sqlite_master WHERE lower(name) IN (${LEGACY_TABLE_SCHEMA.map(() => "?").join(",")})`)
-          .bind(...LEGACY_TABLE_SCHEMA.map(table => table.name)),
-        this.db.prepare("PRAGMA table_info(domains_cache)"),
-        this.db.prepare("PRAGMA table_info(accounts)"),
-        this.db.prepare("PRAGMA table_info(custom_domains)"),
+      await this.db.batch([
+        this.db.prepare(`
+          CREATE TABLE IF NOT EXISTS accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alias TEXT NOT NULL,
+            api_key TEXT NOT NULL UNIQUE,
+            api_secret TEXT NOT NULL,
+            provider TEXT NOT NULL DEFAULT 'dnshe',
+            website TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+          );
+        `),
+        this.db.prepare(`
+          CREATE TABLE IF NOT EXISTS domains_cache (
+            id INTEGER PRIMARY KEY,
+            account_id INTEGER NOT NULL,
+            subdomain TEXT NOT NULL,
+            rootdomain TEXT NOT NULL,
+            full_domain TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT,
+            expires_at TEXT NOT NULL,
+            last_renewed_at TEXT,
+            has_dns INTEGER DEFAULT 1,
+            dns_provider TEXT,
+            provider_account_id TEXT,
+            remote_id TEXT,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+          );
+        `),
+        this.db.prepare(`
+          CREATE TABLE IF NOT EXISTS logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT NOT NULL,
+            category TEXT NOT NULL,
+            message TEXT NOT NULL,
+            details TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+          );
+        `),
+        this.db.prepare(`
+          CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+          );
+        `),
+        this.db.prepare(`
+          CREATE TABLE IF NOT EXISTS cache (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            expires_at INTEGER NOT NULL
+          );
+        `),
+        this.db.prepare(`
+          CREATE TABLE IF NOT EXISTS domain_date_overrides (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER NOT NULL,
+            full_domain TEXT NOT NULL,
+            registered_at TEXT,
+            expires_at TEXT,
+            source TEXT,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (account_id, full_domain),
+            FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+          );
+        `),
+        this.db.prepare(`
+          CREATE TABLE IF NOT EXISTS custom_accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (group_id, name),
+            FOREIGN KEY (group_id) REFERENCES accounts(id) ON DELETE CASCADE
+          );
+        `),
+        this.db.prepare(`
+          CREATE TABLE IF NOT EXISTS custom_domains (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id INTEGER NOT NULL,
+            account_id INTEGER,
+            full_domain TEXT NOT NULL,
+            registered_at TEXT,
+            expires_at TEXT NOT NULL,
+            remark TEXT,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (group_id, account_id, full_domain),
+            FOREIGN KEY (group_id) REFERENCES accounts(id) ON DELETE CASCADE,
+            FOREIGN KEY (account_id) REFERENCES custom_accounts(id) ON DELETE CASCADE
+          );
+        `),
+        this.db.prepare(`
+          CREATE TABLE IF NOT EXISTS actions (
+            id TEXT PRIMARY KEY, type TEXT NOT NULL, status TEXT NOT NULL, progress INTEGER NOT NULL DEFAULT 0,
+            started_at TEXT, finished_at TEXT, error TEXT, metadata TEXT, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+          );
+        `),
+        this.db.prepare(`
+          CREATE TABLE IF NOT EXISTS audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, actor TEXT NOT NULL, action TEXT NOT NULL,
+            resource_type TEXT NOT NULL, resource_id TEXT, provider TEXT, result TEXT NOT NULL,
+            details TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+          );
+        `),
+        this.db.prepare(`
+          CREATE TABLE IF NOT EXISTS scanner_jobs (
+            id TEXT PRIMARY KEY, status TEXT NOT NULL, cursor TEXT NOT NULL, total_checked INTEGER NOT NULL DEFAULT 0,
+            available INTEGER NOT NULL DEFAULT 0, registered INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0,
+            started_at TEXT, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP, finished_at TEXT, error TEXT
+          );
+        `)
       ]);
-      if (snapshots.length !== 4 || snapshots.some(result => !result.success || !Array.isArray(result.results))) {
-        throw new Error("Schema inspection did not complete");
-      }
-      const tables = new Set<string>();
-      for (const row of snapshots[0].results) {
-        if (row.type !== "table" || !LEGACY_TABLE_SCHEMA.some(table => table.name === row.name)
-          || tables.has(row.name)) throw new Error("Invalid legacy schema object");
-        tables.add(row.name);
-      }
-      const columnNames = (table: string, index: number) => {
-        const names = snapshots[index].results.map(column => column.name);
-        if (names.some(name => typeof name !== "string" || !name) || new Set(names).size !== names.length
-          || tables.has(table) !== (names.length > 0)) throw new Error("Invalid schema column inspection");
-        return new Set(names.map(name => name.toLowerCase()));
-      };
-      const existingColumns = columnNames("domains_cache", 1);
-      const accountColumnNames = columnNames("accounts", 2);
-      const customDomainColumnNames = columnNames("custom_domains", 3);
 
       // 兼容已部署的旧数据库：仅在缺少字段时执行一次轻量迁移
-      const migrations: string[] = LEGACY_TABLE_SCHEMA.filter(table => !tables.has(table.name)).map(table => table.sql);
-      if (tables.has("domains_cache") && !existingColumns.has("dns_provider")) {
+      const domainColumns = await this.db.prepare("PRAGMA table_info(domains_cache)").all<{ name: string }>();
+      const existingColumns = new Set((domainColumns.results || []).map((column) => column.name));
+      const migrations: string[] = [];
+      if (!existingColumns.has("dns_provider")) {
         migrations.push("ALTER TABLE domains_cache ADD COLUMN dns_provider TEXT");
       }
-      if (tables.has("domains_cache") && !existingColumns.has("provider_account_id")) {
+      if (!existingColumns.has("provider_account_id")) {
         migrations.push("ALTER TABLE domains_cache ADD COLUMN provider_account_id TEXT");
       }
-      if (tables.has("domains_cache") && !existingColumns.has("remote_id")) {
+      if (!existingColumns.has("remote_id")) {
         migrations.push("ALTER TABLE domains_cache ADD COLUMN remote_id TEXT");
       }
-      if (tables.has("accounts") && !accountColumnNames.has("provider")) {
+      const accountColumns = await this.db.prepare("PRAGMA table_info(accounts)").all<{ name: string }>();
+      const accountColumnNames = new Set((accountColumns.results || []).map((column) => column.name));
+      if (!accountColumnNames.has("provider")) {
         migrations.push("ALTER TABLE accounts ADD COLUMN provider TEXT NOT NULL DEFAULT 'dnshe'");
       }
-      if (tables.has("accounts") && !accountColumnNames.has("website")) {
+      if (!accountColumnNames.has("website")) {
         migrations.push("ALTER TABLE accounts ADD COLUMN website TEXT");
       }
-      if (tables.has("custom_domains") && !customDomainColumnNames.has("registered_at")) {
+      const customDomainColumns = await this.db.prepare("PRAGMA table_info(custom_domains)").all<{ name: string }>();
+      const customDomainColumnNames = new Set((customDomainColumns.results || []).map((column) => column.name));
+      if (!customDomainColumnNames.has("registered_at")) {
         migrations.push("ALTER TABLE custom_domains ADD COLUMN registered_at TEXT");
       }
-      // Retain EVERY additive definition and clock initializer. All writes,
-      // including legacy ALTERs, now roll back together if any statement fails.
-      migrations.push(...SYNC_TASK_SCHEMA, ...AUTOMATION_SCHEMA);
-      const results = await this.db.batch(migrations.map(sql => this.db.prepare(sql)));
-      if (results.length !== migrations.length || results.some(result => !result.success || !Array.isArray(result.results))) {
-        throw new Error("Schema migration did not complete");
+      if (migrations.length > 0) {
+        await this.db.batch(migrations.map((sql) => this.db.prepare(sql)));
       }
       return true;
     } catch (e) {
@@ -130,8 +210,7 @@ export class DatabaseManager {
 
   async allRaw<T>(sql: string, bindings: unknown[] = []): Promise<T[]> {
     const result = await this.db.prepare(sql).bind(...bindings).all<T>();
-    if (!result.success || !Array.isArray(result.results)) throw new Error("数据库查询未完成");
-    return result.results;
+    return result.results || [];
   }
 
   // ===== 时间工具（保持兼容，内部委托） =====
@@ -240,12 +319,6 @@ export class DatabaseManager {
   async setPassword(username: string, password: string): Promise<void> {
     return authDao.setPassword(this.db, username, password);
   }
-  async getAuthoritativeAppSettings(): Promise<Record<string, string>> {
-    return settingsDao.getAllAppSettings(this.db, this.aesKey, true);
-  }
-  async initializePassword(username: string, password: string): Promise<boolean> {
-    return authDao.initializePassword(this.db, username, password);
-  }
   async verifyPassword(password: string): Promise<boolean> {
     return authDao.verifyPassword(this.db, this.aesKey, password);
   }
@@ -287,8 +360,8 @@ export class DatabaseManager {
   ): Promise<void> {
     return logDao.writeLog(this.db, type, category, message, details);
   }
-  async getLogs(limit = 100, categories?: string[], afterId?: number): Promise<DBLog[]> {
-    return logDao.getLogs(this.db, limit, categories, afterId);
+  async getLogs(limit = 100, categories?: string[]): Promise<DBLog[]> {
+    return logDao.getLogs(this.db, limit, categories);
   }
   async clearLogs(): Promise<void> {
     return logDao.clearLogs(this.db);
@@ -319,25 +392,6 @@ export class DatabaseManager {
   }
 
   // ===== Domain DAO 委托 =====
-
-  /** Complete records and invalidation marker commit together; never clear dirty on a failed write. */
-  async replaceDnsRecordsCache(domainId: number, records: unknown[]): Promise<void> {
-    await this.db.batch([
-      this.db.prepare(`INSERT INTO cache(key,value,expires_at) VALUES(?,?,?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value, expires_at = excluded.expires_at`)
-        .bind(`api_cache:dns:${domainId}`, JSON.stringify(records), Math.floor(Date.now() / 1000) + 366 * 24 * 3600),
-      this.db.prepare("DELETE FROM cache WHERE key = ?").bind(`dns_dirty:${domainId}`),
-      this.db.prepare("UPDATE domains_cache SET updated_at=updated_at WHERE id=?").bind(domainId),
-    ]);
-  }
-
-  async acquireSyncLease(key: string, token: string): Promise<boolean> {
-    return syncDao.acquireSyncLease(this.db, key, token);
-  }
-  async commitSyncPage(accountId: number, domains: UpstreamSubdomain[], leaseKey: string, token: string,
-    cursorKey: string, value: string, ttl: number, deletions: syncDao.SyncCandidate[] = []): Promise<void> {
-    return syncDao.commitSyncPage(this.db, accountId, domains, leaseKey, token, cursorKey, value, ttl, deletions);
-  }
 
   async getDomains(search = "", status = "", accountId?: number, provider?: AccountProvider): Promise<DBDomain[]> {
     return domainDao.getDomains(this.db, search, status, accountId, provider);
@@ -408,7 +462,7 @@ export class DatabaseManager {
   async exportAllData() {
     return backupDao.exportAllData(this.db);
   }
-  async importAllData(snapshot: unknown, sourceAesKey?: string, dryRun = false) {
-    return backupDao.importAllData(this.db, snapshot, this.aesKey, sourceAesKey, dryRun);
+  async importAllData(snapshot: { version?: number; data?: Record<string, unknown[]> }) {
+    return backupDao.importAllData(this.db, snapshot);
   }
 }

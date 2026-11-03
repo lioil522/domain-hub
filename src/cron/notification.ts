@@ -5,9 +5,6 @@
  * 刻意不抛异常 —— 作为定时任务收尾步骤，推送失败不应中断主流程。
  */
 
-import type { InvocationCounter } from "../services/invocation-budget";
-import { invocationFetch } from "../services/invocation-fetch";
-
 export type WebhookType = "dingtalk" | "feishu" | "wecom" | "serverchan" | "custom";
 
 export interface WebhookSendResult {
@@ -34,8 +31,7 @@ export function normalizeServerChanEndpoint(input: string): string {
 export async function sendWebhookNotification(
   webhookUrl: string,
   message: string,
-  webhookType: WebhookType = "custom",
-  budget?: InvocationCounter
+  webhookType: WebhookType = "custom"
 ): Promise<WebhookSendResult> {
   if (!webhookUrl) return { ok: false, detail: "未配置 Webhook 地址" };
   const endpoint = webhookType === "serverchan" ? normalizeServerChanEndpoint(webhookUrl) : webhookUrl;
@@ -64,11 +60,11 @@ export async function sendWebhookNotification(
         break;
     }
 
-    const res = await invocationFetch(endpoint, {
+    const res = await fetch(endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
-    }, budget);
+    });
 
     const bodyText = (await res.text().catch(() => "")).slice(0, 500);
 
@@ -102,14 +98,13 @@ export async function sendWebhookNotification(
 export async function sendTelegramNotification(
   botToken: string,
   chatId: string,
-  message: string,
-  budget?: InvocationCounter
+  message: string
 ): Promise<WebhookSendResult> {
   if (!botToken || !chatId) return { ok: false, detail: "未配置 Telegram Bot Token 或 Chat ID" };
 
   try {
     const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
-    const res = await invocationFetch(url, {
+    const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -117,7 +112,7 @@ export async function sendTelegramNotification(
         text: message,
         disable_web_page_preview: true,
       }),
-    }, budget);
+    });
 
     const bodyText = (await res.text().catch(() => "")).slice(0, 500);
 

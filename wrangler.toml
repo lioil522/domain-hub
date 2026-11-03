@@ -1,13 +1,7 @@
-# 通用 fork 模板：原版工作流可在自己的账号自动处理 Worker、D1 和 AES_KEY。
-# 已有站点升级请保留自己的 Worker 名称、路由与访问策略，不直接覆盖配置。
+# NOTE: Domain-Hub 全新部署，前后端都在同一个 Worker 里，Worker 名直接叫 domain-hub。
 name = "domain-hub"
 main = "src/index.ts"
 compatibility_date = "2024-04-01"
-workers_dev = true
-preview_urls = false
-
-# 默认通过自己的 workers.dev 地址访问，不包含上游仓库的域名或 Zone。
-# 若使用自己的 Route/Custom Domain，请自行配置并准备相应 Zone 权限。
 
 # 静态资源托管：前端产物与后端同源，同一个 Worker 发出，不再需要 Cloudflare Pages。
 #

@@ -19,7 +19,6 @@
  *      （即「存进去的」与「读出来重建客户端用的」一致）—— 这条是本 bug 的直接回归
  *   4. 双凭据型不允许把哈希写进 api_key（用真实 AK 前缀 `provider:` 而非哈希前缀）
  */
-import "../tests/helpers/block-outbound";
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 

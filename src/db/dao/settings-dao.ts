@@ -23,14 +23,13 @@ export async function getSetting(db: D1Database, key: string): Promise<string | 
 /**
  * 写入 settings 表（upsert 语义）
  */
-export async function setSetting(db: D1Database, key: string, value: string, strict = false): Promise<void> {
+export async function setSetting(db: D1Database, key: string, value: string): Promise<void> {
   try {
     const now = getBeijingNow();
     await db.prepare(
       "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
     ).bind(key, value, now).run();
   } catch (e) {
-    if (strict) throw e;
     console.error("setSetting error:", e);
   }
 }
@@ -48,14 +47,12 @@ export async function deleteSetting(db: D1Database, key: string): Promise<void> 
  * NOTE: 敏感字段（如 Telegram Token）以 AES 加密形式存储，此处返回解密后的原文，
  * 由上层接口决定是否打码后再下发前端。
  */
-export async function getAllAppSettings(db: D1Database, aesKey?: string, strict = false): Promise<Record<string, string>> {
+export async function getAllAppSettings(db: D1Database, aesKey?: string): Promise<Record<string, string>> {
   const out: Record<string, string> = {};
   try {
-    const result = await db.prepare(
+    const { results } = await db.prepare(
       "SELECT key, value FROM settings WHERE key LIKE 'cfg_%'"
     ).all<{ key: string; value: string }>();
-    if (!result.success || !Array.isArray(result.results)) throw new Error("数据库设置读取失败");
-    const { results } = result;
     for (const row of results || []) {
       const shortKey = row.key.replace(/^cfg_/, "");
       let val = row.value;
@@ -70,7 +67,6 @@ export async function getAllAppSettings(db: D1Database, aesKey?: string, strict 
       out[shortKey] = val;
     }
   } catch (e) {
-    if (strict) throw e;
     console.error("getAllAppSettings error:", e);
   }
   return out;
@@ -88,5 +84,5 @@ export async function setAppSetting(db: D1Database, aesKey: string | undefined, 
       console.error("setAppSetting encrypt error:", e);
     }
   }
-  await setSetting(db, `cfg_${shortKey}`, stored, true);
+  await setSetting(db, `cfg_${shortKey}`, stored);
 }

@@ -3,8 +3,7 @@
  */
 
 import type { UpstreamSubdomain, UpstreamClient, AccountProvider } from "../../db";
-import type { SubdomainInfo, OffsetPagination } from "../../dnshe";
-import { incompleteResponse } from "../../errors/provider-api-error";
+import type { SubdomainInfo } from "../../dnshe";
 import { DnspodClient, mapDnspodDomainToUpstream } from "../../dnspod";
 import { AlidnsClient, mapAlidnsDomainToUpstream } from "../../alidns";
 import { HuaweiCloudClient, mapHuaweiZoneToUpstream } from "../../huaweicloud";
@@ -46,7 +45,6 @@ export interface SubdomainClient {
     subdomains?: SubdomainInfo[];
     total?: number;
     message?: string;
-    pagination?: OffsetPagination;
   }>;
 }
 
@@ -57,33 +55,29 @@ export async function fetchAllSubdomainsFromClient(client: SubdomainClient): Pro
   const allSubdomains: SubdomainInfo[] = [];
   const perPage = 500;
   let page = 1;
-  const ids = new Set<number>();
+  let hasMore = true;
 
-  for (let guard = 0; guard < 50; guard++) {
+  while (hasMore) {
     const res = await client.listSubdomains(page, perPage);
     if (!res || !res.success || !Array.isArray(res.subdomains)) {
       throw new Error(res?.message || "响应数据格式错误");
     }
 
-    for (const sub of res.subdomains) {
-      if (!Number.isSafeInteger(sub.id) || !sub.full_domain || ids.has(sub.id)) throw incompleteResponse("dnshe");
-      ids.add(sub.id);
-      allSubdomains.push(sub);
+    allSubdomains.push(...res.subdomains);
+
+    if (res.subdomains.length < perPage) {
+      hasMore = false;
+    } else if (res.total !== undefined && allSubdomains.length >= res.total) {
+      hasMore = false;
+    } else {
+      page++;
     }
-    const p = res.pagination;
-    if (p && (typeof p.has_more !== "boolean" || (p.page !== undefined && p.page !== page))) throw incompleteResponse("dnshe");
-    const total = p?.total ?? res.total;
-    if ((total !== undefined && (!Number.isSafeInteger(total) || total < 0)) ||
-      (p?.total !== undefined && res.total !== undefined && p.total !== res.total)) throw incompleteResponse("dnshe");
-    const finished = p ? !p.has_more : total !== undefined ? allSubdomains.length >= total : res.subdomains.length < perPage;
-    if (finished) {
-      if (total !== undefined && allSubdomains.length !== total) throw incompleteResponse("dnshe");
-      return allSubdomains;
+
+    if (page > 50) {
+      console.error("Pagination safety limit reached (50 pages), stopping.");
+      break;
     }
-    const next = p?.next_page ?? page + 1;
-    if (!res.subdomains.length || !Number.isSafeInteger(next) || next !== page + 1) throw incompleteResponse("dnshe");
-    page = next;
   }
 
-  throw incompleteResponse("dnshe", "DNSHE 域名分页达到安全上限，同步未执行删除");
+  return allSubdomains;
 }

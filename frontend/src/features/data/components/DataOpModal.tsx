@@ -20,9 +20,6 @@ export interface DataOpModalProps {
   onTokenChange: (v: string) => void;
   /** 已选备份文件：`name` 用于回显，非空即代表「已选」 */
   importSnapshot: { name: string } | null;
-  sourceAesKey: string;
-  onSourceAesKeyChange: (value: string) => void;
-  importPreview: { totalAdd: number } | null;
   onPickFile: (file: File | null) => void;
   /** 账户是否已开启 2FA —— 未开启时导出按钮置灰并给出警示条 */
   twoFaEnabled: boolean;
@@ -52,7 +49,6 @@ export const DataOpModal = ({
   token,
   onTokenChange,
   importSnapshot,
-  sourceAesKey, onSourceAesKeyChange, importPreview,
   onPickFile,
   twoFaEnabled,
   busy,
@@ -73,7 +69,7 @@ export const DataOpModal = ({
               <span className="truncate">{mode === "export" ? "导出数据" : "导入数据"}</span>
             </h3>
             <p className="text-xs text-content-muted mt-0.5">
-              {mode === "export" ? "业务快照最多500行/8MiB" : "先预览，再确认追加；不覆盖、不删除"}
+              {mode === "export" ? "全量业务数据 JSON 快照" : "合并模式，不会删除现有数据"}
             </p>
           </div>
           <button
@@ -92,7 +88,6 @@ export const DataOpModal = ({
               <input id="app-fld7"
                 type="file"
                 accept="application/json,.json"
-                disabled={busy}
                 onChange={(e) => { onPickFile(e.target.files?.[0] || null); }}
                 className="w-full text-xs text-content-muted file:mr-3 file:px-3 file:py-1.5 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-elevated file:text-content-secondary hover:file:bg-hovered cursor-pointer"
               />
@@ -103,15 +98,8 @@ export const DataOpModal = ({
                 </div>
               )}
               <p className="text-[11px] text-content-muted leading-relaxed">
-                最多500行/8MiB。本地ID映射，服务商域名ID保留；已有身份或数据冲突整批停止。更大迁移请使用停写后的数据库/AES成对备份。
+                同 ID 的行会被备份中的值<b>覆盖</b>，新 ID 追加，现有数据不受影响。
               </p>
-              <label htmlFor="app-source-aes" className="text-xs text-content-muted font-medium block">源 AES 密钥（仅异密钥迁移时填写）</label>
-              <input id="app-source-aes" type="password" autoComplete="off" maxLength={4096} disabled={busy}
-                value={sourceAesKey} onChange={e => onSourceAesKeyChange(e.target.value)}
-                className="w-full bg-elevated border border-border-base rounded-lg px-3 py-2 text-sm text-content-primary"
-                placeholder="留空使用目标密钥；不保存密钥" />
-              <p className="text-[11px] text-content-muted">仅通过 HTTPS 或本机连接提交；关闭/成功后清空，不写入备份或浏览器存储。</p>
-              {importPreview && <p role="status" className="text-xs text-content-primary">凭据与归属预览通过：新增 {importPreview.totalAdd} 行，覆盖/删除 0 行。预览不锁定数据库，确认时会重新检查。</p>}
             </div>
           )}
 
@@ -127,9 +115,8 @@ export const DataOpModal = ({
                 inputMode="numeric"
                 maxLength={6}
                 value={token}
-                disabled={busy}
                 onChange={(e) => onTokenChange(e.target.value.replace(/\D/g, ""))}
-                onKeyDown={(e) => { if (e.key === "Enter" && !busy && (mode === "export" || !importPreview)) mode === "export" ? onExport() : onImport(); }}
+                onKeyDown={(e) => { if (e.key === "Enter") mode === "export" ? onExport() : onImport(); }}
                 placeholder="身份验证器上的 6 位动态码"
                 className="w-full bg-elevated border border-border-base rounded-lg px-3 py-2 text-sm font-mono tracking-widest text-center text-content-primary focus:outline-none focus:border-accent placeholder:text-content-muted placeholder:tracking-normal"
               />
@@ -177,7 +164,7 @@ export const DataOpModal = ({
             ) : (
               <Upload className="w-4 h-4" />
             )}
-            {mode === "export" ? "验证并导出" : importPreview ? "确认追加导入" : "只读预览"}
+            {mode === "export" ? "验证并导出" : "验证并导入"}
           </button>
         </div>
       </div>

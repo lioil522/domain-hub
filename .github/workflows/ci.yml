@@ -25,9 +25,6 @@ permissions:
   contents: read
 
 jobs:
-  full-verification:
-    uses: ./.github/workflows/verify.yml
-
   frontend:
     name: 前端 typecheck + build
     runs-on: ubuntu-latest

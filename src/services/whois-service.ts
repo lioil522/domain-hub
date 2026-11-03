@@ -3,7 +3,6 @@ import { DNSHEClient } from "../dnshe";
 import { NON_QUOTA_PROVIDERS } from "../db";
 import { AccountRepository } from "../repositories/account-repository";
 import { AccountService } from "./account-service";
-import { ValidationError } from "../errors";
 
 export class WhoisService {
   constructor(private readonly db: DatabaseManager) {}
@@ -20,11 +19,11 @@ export class WhoisService {
       const auth = await this.db.getClientForAccount(dnsheAccount.id);
       if (auth.client instanceof DNSHEClient) return auth.client;
     }
-    throw new ValidationError("当前 DNSHE 服务要求认证，请先绑定 DNSHE 账号");
+    return new DNSHEClient("public", "public");
   }
 
-  async query(domain: string, accountId?: number, signal?: AbortSignal) {
+  async query(domain: string, accountId?: number) {
     const client = await this.getClient(accountId);
-    return client.whois(domain, signal);
+    return client.whois(domain);
   }
 }

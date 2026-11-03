@@ -10,10 +10,8 @@ import { LogService } from "../services/log-service";
 import { AuditService } from "../services/audit-service";
 import { AuditRepository } from "../repositories/audit-repository";
 import { successRes, errorRes } from "./response";
-import { translateDnsWriteError } from "../services/dns-operations";
-import { normalizeDnsInput } from "../services/dns-input";
+import { normalizeDnsRecordName, translateDnsWriteError } from "../services/dns-operations";
 import { dnsService } from "../services/dns-service";
-import { AppError } from "../errors";
 
 function domainService(db: DatabaseManager) { return new DomainService(new DomainRepository(db)); }
 function logService(db: DatabaseManager) { return new LogService(new LogRepository(db)); }
@@ -24,10 +22,25 @@ export interface DnsRouteDeps { sleep: (ms: number) => Promise<void>; }
 const DNS_BATCH_LIMIT = 50;
 const DNS_BATCH_INTERVAL = 300;
 
-interface DnsBatchItemResult { label: string; success: boolean; message: string; not_sent?: boolean }
+interface DnsBatchItemResult { label: string; success: boolean; message: string; }
+
+function buildBatchDnsParams(item: Record<string, unknown> | null | undefined, fullDomain: string) {
+  const type = String(item?.type || "").trim().toUpperCase();
+  const name = normalizeDnsRecordName(String(item?.name ?? ""), fullDomain);
+  const content = String(item?.content || "").trim();
+  const ttl = Number(item?.ttl) > 0 ? Number(item?.ttl) : 600;
+  const params: Record<string, unknown> = { ...item, type, name, content, ttl };
+  if ((type === "MX" || type === "SRV") && Number.isFinite(Number(item?.priority))) params.priority = Number(item?.priority);
+  else delete params.priority;
+  const line = String(item?.line || "").trim();
+  if (line) params.line = line; else delete params.line;
+  if (item?.proxied === true || item?.proxied === "true") params.proxied = true;
+  return { type, name, content, ttl, params };
+}
 
 function normalizedInput(item: Record<string, unknown>, fullDomain: string): DnsRecordInput {
-  return normalizeDnsInput(item, fullDomain);
+  const { type, name, content, ttl, params } = buildBatchDnsParams(item, fullDomain);
+  return params as DnsRecordInput;
 }
 
 export function registerDnsRoutes(app: Hono<AppEnv>, deps: DnsRouteDeps) {
@@ -42,7 +55,6 @@ export function registerDnsRoutes(app: Hono<AppEnv>, deps: DnsRouteDeps) {
       await logService(db).write("success", "api", `查看了域名 [${domain.full_domain}] 的 DNS 解析记录 (${result.records.length} 条)`);
       return c.json(successRes({ records: result.records }));
     } catch (e: unknown) {
-      if (e instanceof AppError) throw e;
       return c.json(errorRes(e instanceof Error ? e.message : "未知错误"), 400);
     }
   });
@@ -63,7 +75,6 @@ export function registerDnsRoutes(app: Hono<AppEnv>, deps: DnsRouteDeps) {
       await auditService(db).write({ actor: "session", action: "create", resourceType: "dns_record", resourceId: String((result.record as any)?.id || ""), result: "success", details: { domainId, type: input.type, name: input.name, content: input.content } });
       return c.json(successRes({ message: "创建DNS记录成功", record: result.record }));
     } catch (e: unknown) {
-      if (e instanceof AppError) throw e;
       const { message, errorCode } = translateDnsWriteError(e instanceof Error ? e.message : "未知错误", body.type);
       return c.json(errorRes(message, errorCode), 400);
     }
@@ -100,7 +111,7 @@ export function registerDnsRoutes(app: Hono<AppEnv>, deps: DnsRouteDeps) {
       await logService(db).write(failCount === 0 ? "success" : "warning", "api", `批量添加域名 [${domain.full_domain}] 的解析记录完成：成功 ${successCount} 条，失败 ${failCount} 条`, results);
       await auditService(db).write({ actor: "session", action: "batch-create", resourceType: "dns_record", resourceId: String(domainId), result: failCount === 0 ? "success" : "failure", details: { successCount, failCount } });
       return c.json(successRes({ success_count: successCount, fail_count: failCount, results, error_code: nsDisabled ? "ns_management_disabled" : undefined, message: `批量添加完成：成功 ${successCount} 条，失败 ${failCount} 条` }));
-    } catch (e: unknown) { if (e instanceof AppError) throw e; return c.json(errorRes(`批量添加解析记录失败: ${e instanceof Error ? e.message : "未知错误"}`), 400); }
+    } catch (e: unknown) { return c.json(errorRes(`批量添加解析记录失败: ${e instanceof Error ? e.message : "未知错误"}`), 400); }
   });
 
   app.post("/api/domains/:id/dns/batch-update", async (c) => {
@@ -115,15 +126,16 @@ export function registerDnsRoutes(app: Hono<AppEnv>, deps: DnsRouteDeps) {
       const domain = await domainService(db).get(domainId);
       if (!domain) return c.json(errorRes("未找到域名记录", "not_found"), 404);
       const results: DnsBatchItemResult[] = [];
-      let successCount = 0, failCount = 0, nsDisabled = false, changed = false, stopped = false;
+      let successCount = 0, failCount = 0, nsDisabled = false, changed = false;
       for (const raw of items) {
         const item = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+        const input = normalizedInput(item, domain.full_domain);
         const recordId = String(item.record_id ?? item.id ?? "").trim();
-        const label = String(item.label || "").trim() || `${String(item.type || "?")} ${String(item.name || "@")} → ${String(item.content || "(结构化)")}`;
-        if (stopped) { failCount++; results.push({ label, success: false, not_sent: true, message: "未发送：前项失败或结果未确认，请只读核验；不自动回滚/重试" }); continue; }
+        const label = String(item.label || "").trim() || `${input.type || "?"} ${input.name} → ${input.content || "(空)"}`;
         if (!recordId) { failCount++; results.push({ label, success: false, message: "缺少记录 ID，无法定位要修改的记录" }); continue; }
-        try { const input = normalizedInput(item, domain.full_domain); await dnsService(db).update(domain, recordId, input); successCount++; changed = true; results.push({ label, success: true, message: "修改成功" }); }
-        catch (e: unknown) { stopped = true; const { message, errorCode } = translateDnsWriteError(e instanceof Error ? e.message : "未知错误", item.type); if (errorCode === "ns_management_disabled") nsDisabled = true; failCount++; results.push({ label, success: false, message }); }
+        if (!input.type || !input.content) { failCount++; results.push({ label, success: false, message: "记录类型与记录值均不能为空" }); continue; }
+        try { await dnsService(db).update(domain, recordId, input); successCount++; changed = true; results.push({ label, success: true, message: "修改成功" }); }
+        catch (e: unknown) { const { message, errorCode } = translateDnsWriteError(e instanceof Error ? e.message : "未知错误", input.type); if (errorCode === "ns_management_disabled") nsDisabled = true; failCount++; results.push({ label, success: false, message }); }
         await deps.sleep(DNS_BATCH_INTERVAL);
       }
       if (changed) await dnsService(db).refreshStatus(domain);
@@ -146,11 +158,10 @@ export function registerDnsRoutes(app: Hono<AppEnv>, deps: DnsRouteDeps) {
       if (!domain) return c.json(errorRes("未找到域名记录", "not_found"), 404);
       const items = rawItems.map((raw: unknown) => { const item = raw && typeof raw === "object" ? raw as Record<string, unknown> : null; return { recordId: String(item?.record_id ?? item?.id ?? raw ?? "").trim(), label: String(item?.label ?? item?.record_id ?? item?.id ?? raw ?? "").trim() }; }).filter((x: { recordId: string; label: string }) => Boolean(x.recordId));
       const results: DnsBatchItemResult[] = [];
-      let successCount = 0, failCount = 0, nsDisabled = false, changed = false, stopped = false;
+      let successCount = 0, failCount = 0, nsDisabled = false, changed = false;
       for (const item of items) {
-        if (stopped) { failCount++; results.push({ label: item.label || item.recordId, success: false, not_sent: true, message: "未发送：前项失败或结果未确认，请只读核验；不自动回滚/重试" }); continue; }
         try { await dnsService(db).remove(domain, item.recordId); successCount++; changed = true; results.push({ label: item.label || item.recordId, success: true, message: "删除成功" }); }
-        catch (e: unknown) { stopped = true; const { message, errorCode } = translateDnsWriteError(e instanceof Error ? e.message : "未知错误", "NS"); if (errorCode === "ns_management_disabled") nsDisabled = true; failCount++; results.push({ label: item.label || item.recordId, success: false, message }); }
+        catch (e: unknown) { const { message, errorCode } = translateDnsWriteError(e instanceof Error ? e.message : "未知错误", "NS"); if (errorCode === "ns_management_disabled") nsDisabled = true; failCount++; results.push({ label: item.label || item.recordId, success: false, message }); }
         await deps.sleep(DNS_BATCH_INTERVAL);
       }
       if (changed) await dnsService(db).refreshStatus(domain);
@@ -172,7 +183,7 @@ export function registerDnsRoutes(app: Hono<AppEnv>, deps: DnsRouteDeps) {
       await logService(db).write("success", "api", `修改了域名 [${domain.full_domain}] 下的记录 (ID: ${recordId}): ${input.type} ${input.name} -> ${input.content}`);
       await auditService(db).write({ actor: "session", action: "update", resourceType: "dns_record", resourceId: recordId, result: "success", details: { domainId, type: input.type, name: input.name } });
       return c.json(successRes({ message: "更新DNS记录成功", record: result.record }));
-    } catch (e: unknown) { if (e instanceof AppError) throw e; const { message, errorCode } = translateDnsWriteError(e instanceof Error ? e.message : "未知错误", body.type); return c.json(errorRes(message, errorCode), 400); }
+    } catch (e: unknown) { const { message, errorCode } = translateDnsWriteError(e instanceof Error ? e.message : "未知错误", body.type); return c.json(errorRes(message, errorCode), 400); }
   });
 
   app.delete("/api/domains/:id/dns/:record_id", async (c) => {
@@ -183,6 +194,6 @@ export function registerDnsRoutes(app: Hono<AppEnv>, deps: DnsRouteDeps) {
       await logService(db).write("success", "api", `删除了域名 [${domain.full_domain}] 下的 DNS 记录 (ID: ${recordId})`);
       await auditService(db).write({ actor: "session", action: "delete", resourceType: "dns_record", resourceId: recordId, result: "success", details: { domainId } });
       return c.json(successRes({ message: "删除DNS记录成功" }));
-    } catch (e: unknown) { if (e instanceof AppError) throw e; return c.json(errorRes(e instanceof Error ? e.message : "未知错误"), 400); }
+    } catch (e: unknown) { return c.json(errorRes(e instanceof Error ? e.message : "未知错误"), 400); }
   });
 }

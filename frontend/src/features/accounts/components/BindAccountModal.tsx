@@ -24,7 +24,6 @@ import { useAppData } from "../../../state/AppDataContext";
 import { BIND_FORM_SCHEMA, type BindBatchResult, type BindSyncDeps } from "./BIND_FORM_SCHEMA";
 import { GenericCredentialForm } from "./GenericCredentialForm";
 import { BindBatchForm } from "./BindBatchForm";
-import { readSessionToken } from "../../../api/client";
 
 export interface BindAccountModalProps {
   /** 是否打开 */
@@ -35,7 +34,12 @@ export interface BindAccountModalProps {
   actionLoading: string | null;
   setActionLoading: (v: string | null) => void;
   /** 等待账号域名在后端落库后再刷新列表（依赖较多，仍留在 App） */
-  waitForAccountDomainSync: BindSyncDeps["waitForAccountDomainSync"];
+  waitForAccountDomainSync: (
+    accountIds: number[],
+    label: string,
+    baseline?: Map<number, string>,
+    providerLookup?: (id: number) => string | undefined
+  ) => Promise<void>;
   /** 各 provider 域名列表刷新（仍在 App / 后续 Phase 迁移） */
   fetchCfZones: (accountIdFilter?: string) => Promise<void> | void;
   fetchDpDomains: (accountIdFilter?: string) => Promise<void> | void;
@@ -134,7 +138,6 @@ export function BindAccountModal(props: BindAccountModalProps) {
     }
 
     setActionLoading(schema.singleAction);
-    const session = readSessionToken();
     try {
       const res = await apiFetch("/api/accounts", {
         method: "POST",
@@ -147,9 +150,7 @@ export function BindAccountModal(props: BindAccountModalProps) {
         if (toast) showToast("success", toast);
         onClose();
         setValuesByProvider((prev) => ({ ...prev, [formKey]: { ...EMPTY_VALUES } }));
-        await Promise.resolve(s.onSuccess(data, values, { ...deps,
-          waitForAccountDomainSync: (ids, label, actionId, lookup) => waitForAccountDomainSync(ids, label, actionId, lookup, session, data.syncWarning),
-        }));
+        await Promise.resolve(s.onSuccess(data, values, deps));
       } else {
         showToast("error", data.message || s.errorFallback);
       }
@@ -186,7 +187,6 @@ export function BindAccountModal(props: BindAccountModalProps) {
     }
 
     setActionLoading(schema.batchAction);
-    const session = readSessionToken();
     setBatchResults((prev) => ({ ...prev, [formKey]: null }));
     try {
       const res = await apiFetch("/api/accounts/batch", {
@@ -200,9 +200,7 @@ export function BindAccountModal(props: BindAccountModalProps) {
         const toast = b.successToast?.(data);
         if (toast) showToast(toast.level, toast.msg);
         setBatchInput((prev) => ({ ...prev, [formKey]: "" }));
-        await Promise.resolve(b.onSuccess(data, { ...deps,
-          waitForAccountDomainSync: (ids, label, actionId, lookup) => waitForAccountDomainSync(ids, label, actionId, lookup, session, data.syncWarning),
-        }));
+        await Promise.resolve(b.onSuccess(data, deps));
       } else {
         showToast("error", data.message || b.errorFallback);
       }

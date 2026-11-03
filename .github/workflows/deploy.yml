@@ -148,7 +148,7 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          wranglerVersion: '4.156.2'
+          wranglerVersion: '4.127.0'
 
       - name: Auto-Configure & Sync AES_KEY Secret
         env:

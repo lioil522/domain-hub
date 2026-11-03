@@ -4,8 +4,6 @@ import { DatabaseManager } from "../db";
 import { toASCII, isRegistrableDomain } from "../punycode";
 import { successRes, errorRes } from "./response";
 import { RDAP_CACHE_PREFIX } from "../db";
-import type { InvocationCounter } from "../services/invocation-budget";
-import { invocationFetch } from "../services/invocation-fetch";
 
 /**
  * 8.6 查询根域名的 NS 记录（DoH 代理 + D1 缓存）
@@ -60,13 +58,13 @@ interface DohResponse {
  * @returns NS 主机名数组（已去尾点/转小写/去重/排序）；查询失败或无 NS 时返回 null，
  *          调用方据此区分「不支持线路」与「未知」——后者不写缓存，下次再试。
  */
-async function resolveNsViaDoh(name: string, budget?: InvocationCounter): Promise<string[] | null> {
+async function resolveNsViaDoh(name: string): Promise<string[] | null> {
   for (const endpoint of DOH_ENDPOINTS) {
     try {
-      const res = await invocationFetch(`${endpoint}?name=${encodeURIComponent(name)}&type=NS`, {
+      const res = await fetch(`${endpoint}?name=${encodeURIComponent(name)}&type=NS`, {
         headers: { accept: "application/dns-json" },
         signal: AbortSignal.timeout(DOH_TIMEOUT_MS)
-      }, budget);
+      });
       if (!res.ok) continue;
 
       const data = (await res.json()) as DohResponse;
@@ -153,7 +151,7 @@ app.get("/api/dns/ns", async (c) => {
       }
 
       queried++;
-      const hosts = await resolveNsViaDoh(root, dbManager.invocationBudget);
+      const hosts = await resolveNsViaDoh(root);
       ns[root] = hosts;
       if (hosts && hosts.length > 0) {
         // 只缓存有效结论：查询失败不落库，避免把一次网络抖动固化成 30 天的「未知」

@@ -26,9 +26,6 @@ export interface AppSettings {
   auto_renew: string;
   /** 定时任务的解析记录缓存策略：scheduled=只读缓存 / always=每次全额回源 */
   dns_records_cache_mode: string;
-  login_sync_enabled: string;
-  sync_freshness_seconds: string;
-  dnshe_renew_window_days: string;
 }
 
 export interface UseSettingsOptions {
@@ -75,9 +72,6 @@ export function useSettings(opts: UseSettingsOptions) {
     renew_threshold_days: "90",
     auto_renew: "1",
     dns_records_cache_mode: "scheduled",
-    login_sync_enabled: "false",
-    sync_freshness_seconds: "3600",
-    dnshe_renew_window_days: "0",
   });
   const [settingsConfigured, setSettingsConfigured] = useState<{ tg_token: boolean; webhook_url: boolean }>({ tg_token: false, webhook_url: false });
   const [loadingSettings, setLoadingSettings] = useState(false);
@@ -124,9 +118,6 @@ export function useSettings(opts: UseSettingsOptions) {
         renew_threshold_days: settings.renew_threshold_days,
         auto_renew: settings.auto_renew,
         dns_records_cache_mode: settings.dns_records_cache_mode,
-        login_sync_enabled: settings.login_sync_enabled,
-        sync_freshness_seconds: settings.sync_freshness_seconds,
-        dnshe_renew_window_days: settings.dnshe_renew_window_days,
       };
       if (settings.tg_token && !settings.tg_token.startsWith("****")) payload.tg_token = settings.tg_token;
       if (settings.webhook_url && !settings.webhook_url.startsWith("****")) payload.webhook_url = settings.webhook_url;

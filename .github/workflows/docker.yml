@@ -124,7 +124,7 @@ jobs:
             || fail "$ASSET 的 Cache-Control 不是 immutable 长缓存"
 
           # 6. 进程内定时器（替代 Cron Trigger）确实排上了下一次触发
-          docker logs domain-hub-ci 2>&1 | grep -q '下一次本地到期提醒与 DNSHE 自动续期（不完整同步）' \
+          docker logs domain-hub-ci 2>&1 | grep -q '下一次域名同步与自动续期' \
             || fail "启动日志里没有定时任务的排程行"
 
           # 7. 运行时镜像不该带 node_modules（后端已被 esbuild 打成单文件），且不以 root 运行

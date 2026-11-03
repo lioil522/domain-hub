@@ -6,9 +6,6 @@ import type { WebhookType } from "./cron";
 import type { Bindings, Variables } from "./routes/types";
 import { DatabaseManager, timingSafeEqual } from "./db";
 import { AppError } from "./errors";
-import { databaseIdentity, withBudgetD1 } from "./db/budget-d1";
-import { InvocationBudget } from "./services/invocation-budget";
-import { ProviderApiError } from "./errors/provider-api-error";
 // NOTE: 同一模块既要把 isRegistrableDomain 转出给外部（见下方 export ... from），
 // 又要在本文件内直接调用它 —— `export { x } from` 只做转出、不建立本地绑定，
 // 所以必须再显式导入一次，否则本文件内的调用点会报 TS2304。
@@ -94,7 +91,7 @@ app.use(
 
     if (c.req.method === "OPTIONS") {
       const headers: Record<string, string> = {
-        "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
         "Access-Control-Allow-Headers": "Content-Type, Authorization",
         "Access-Control-Max-Age": "86400",
         Vary: "Origin",
@@ -107,7 +104,7 @@ app.use(
 
     const corsMiddleware = cors({
       origin: allowList.length > 0 ? allowList : requestOrigin || "*",
-      allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+      allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
       allowHeaders: ["Content-Type", "Authorization"],
       maxAge: 86400,
     });
@@ -118,26 +115,23 @@ app.use(
 /**
  * 表结构自举 — 每个 isolate 只执行一次
  */
-const schemaReady = new WeakMap<D1Database, Promise<boolean>>();
+let schemaReady: Promise<boolean> | null = null;
 
-function ensureSchemaOnce(db: D1Database, dbManager: DatabaseManager): Promise<boolean> {
-  db = databaseIdentity(db);
-  let ready = schemaReady.get(db);
-  if (!ready) {
-    ready = dbManager
+function ensureSchemaOnce(dbManager: DatabaseManager): Promise<boolean> {
+  if (!schemaReady) {
+    schemaReady = dbManager
       .ensureTables()
       .then((ok) => {
-        if (!ok) schemaReady.delete(db);
+        if (!ok) schemaReady = null;
         return ok;
       })
       .catch((e) => {
-        schemaReady.delete(db);
+        schemaReady = null;
         console.error("ensureSchemaOnce failed:", e);
         return false;
       });
-    schemaReady.set(db, ready);
   }
-  return ready;
+  return schemaReady;
 }
 
 /**
@@ -145,9 +139,7 @@ function ensureSchemaOnce(db: D1Database, dbManager: DatabaseManager): Promise<b
  */
 app.use("/api/*", async (c, next) => {
   const dbManager = new DatabaseManager(c.env.DB, c.env.AES_KEY);
-  if (!(await ensureSchemaOnce(c.env.DB, dbManager))) {
-    return c.json(errorRes("数据库暂不可用，请稍后重试", "storage_unavailable"), 503);
-  }
+  await ensureSchemaOnce(dbManager);
   c.set("db", dbManager);
   return next();
 });
@@ -176,9 +168,7 @@ app.use("/api/*", async (c, next) => {
       if (await dbManager.validateSession(token)) {
         return next();
       }
-    } catch (e) {
-      return c.json(errorRes("鉴权存储暂不可用，请稍后重试", "auth_storage_unavailable"), 503);
-    }
+    } catch (e) {}
   }
 
   // 2. 应急令牌通道
@@ -197,7 +187,7 @@ app.use("/api/*", async (c, next) => {
     await dbManager.recordLoginFailure(ipScope, LOGIN_LOCK_WINDOW_SECONDS);
   }
 
-  return c.json(errorRes("认证失败：会话凭据已失效，请重新登录", "session_expired"), 401);
+  return c.json(errorRes("认证失败：会话凭据已失效，请重新登录", "forbidden"), 403);
 });
 
 registerAccountRoutes(app, {
@@ -266,43 +256,28 @@ registerBackupRoutes(app, {
 
 app.onError((err, c) => {
   if (err instanceof AppError) {
-    if (err instanceof ProviderApiError && err.retryAfterMs !== undefined && Number.isFinite(err.retryAfterMs)) {
-      c.header("Retry-After", String(Math.max(1, Math.ceil(err.retryAfterMs / 1000))));
-    }
     return c.json(errorRes(err.message, err.code, err.details), err.statusCode as any);
   }
   console.error("Unhandled Exception:", err);
   return c.json(errorRes("服务器内部错误", "internal_error"), 500);
 });
 
-registerSyncRoutes(app);
 app.notFound((c) => {
   return c.json(errorRes(`路径 ${c.req.path} 不存在`, "not_found"), 404);
 });
 
-// Shared production pipeline also allows offline tests to inspect its counter.
-// Observe legacy work until every long-task entry has a sliced replacement.
-export async function runHttpInvocation(request: Request, env: Bindings, ctx: ExecutionContext,
-  budget = new InvocationBudget()): Promise<Response> {
-  const res = await app.fetch(request, { ...env, DB: withBudgetD1(env.DB, budget) }, ctx);
-  return withSecurityHeaders(res);
-}
-
-// Still the legacy Cron business until P2/P6; only invocation accounting changes.
-export function runScheduledInvocation(env: Bindings, budget = new InvocationBudget()) {
-  const dbManager = new DatabaseManager(withBudgetD1(env.DB, budget), env.AES_KEY);
-  const webhookType = (env.WEBHOOK_TYPE || "custom") as WebhookType;
-  return runDailySyncAndRenewal(dbManager, env.WEBHOOK_URL, webhookType, true);
-}
-
 export default {
-  fetch: runHttpInvocation,
+  async fetch(request: Request, env: Bindings, ctx: ExecutionContext): Promise<Response> {
+    const res = await app.fetch(request, env, ctx);
+    return withSecurityHeaders(res);
+  },
 
   async scheduled(event: ScheduledEvent, env: Bindings, ctx: ExecutionContext) {
-    ctx.waitUntil(runScheduledInvocation(env));
+    const dbManager = new DatabaseManager(env.DB, env.AES_KEY);
+    const webhookType = (env.WEBHOOK_TYPE || "custom") as WebhookType;
+    ctx.waitUntil(runDailySyncAndRenewal(dbManager, env.WEBHOOK_URL, webhookType, true));
   }
 };
 
 // 下游直接 re-export 的模块（不要删除这些行）
 export { isRegistrableDomain } from "./punycode";
-import { registerSyncRoutes } from "./routes/sync";

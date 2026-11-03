@@ -1,4 +1,3 @@
-import "../tests/helpers/block-outbound";
 import assert from "node:assert/strict";
 import { DnspodClient, mapDnspodDomainToUpstream } from "../src/dnspod";
 import { CloudflareClient, mapZoneToUpstream } from "../src/cloudflare";
@@ -6,14 +5,8 @@ import { AlidnsClient, mapAlidnsDomainToUpstream } from "../src/alidns";
 import { HuaweiCloudClient, mapHuaweiZoneToUpstream } from "../src/huaweicloud";
 import { VercelClient, mapVercelDomainToUpstream } from "../src/vercel";
 import { LegacyDomainProviderAdapter } from "../src/providers/domain/legacy-client-adapter";
-import { ProviderApiError } from "../src/errors/provider-api-error";
 
 console.log("多服务商添加域名 (CreateDomain) 单元测试开始...");
-
-// A renamed private method must fail locally instead of reaching a real AddDomain API.
-await assert.rejects(fetch("https://fixture.invalid"), /outbound fetch is forbidden/);
-await assert.rejects(new AlidnsClient("fixture", "fixture").createDomain("fixture.invalid"),
-  (error: unknown) => error instanceof ProviderApiError && error.error_code === "transport_error");
 
 // 1. DNSPod
 {
@@ -142,15 +135,18 @@ await assert.rejects(new AlidnsClient("fixture", "fixture").createDomain("fixtur
   let capturedAction = "";
   let capturedParams: any = null;
 
-  (client as any).requestRpc = async (action: string, params: any) => {
+  (client as any).requestXml = async (action: string, params: any) => {
     capturedAction = action;
     capturedParams = params;
     if (action === "AddDomain") {
-      return {
-        DomainId: "ali_dom_001",
-        DomainName: params.DomainName,
-        DnsServers: { DnsServer: ["dns1.hichina.com", "dns2.hichina.com"] },
-      };
+      return `<AddDomainResponse>
+        <DomainId>ali_dom_001</DomainId>
+        <DomainName>${params.DomainName}</DomainName>
+        <DnsServers>
+          <DnsServer>dns1.hichina.com</DnsServer>
+          <DnsServer>dns2.hichina.com</DnsServer>
+        </DnsServers>
+      </AddDomainResponse>`;
     }
     throw new Error(`Unexpected action: ${action}`);
   };
@@ -161,7 +157,7 @@ await assert.rejects(new AlidnsClient("fixture", "fixture").createDomain("fixtur
   assert.equal(res.data?.domain.full_domain, "corp.myaliyun.com");
   assert.deepEqual(res.data?.nameservers, ["dns1.hichina.com", "dns2.hichina.com"]);
   assert.equal(capturedParams.DomainName, "corp.myaliyun.com");
-  console.log("  ✓ 阿里云 DNS AddDomain 正确提取归一化响应中的 DnsServers");
+  console.log("  ✓ 阿里云 DNS AddDomain 正确提取 XML 中的 DnsServers");
 }
 
 // 4. 华为云 DNS

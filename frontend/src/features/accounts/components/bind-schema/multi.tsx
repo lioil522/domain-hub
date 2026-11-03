@@ -49,7 +49,7 @@ export function multiSchema(key: MultiProviderKey): BindProviderSchema {
       onSuccess: async (data, _v, deps) => {
         await deps.fetchAccounts();
         if (data.account?.id) {
-          await deps.waitForAccountDomainSync([Number(data.account.id)], `${meta.label} 账号绑定成功`, data.actionId, () => key);
+          await deps.waitForAccountDomainSync([Number(data.account.id)], `${meta.label} 账号绑定成功`, undefined, () => key);
         } else {
           await deps.fetchMultiProviderDomains(key);
         }
@@ -102,7 +102,7 @@ export function multiSchema(key: MultiProviderKey): BindProviderSchema {
       onSuccess: async (data, deps) => {
         await deps.fetchAccounts();
         if (Array.isArray(data.account_ids) && data.account_ids.length > 0) {
-          await deps.waitForAccountDomainSync(toAccountIds(data.account_ids), `${data.success_count} 个 ${meta.label} 账号绑定成功`, data.actionId, () => key);
+          await deps.waitForAccountDomainSync(toAccountIds(data.account_ids), `${data.success_count} 个 ${meta.label} 账号绑定成功`, undefined, () => key);
         } else {
           await deps.fetchMultiProviderDomains(key);
         }

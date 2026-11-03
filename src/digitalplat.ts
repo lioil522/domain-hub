@@ -18,9 +18,6 @@
 
 import type { ActionResponse, CreateDnsRecordResponse, DnsRecordInfo, ListDnsRecordsResponse } from "./dnshe";
 import type { UpstreamSubdomain } from "./db";
-import { ProviderApiError, incompleteResponse } from "./errors/provider-api-error";
-import { parseProviderJson, requestProviderText, type ProviderRequestLimits } from "./providers/provider-request";
-import { CompleteList, domainKey, hasText, isObject } from "./providers/list-integrity";
 import { zoneIdToNumericId } from "./cloudflare";
 import { detectDnsProvider } from "./dns-provider";
 
@@ -83,9 +80,8 @@ interface DpDnsRecord {
  */
 function mapDpRecord(rec: DpDnsRecord): DnsRecordInfo[] {
   if (rec.protected) return [];
-  // Empty TXT values are valid. Filtering them would also shift synthetic #idx IDs
-  // away from the raw RRset positions used by update/delete.
-  const values = dpRecordValues(rec);
+  const rawValues = Array.isArray(rec.values) && rec.values.length > 0 ? rec.values : [rec.value ?? ""];
+  const values = rawValues.filter((v) => v !== "");
   const isMulti = values.length > 1;
   const type = String(rec.type || "").toUpperCase();
 
@@ -108,10 +104,6 @@ function mapDpRecord(rec: DpDnsRecord): DnsRecordInfo[] {
       proxied: false,
     };
   });
-}
-
-function dpRecordValues(rec: DpDnsRecord): string[] {
-  return Array.isArray(rec.values) ? [...rec.values] : [rec.value ?? ""];
 }
 
 /**
@@ -196,14 +188,11 @@ export function normalizeDpName(name: string | undefined | null, domain: string)
 /**
  * DigitalPlat API 请求封装类
  */
-/** Only produced by a readable, explicit unsuccessful HTTP 409 API reply. */
-class DigitalPlatConflictError extends ProviderApiError {}
-
 export class DigitalPlatClient {
   private apiKey: string;
   private baseUrl = "https://domain-api.digitalplat.org/api/v1";
 
-  constructor(apiKey: string, private readonly requestLimits: ProviderRequestLimits = {}) {
+  constructor(apiKey: string) {
     this.apiKey = String(apiKey || "").trim();
   }
 
@@ -223,7 +212,6 @@ export class DigitalPlatClient {
       body?: unknown;
       idempotencyKey?: string;
       ifMatchEtag?: string;
-      envelope?: boolean;
     } = {}
   ): Promise<T> {
     const url = new URL(this.baseUrl + path);
@@ -248,114 +236,79 @@ export class DigitalPlatClient {
       headers["If-Match"] = options.ifMatchEtag;
     }
 
-    const result = await requestProviderText("digitalplat", url.toString(), {
+    const response = await fetch(url.toString(), {
       method,
       headers,
       body: options.body === undefined ? undefined : JSON.stringify(options.body),
-    }, this.requestLimits);
-    const { response, retryAfterMs } = result;
+    });
 
-    let data: DpResponse<unknown>;
+    let data: DpResponse<T>;
     try {
-      data = parseProviderJson("digitalplat", result) as DpResponse<unknown>;
-    } catch (error) {
+      data = (await response.json()) as DpResponse<T>;
+    } catch {
       // 响应体不是 JSON —— 典型场景是 Cloudflare 质询 HTML 页
-      if (response.status === 403) throw new ProviderApiError("digitalplat", 403, "non_json_response",
-        "DigitalPlat API 被 Cloudflare 人机验证拦截（HTTP 403），请稍后重试；若持续出现请检查部署出口 IP 是否被拉黑", undefined, retryAfterMs);
-      throw error;
+      throw new Error(
+        response.status === 403
+          ? "DigitalPlat API 被 Cloudflare 人机验证拦截（HTTP 403），请稍后重试；若持续出现请检查部署出口 IP 是否被拉黑"
+          : `DigitalPlat API 响应异常 (HTTP ${response.status})`
+      );
     }
 
-    if (!isObject(data) || typeof data.success !== "boolean") {
-      if (response.ok) throw incompleteResponse("digitalplat");
-      throw new ProviderApiError("digitalplat", response.status, "invalid_response", `DigitalPlat API 响应格式异常 (HTTP ${response.status})`, undefined, retryAfterMs);
-    }
-    if (!response.ok || data.success !== true) {
+    if (!response.ok || !data.success) {
       const nested = (data.error as { message?: unknown; code?: unknown } | undefined) || {};
       const nestedMessage = typeof nested.message === "string" ? nested.message : "";
       const detail = String(data.message || (typeof data.error === "string" ? data.error : "") || nestedMessage || "");
       const errorCode = typeof nested.code === "string" ? nested.code : "";
-      const fail = (message: string) => new ProviderApiError("digitalplat", response.status,
-        errorCode || "request_failed", message, undefined, retryAfterMs);
       // 401/403 统一翻译成可操作的中文指引
       if (errorCode === "invalid_api_key" || response.status === 401) {
-        throw fail(
+        throw new Error(
           "DigitalPlat API Key 无效或已被吊销：请到 DigitalPlat 控制台「API 密钥」页核对（Key 明文只在创建时显示一次，无法再次查看，失效就重新创建一个）"
         );
       }
       if (response.status === 403) {
-        throw fail(
+        throw new Error(
           "DigitalPlat API 拒绝访问（HTTP 403）：请到 DigitalPlat 控制台「API 密钥」页确认该 API Key 仍然有效且未被禁用"
         );
       }
       // 412 = PATCH 的 If-Match ETag 与上游当前版本不符（并发编辑 / 列表过期），
       // 需要重新拉取记录列表拿最新 etag 再重试，否则静默覆盖别人的修改。
       if (response.status === 412) {
-        throw fail(
+        throw new Error(
           "DigitalPlat 记录已在本页之外被修改（ETag 冲突，HTTP 412）：请关闭编辑后重新加载记录列表再试，避免覆盖其他会话的改动"
         );
       }
       if (errorCode === "hosted_dns_zone_not_found") {
-        throw fail(
+        throw new Error(
           "该域名未启用 DigitalPlat DNS 托管（NS 未指向 DigitalPlat），请先在 DigitalPlat 控制台启用 Hosted DNS 后再管理解析记录"
         );
       }
-      if (response.status === 409 && data.success === false && (detail.trim() || errorCode.trim())) {
-        throw new DigitalPlatConflictError("digitalplat", 409, errorCode || "request_failed",
-          `DigitalPlat API 错误: ${detail || "HTTP 409"}`, undefined, retryAfterMs);
-      }
-      throw fail(`DigitalPlat API 错误: ${detail || `HTTP ${response.status}`}`);
+      throw new Error(`DigitalPlat API 错误: ${detail || `HTTP ${response.status}`}`);
     }
 
-    return (options.envelope ? data : data.data) as T;
+    return data.data as T;
   }
 
   /**
    * 列出 API Key 名下全部域名（同时用于绑定时的密钥有效性校验）
    *
    * NOTE: 键名兼容实测（domain/expires_at）与文档（name/expiry_date）两套口径，
-   * 无效条目和未知分页外壳不能成为权威快照。
+   * 拿到空域名的异常条目直接丢弃，避免把空串哈希成脏行写进缓存。
    */
   async listDomains(): Promise<DpDomainInfo[]> {
-    const res = await this.request<DpResponse<DpDomainInfo[]>>("GET", "/domains", { envelope: true });
-    this.requireUnpaginatedList(res);
-    const list = new CompleteList<DpDomainInfo>("digitalplat");
-    list.add(res.data, d => {
-      const name = d.domain || d.name;
-      if (!hasText(name) || !domainKey(name) || (d.domain !== undefined && !hasText(d.domain)) ||
-        (d.name !== undefined && (!hasText(d.name) || domainKey(d.name) !== domainKey(name))) ||
-        (d.nameservers !== undefined && (!Array.isArray(d.nameservers) || !d.nameservers.every(hasText)))) return null;
-      return [`name:${domainKey(name)}`];
-    });
-    return list.items;
-  }
-
-  private requireUnpaginatedList(res: DpResponse<unknown>): void {
-    // The production Developer API's observed bare data[] contract is not Domain-OSS's page/per_page API.
-    // Until its pagination contract is verified, reject nonempty metadata instead of discarding it.
-    if ((res.meta !== undefined && res.meta !== null && (!isObject(res.meta) || Object.keys(res.meta).length > 0)) ||
-      Object.keys(res).some(key => !["success", "data", "meta", "message"].includes(key))) {
-      throw incompleteResponse("digitalplat", "DigitalPlat 返回尚未确认的列表元信息，旧缓存保持不变");
-    }
+    const data = await this.request<DpDomainInfo[]>("GET", "/domains");
+    if (!Array.isArray(data)) return [];
+    return data.filter((d) => String(d.domain || d.name || "").trim() !== "");
   }
 
   /**
    * 列出域名下全部 DNS 解析记录（内部原始形状，供 updateDnsRecord 提取 etag）
    */
   private async listRawDnsRecords(domain: string): Promise<DpDnsRecord[]> {
-    if (!hasText(domain)) throw new Error("DigitalPlat DNS 解析记录列表需要域名作为参数");
-    const res = await this.request<DpResponse<DpDnsRecord[]>>(
+    const data = await this.request<DpDnsRecord[]>(
       "GET",
-      `/domains/${encodeURIComponent(domain)}/dns/records`,
-      { envelope: true }
+      `/domains/${encodeURIComponent(domain)}/dns/records`
     );
-    this.requireUnpaginatedList(res);
-    const list = new CompleteList<DpDnsRecord>("digitalplat");
-    list.add(res.data, r => hasText(r.id) && typeof r.name === "string" && hasText(r.type) &&
-      (r.protected === undefined || typeof r.protected === "boolean") &&
-      (r.values !== undefined
-        ? Array.isArray(r.values) && r.values.length > 0 && r.values.every(v => typeof v === "string")
-        : typeof r.value === "string") ? [`id:${r.id}`] : null);
-    return list.items;
+    return Array.isArray(data) ? data : [];
   }
 
   /**
@@ -364,7 +317,7 @@ export class DigitalPlatClient {
   async listDnsRecords(domain: string | number): Promise<ListDnsRecordsResponse> {
     const raw = await this.listRawDnsRecords(String(domain));
     const records = raw.flatMap(mapDpRecord);
-    return { success: true, complete: true, records };
+    return { success: true, records };
   }
 
 
@@ -401,7 +354,7 @@ export class DigitalPlatClient {
       if (normalizeDpName(rec.name, params.domain) !== normalizedTargetName || rec.type.toUpperCase() !== type) {
         return false;
       }
-      const vals = dpRecordValues(rec);
+      const vals = Array.isArray(rec.values) && rec.values.length > 0 ? rec.values : [rec.value ?? ""];
       return vals.map((v) => String(v).trim()).includes(content);
     });
     if (duplicate) {
@@ -423,10 +376,7 @@ export class DigitalPlatClient {
       });
       return { success: true };
     } catch (postErr: unknown) {
-      // Unknown POST outcomes must not trigger another mutation, including an
-      // unreadable/oversized HTTP 409. Only an explicit API conflict permits merging.
-      if (!(postErr instanceof DigitalPlatConflictError)) throw postErr;
-      // 3. 明确同名冲突后才尝试并入同名同类型的现有记录
+      // 3. 若上游 POST 返回同名冲突或不支持独立创建，降级尝试并入同名同类型的现有记录
       const existing = raw.find(
         (rec) =>
           normalizeDpName(rec.name, params.domain) === normalizedTargetName &&
@@ -437,7 +387,9 @@ export class DigitalPlatClient {
         throw postErr;
       }
 
-      const existingValues = dpRecordValues(existing);
+      const existingValues = Array.isArray(existing.values) && existing.values.length > 0
+        ? [...existing.values]
+        : existing.value ? [existing.value] : [];
 
       if (existingValues.length >= 16) {
         throw new Error("DigitalPlat 单条记录集最多包含 16 个记录值，已达上限");
@@ -472,11 +424,11 @@ export class DigitalPlatClient {
       priority?: number;
     }>;
   }): Promise<{
-    results: Array<{ label: string; success: boolean; message: string; not_sent?: boolean }>;
+    results: Array<{ label: string; success: boolean; message: string }>;
     successCount: number;
     failCount: number;
   }> {
-    const results: Array<{ label: string; success: boolean; message: string; not_sent?: boolean }> = [];
+    const results: Array<{ label: string; success: boolean; message: string }> = [];
     let successCount = 0;
     let failCount = 0;
 
@@ -518,12 +470,8 @@ export class DigitalPlatClient {
     }
 
     const rawRecords = await this.listRawDnsRecords(params.domain);
-    let stopped = false;
+
     for (const group of groups.values()) {
-      if (stopped) {
-        for (const it of group.items) { failCount++; results.push({ label: `${it.raw.type} ${it.raw.name}`, success: false, not_sent: true, message: "未发送：前组失败或结果未确认，请只读核验；不自动回滚/重试" }); }
-        continue;
-      }
       try {
         const existing = rawRecords.find(
           (rec) =>
@@ -563,7 +511,9 @@ export class DigitalPlatClient {
           }
         } else {
           // 已存在 RRset：合并现有值与待添加的值
-          const existingValues = dpRecordValues(existing);
+          const existingValues = Array.isArray(existing.values) && existing.values.length > 0
+            ? [...existing.values]
+            : existing.value ? [existing.value] : [];
 
           const newToAdd: string[] = [];
           for (const it of group.items) {
@@ -612,7 +562,6 @@ export class DigitalPlatClient {
           }
         }
       } catch (err: unknown) {
-        stopped = true;
         const errMsg = err instanceof Error ? err.message : "创建失败";
         for (const it of group.items) {
           const label = `${it.raw.type || "?"} ${it.raw.name} → ${it.raw.content || "(空)"}`;
@@ -683,7 +632,9 @@ export class DigitalPlatClient {
 
       // 2. 目标确认添加/合并成功后，再从原 RRset 中剥离或删除旧记录
       try {
-        const existingValues = dpRecordValues(target);
+        const existingValues = Array.isArray(target.values) && target.values.length > 0
+          ? [...target.values]
+          : target.value ? [target.value] : [];
 
         if (existingValues.length > 1) {
           // 优先按记录值内容比对匹配要移除的项，防止批量连续修改时下标漂移（Index Drift）
@@ -735,7 +686,9 @@ export class DigitalPlatClient {
 
     if (targetIdx >= 0) {
       // 多值展开的某一行：只替换对应下标的值，保留同组其余值
-      const values = dpRecordValues(target);
+      const values = Array.isArray(target.values) && target.values.length > 0
+        ? [...target.values]
+        : target.value ? [target.value] : [];
 
       if (targetIdx < values.length) {
         values[targetIdx] = content;
@@ -775,7 +728,9 @@ export class DigitalPlatClient {
     }
 
     if (targetIdx >= 0 && target) {
-      const values = dpRecordValues(target);
+      const values = Array.isArray(target.values) && target.values.length > 0
+        ? [...target.values]
+        : target.value ? [target.value] : [];
 
       if (values.length > 1) {
         // 多值展开的某一行：只剔除该行对应的值，更新剩余值

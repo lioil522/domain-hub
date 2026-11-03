@@ -8,7 +8,7 @@ interface UseAppControllerDataEffectsOptions {
   fetchDomains: () => void;
   refreshAllProviderDomains: () => void;
   fetchCustomDomains: () => void;
-  fetchLogs: () => void | Promise<void>;
+  fetchLogs: () => void;
   fetchQuotas: () => void;
   fetchSettings: () => void;
   fetchAccountInfo: () => void;

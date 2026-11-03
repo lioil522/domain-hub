@@ -12,10 +12,7 @@ export class BackupRepository {
   exportAll(): Promise<BackupRecord> {
     return this.db.exportAllData();
   }
-  importAll(snapshot: BackupRecord, sourceAesKey?: string): Promise<{ imported: Record<string, number>; mappings: Record<string, Record<string, number>> }> {
-    return this.db.importAllData(snapshot, sourceAesKey);
-  }
-  previewImport(snapshot: BackupRecord, sourceAesKey?: string) {
-    return this.db.importAllData(snapshot, sourceAesKey, true);
+  importAll(snapshot: BackupRecord): Promise<{ imported: Record<string, number> }> {
+    return this.db.importAllData(snapshot);
   }
 }

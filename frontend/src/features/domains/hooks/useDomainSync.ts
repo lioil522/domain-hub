@@ -1,25 +1,24 @@
 import { useAppData } from "../../../state/AppDataContext";
 import { accountsApi } from "../../../api/endpoints/accounts";
 import { domainsApi } from "../../../api/endpoints/domains";
-import { finishSyncAction } from "../../../lib/sync-action";
-import { readSessionToken } from "../../../api/client";
 
 /** `useDomainSync` 的外部依赖 —— 均由 `App.tsx` 注入 */
 export interface UseDomainSyncOptions {
   /** 动作级 loading 标记（App 的 `actionLoading` setter） */
   setActionLoading: (v: string | null) => void;
   /** 刷新 DNSHE 域名列表（App 的 `fetchDomains`） */
-  refreshDomains: () => void | Promise<unknown>;
+  refreshDomains: () => void;
   /** 刷新全部服务商（App 的 `refreshAllProviderDomains`） */
-  refreshAllProviderDomains: () => void | Promise<unknown>;
+  refreshAllProviderDomains: () => void;
   /** 按 provider 刷新对应标签页（App 的 `refreshProviderDomains`） */
-  refreshProviderDomains: (provider?: string, accountIdFilter?: string) => void | Promise<unknown>;
+  refreshProviderDomains: (provider?: string, accountIdFilter?: string) => void;
 }
 
 /**
  * 域名同步动作（全量 / DNSHE / 单账号）
  *
- * 通过 Action 终态确认结果，不以固定延迟或域名缓存变化推断完成。
+ * 从 `App.tsx` 抽出（Phase 4-J）。**纯搬运**：接口路径、loading 键、延迟刷新
+ * 时长（5000 / 5000 / 3000ms）与全部 toast 文案逐字保留。
  *
  * 为什么 `apiFetch` / `showToast` 走 `useAppData()`：Provider 级横切能力，
  * 与 App 内调用点共用同一实例，少两个 prop。
@@ -41,10 +40,17 @@ export function useDomainSync({
    */
   const handleSyncDomains = async () => {
     setActionLoading("sync-all");
-    const session = readSessionToken();
     try {
       const data = await domainsApi.syncAll(apiFetch);
-      await finishSyncAction(apiFetch, data, () => Promise.all([refreshDomains(), refreshAllProviderDomains()]), showToast, session);
+      if (data.success) {
+        showToast("success", data.message || "同步域名任务已成功在后台启动");
+        setTimeout(() => {
+          refreshDomains();
+          refreshAllProviderDomains();
+        }, 5000);
+      } else {
+        showToast("error", data.message || "启动同步域名任务失败");
+      }
     } catch (e) {
       showToast("error", "发起域名同步网络请求失败");
     } finally {
@@ -60,10 +66,14 @@ export function useDomainSync({
    */
   const handleSyncDnsheDomains = async () => {
     setActionLoading("sync");
-    const session = readSessionToken();
     try {
       const data = await domainsApi.syncProvider(apiFetch, "dnshe");
-      await finishSyncAction(apiFetch, data, refreshDomains, showToast, session);
+      if (data.success) {
+        showToast("success", data.message || "DNSHE 账号同步已在后台启动");
+        setTimeout(() => refreshDomains(), 5000);
+      } else {
+        showToast("error", data.message || "启动 DNSHE 同步失败");
+      }
     } catch (e) {
       showToast("error", "发起同步请求失败");
     } finally {
@@ -80,10 +90,17 @@ export function useDomainSync({
   const handleSyncAccount = async (accountId: number, provider?: string) => {
     const loadingKey = `sync-account-${accountId}`;
     setActionLoading(loadingKey);
-    const session = readSessionToken();
     try {
       const data = await accountsApi.sync(apiFetch, accountId);
-      await finishSyncAction(apiFetch, data, () => refreshProviderDomains(provider), showToast, session);
+      if (data.success) {
+        showToast("success", data.message || "同步已在后台启动");
+        // 延迟刷新对应 provider 的域名列表，等待后台同步完成
+        setTimeout(() => {
+          refreshProviderDomains(provider);
+        }, 3000);
+      } else {
+        showToast("error", data.message || "同步失败");
+      }
     } catch (e) {
       showToast("error", "发起同步请求失败");
     } finally {

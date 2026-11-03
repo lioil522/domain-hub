@@ -1,6 +1,5 @@
 import { BackupRepository, type BackupRecord } from "../repositories/backup-repository";
 import type { DatabaseManager } from "../db";
-import { validBusinessSnapshot } from "../db/backup-format";
 
 export interface BackupSnapshot extends BackupRecord { version: number; exported_at: string; data: Record<string, unknown[]>; }
 export interface BackupDiffItem { table: string; add: number; update: number; remove: number; conflicts: number; }
@@ -26,16 +25,17 @@ export class BackupService {
   }
 
   validate(snapshot: unknown): snapshot is BackupSnapshot {
-    return validBusinessSnapshot(snapshot);
+    if (!snapshot || typeof snapshot !== "object") return false;
+    const value = snapshot as Record<string, unknown>;
+    if (value.version !== 1 || typeof value.exported_at !== "string" || !value.data || typeof value.data !== "object") return false;
+    const data = value.data as Record<string, unknown>;
+    return TABLE_KEYS.every((table) => data[table] === undefined || Array.isArray(data[table]));
   }
 
-  async preview(incoming: unknown, sourceAesKey?: string): Promise<BackupDiff> {
+  async preview(incoming: unknown): Promise<BackupDiff> {
     if (!this.validate(incoming)) throw new Error("备份文件格式无效或版本不受支持");
-    const { imported } = await this.repository.previewImport(incoming, sourceAesKey);
-    // Restore never updates/deletes existing business rows. A failed credential
-    // or identity check rejects the preview instead of reporting zero conflicts.
-    const tables = TABLE_KEYS.map(table => ({ table, add: imported[table], update: 0, remove: 0, conflicts: 0 }));
-    return { tables, totalAdd: tables.reduce((n,t) => n+t.add,0), totalUpdate: 0, totalRemove: 0, totalConflicts: 0 };
+    const current = await this.repository.exportAll();
+    return this.diff(current, incoming);
   }
 
   diff(current: BackupSnapshot, incoming: BackupSnapshot): BackupDiff {
@@ -61,8 +61,8 @@ export class BackupService {
     };
   }
 
-  restore(snapshot: BackupSnapshot, sourceAesKey?: string) {
+  restore(snapshot: BackupSnapshot) {
     if (!this.validate(snapshot)) throw new Error("备份文件格式无效或版本不受支持");
-    return this.repository.importAll(snapshot, sourceAesKey);
+    return this.repository.importAll(snapshot);
   }
 }

@@ -1,4 +1,3 @@
-import { useMemo } from "react";
 import { ScrollText, LogIn, Server, Activity, RefreshCw } from "lucide-react";
 import { Badge } from "../../../components/Badge";
 import type { AppLog } from "../../../types/log";
@@ -6,7 +5,8 @@ import type { AppLog } from "../../../types/log";
 /**
  * LogsPage —— 运行日志标签页
  *
- * 最近 100 条以表格倒序显示；活动期间增量更新，空闲停止轮询。
+ * JSX 从 App.tsx 逐字搬运（Phase 12）。`logRowParts`（表格行 / 手机卡片共用的字段节点）
+ * 原先定义在 App 内、仅日志页使用，一并迁入。日志过滤后的结果由 App 计算后传入。
  */
 export interface LogsPageProps {
   logs: AppLog[];
@@ -15,11 +15,9 @@ export interface LogsPageProps {
   setLogCategory: (c: "all" | "auth" | "api" | "operation") => void;
   actionLoading: string | null;
   onClearLogs: () => void;
-  streaming: boolean;
-  onRefreshLogs: () => void;
 }
 
-/** Stable row nodes preserve expanded details during incremental updates. */
+/** 单条日志在「表格行」与「手机卡片」两种布局下共用的字段节点 */
 function logRowParts(log: AppLog) {
   return {
     time: new Date(log.created_at).toLocaleString("zh-CN"),
@@ -39,27 +37,20 @@ function logRowParts(log: AppLog) {
       </Badge>
     ),
     details: log.details ? (
-      <details className="mt-2 text-content-muted text-xs">
-        <summary className="cursor-pointer hover:text-content-primary">查看详情</summary>
-        <pre className="mt-2 p-2.5 rounded bg-elevated text-content-muted text-[11px] md:text-xs font-mono max-h-40 overflow-auto whitespace-pre-wrap break-all">{log.details}</pre>
-      </details>
+      <pre className="mt-2 p-2.5 rounded bg-elevated text-content-muted text-[11px] md:text-xs font-mono max-h-40 overflow-auto whitespace-pre-wrap break-all">
+        {log.details}
+      </pre>
     ) : null,
   };
 }
 
 export function LogsPage(props: LogsPageProps) {
-  const { logs, loadingLogs, logCategory, setLogCategory, actionLoading, onClearLogs, streaming, onRefreshLogs } = props;
-  const rows = useMemo(() => [...logs].sort((a, b) => b.id - a.id), [logs]);
+  const { logs, loadingLogs, logCategory, setLogCategory, actionLoading, onClearLogs } = props;
 
   return (
     <div className="space-y-4 pt-5 md:pt-6">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex flex-wrap items-center gap-2">
-          <h2 className="text-base sm:text-lg font-bold text-content-primary">运行日志 (最近100条)</h2>
-          <Badge tone={streaming ? "ok" : "idle"}>{streaming ? "实时更新" : "空闲 · 自动刷新已停止"}</Badge>
-        </div>
-        <div className="flex items-center gap-2">
-        <button onClick={onRefreshLogs} disabled={loadingLogs} aria-label="刷新运行日志" className="p-2 rounded-lg text-content-muted hover:text-accent hover:bg-hovered disabled:opacity-50"><RefreshCw className={`w-4 h-4 ${loadingLogs ? "animate-spin" : ""}`} /></button>
+        <h2 className="text-base sm:text-lg font-bold text-content-primary">运行日志 (最近100条)</h2>
         <button
           onClick={onClearLogs}
           disabled={actionLoading === "clear-logs"}
@@ -67,7 +58,6 @@ export function LogsPage(props: LogsPageProps) {
         >
           清空运行日志
         </button>
-        </div>
       </div>
 
       {/* 日志分类子标签 */}
@@ -92,48 +82,75 @@ export function LogsPage(props: LogsPageProps) {
         ))}
       </div>
 
-      {loadingLogs && rows.length === 0 ? (
+      {loadingLogs ? (
         <div className="flex justify-center py-20">
           <RefreshCw className="w-6 h-6 animate-spin text-accent" />
         </div>
-      ) : rows.length === 0 ? (
+      ) : logs.length === 0 ? (
         <div className="text-center py-20 border border-dashed border-border-base rounded-xl bg-surface">
           <ScrollText className="w-12 h-12 text-content-muted mx-auto mb-3" />
           <p className="text-content-muted">该分类下暂无运行日志</p>
         </div>
       ) : (
-        <div role="log" aria-label="运行日志（最新在前）" aria-live="polite" aria-relevant="additions" tabIndex={0}
-          className="overflow-x-auto rounded-xl border border-border-base bg-surface scrollbar-thin">
-          <table aria-label="最近100条运行日志" className="w-full min-w-[720px] table-fixed text-left text-sm">
-            <thead className="bg-elevated text-xs text-content-muted">
-              <tr>
-                <th scope="col" className="w-44 px-4 py-4 font-medium">时间</th>
-                <th scope="col" className="w-28 px-4 py-4 font-medium">类型</th>
-                <th scope="col" className="w-32 px-4 py-4 font-medium">模块</th>
-                <th scope="col" className="px-4 py-4 font-medium">描述信息</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-border-soft text-content-secondary">
-            {rows.map((log) => {
+        <>
+          {/* ≥md：保持原有 4 列表格（固定列宽合计 416px + p-4 内边距，在手机上必然横向溢出） */}
+          <div className="hidden md:block bg-surface border border-border-base rounded-xl overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-sm border-collapse">
+                <thead>
+                  <tr className="bg-elevated text-content-muted text-xs border-b border-border-base">
+                    <th scope="col" className="p-4 w-44">时间</th>
+                    <th scope="col" className="p-4 w-28">类型</th>
+                    <th scope="col" className="p-4 w-32">模块</th>
+                    <th scope="col" className="p-4">描述信息</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-border-soft font-medium">
+                  {logs.map((log) => {
+                    const parts = logRowParts(log);
+                    return (
+                      <tr key={log.id} className="hover:bg-hovered transition-colors">
+                        <td className="p-4 text-xs text-content-muted font-mono">{parts.time}</td>
+                        <td className="p-4 text-xs">{parts.badge}</td>
+                        <td className="p-4 text-xs text-content-secondary font-semibold capitalize">
+                          {log.category}
+                        </td>
+                        <td className="p-4 text-content-secondary">
+                          <div>{log.message}</div>
+                          {parts.details}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {/* <md：每条日志一张卡片，字段纵向堆叠 */}
+          <div className="md:hidden space-y-2">
+            {logs.map((log) => {
               const parts = logRowParts(log);
               return (
-                <tr
+                <div
                   key={log.id}
-                  className="hover:bg-hovered transition-colors"
+                  className="bg-surface border border-border-base rounded-xl p-3 space-y-2"
                 >
-                  <td className="px-4 py-4 text-[11px] text-content-muted font-mono whitespace-nowrap">{parts.time}</td>
-                  <td className="px-4 py-4">{parts.badge}</td>
-                  <td className="px-4 py-4 font-semibold capitalize break-words">{log.category}</td>
-                  <td className="px-4 py-4 break-words">
-                    {log.message}
-                    {parts.details}
-                  </td>
-                </tr>
+                  <div className="flex items-center justify-between gap-2 text-xs">
+                    {parts.badge}
+                    <span className="text-content-muted font-mono truncate">{parts.time}</span>
+                  </div>
+                  <div className="text-sm text-content-secondary break-words">{log.message}</div>
+                  <div className="flex items-center gap-1.5 text-[11px] text-content-muted">
+                    <Server className="w-3 h-3 flex-shrink-0" />
+                    <span className="capitalize">{log.category}</span>
+                  </div>
+                  {parts.details}
+                </div>
               );
             })}
-            </tbody>
-          </table>
-        </div>
+          </div>
+        </>
       )}
     </div>
   );

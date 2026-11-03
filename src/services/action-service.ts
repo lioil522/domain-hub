@@ -1,5 +1,5 @@
 import { ActionRepository, type StoredAction } from "../repositories/action-repository";
-import { isActionType, isActionStatus } from "../actions/action-types";
+import { isActionType, type ActionType } from "../actions/action-types";
 
 export class ActionService {
   constructor(private readonly repository: ActionRepository) {}
@@ -13,11 +13,6 @@ export class ActionService {
   }
 
   async update(id: string, patch: Partial<StoredAction>): Promise<StoredAction> {
-    if (patch.status !== undefined && !isActionStatus(patch.status)) throw new Error("Invalid action status");
-    if (patch.progress !== undefined && (!Number.isFinite(patch.progress) || patch.progress < 0 || patch.progress > 100)) throw new Error("Progress must be between 0 and 100");
-    if (patch.status && !["running", "queued"].includes(patch.status)) {
-      patch = { ...patch, finished_at: new Date().toISOString() };
-    }
     await this.repository.update(id, patch);
     const action = await this.repository.get(id);
     if (!action) throw new Error(`Action ${id} not found`);
@@ -33,14 +28,6 @@ export class ActionService {
 
   async fail(id: string, error: string) {
     return this.update(id, { status: "failed", error, finished_at: new Date().toISOString() });
-  }
-
-  async settleSync(id: string, result: import("./sync-result").SyncSummary, metadata: object) {
-    return this.update(id, {
-      status: result.status, progress: result.status === "completed" ? 100 : 0,
-      error: result.status === "completed" ? null : result.accounts.flatMap(a => a.issues.map(i => `[账号 ${a.accountId}] ${i.message}`)).join("；"),
-      metadata: { ...metadata, result },
-    });
   }
 
   async cancel(id: string) {

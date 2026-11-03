@@ -1,6 +1,6 @@
 # 发布、迁移与回退手册
 
-更新：2026-11-04。此手册不授权任何真实写操作。当前 GitHub 发布准备包含已验证的 schema 自举优化与日志表格修正；只推送源码，不切换原生产服务。fork 用户按 [README](../README.md) 配置自己的资源后手动运行 main 工作流，无需输入提交 SHA、配置审批变量或 production 环境。
+更新：2026-11-04。此手册不授权任何真实写操作。GitHub 源码包含已验证的 schema 自举优化与日志表格修正，现按用户要求恢复原版部署方式（仅 Wrangler pin 保持 4.156.2）。fork 用户按 [README](../README.md) 配置 Secrets 后，可手动部署或 push main 自动部署，无需提交 SHA、审批变量或 production 环境。本次恢复推送使用 `[skip ci]`，不直接切换原生产服务；后续普通 main 推送将自动部署。
 
 历史依赖升级、原云端 D1/AES 配对备份及独立 staging 验证见[升级验收](dependency-upgrade-acceptance.md)、[前批交付](follow-up-all-acceptance.md)及[历史云端验收状态](cloud-staging-status-20261103.md)。这些不是新一轮云端检查：staging 最新前端修正由用户确认可用，但 Cloudflare `budget` 使完整后置核验停止；迁移结构/数据正确性已按授权标准通过，不声称免费计划 CPU 或大历史容量达标。
 
@@ -27,13 +27,13 @@
 3. 保存**最新数据库与原AES**恢复材料及其可用性验证，保留已有管理员/2FA/凭据/任务与用户新操作。运行服务期间不得复制单个SQLite主文件冒充一致备份；使用获批停写/备份流程并处理WAL。D1使用独立获批导出/恢复流程。
 4. 使用与生产完全隔离的staging Worker/D1或Node数据目录和测试凭据：验证增量schema/索引、原数据解密、JSON迁移预览/确认、ID冲突与审计回滚。**原数据本机恢复、解密、增量迁移与审计回滚已通过；独立云端staging通过授权测试Custom Domain完成小样本功能验收。实际CPU样本不等于大历史容量通过，仍不能代填生产审批**。
 5. 升级schema为增量，不删表/任务/AES。首次建立历史索引本身可能扫描深历史；先在staging测迁移时间和成本，不因 `IF NOT EXISTS` 就认定无开销。
-6. 手动选择 main 运行部署工作流；无需提交 SHA 或配置 production 环境。团队如需额外审批，可在自己的 fork 独立配置，不是本仓库部署前提。
-7. 必填Cloudflare Token、Account ID、**已有D1 UUID**；原Worker必须已有 `AES_KEY` 的secret_text元信息。元信息不能证明配对，须另验解密。不查库名猜身份、不自动创建D1/初始化schema、不轮换AES/可选Secret。
-8. 审查wrangler中Routes/Custom Domains、workers_dev/preview_urls及Cron。无自动域名探测/访问策略改写，Wrangler仍会应用已审批配置；`--keep-vars`不替代配置核查。`RELEASE_APP_URL`仅是摘要预期URL。
+6. 原版支持 main 自动推送部署和手动运行，不需要 SHA 或 production 环境。已有站点应自行安排部署窗口，避免意外 main 推送触发升级。
+7. 必填 Token 与 Account ID；D1 UUID、GitHub AES_KEY 可选。已有站点建议指定原 UUID，GitHub Key 若配置必须与原库配对；未配置时原版尝试保留 Worker Key，查不到则生成。查询失败不证明空站，自动流程不能替代配对/解密验证。
+8. 审查自己的 Routes/Custom Domains、workers_dev/preview_urls 和 Cron。原版自动检测域名并可能关闭默认入口；仍须保留正确的路由配置。摘要自动推导 URL，不再使用 `RELEASE_APP_URL`。
 
 ## 3. 获批后发布与验收
 
-工作流只接受 main 的 `workflow_dispatch`，依赖 verify/security 成功后检查配置的已有 D1 UUID 和 Worker AES Secret 元信息，再同源构建并发布。push 不会触发 Cloudflare 部署，concurrency 不取消在途发布；Wrangler pin 为 4.156.2。没有 SHA 输入、审批变量或 production 环境依赖；独立备份工作流仍是可选的恢复工具，不是部署前置步骤。默认模板使用部署者自己的 workers.dev 地址，不继承上游生产路由；已有站点应保留自己的配置与 Key。
+恢复后的原版流程为：安装依赖 → 指定或查找/创建 D1 → 检测域名 → 同源构建 → 部署 → 配置 AES 和可选 Secrets → 输出 URL。支持 main push 和手动触发，不依赖 verify/security 作业或 SHA/production 审批；独立 CI、镜像验证和可选备份工具保留。仓库模板不继承上游生产路由，已有站点须保留自己的配置与 Key。自动建库/生成 Key 是新站便利功能，不等于旧库身份、恢复可用性或云端性能验收通过。
 
 新空站的Worker/D1/schema/AES引导是独立流程；已有站点禁止“重新初始化”管理员或自动补一个新Key。生产前后端配套升级，Node须先停同库旧写入实例，不允许两个实例共享一库执行迁移。
 

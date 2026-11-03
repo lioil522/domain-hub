@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { assertManualDeployment, bindReleaseDatabase, assertSecretMetadata } from "../../scripts/release-contract.mjs";
 
-test("fork deployment requires manual main dispatch but no SHA approval inputs", () => {
+test("standalone manual preflight helper remains available without SHA approval inputs", () => {
   const valid = { GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_REF: "refs/heads/main" };
   assertManualDeployment(valid);
   for (const [key, value] of [["GITHUB_EVENT_NAME", "push"], ["GITHUB_EVENT_NAME", "pull_request"], ["GITHUB_REF", "refs/heads/test"], ["GITHUB_REF", "refs/tags/v2"]]) {
@@ -24,15 +24,18 @@ test("release D1 binding rejects missing, mismatched or ambiguous identity; AES 
   assertSecretMetadata([{ name: "AES_KEY", type: "secret_text" }]);
 });
 
-test("fork deployment retains verification and secret safety without environment or SHA gates", () => {
+test("restored original deployment supports main pushes, resource setup and secret synchronization", () => {
   const workflow = fs.readFileSync(".github/workflows/deploy.yml", "utf8");
-  assert.doesNotMatch(workflow, /\n\s+push:|secret put|secret bulk|openssl rand|D1_LIST|CREATE_RES/);
-  assert.match(workflow, /needs: \[verify, security\]/); assert.match(workflow, /workflow_dispatch:/);
+  assert.match(workflow, /push:\s+branches:\s+- main/); assert.match(workflow, /workflow_dispatch:/);
   assert.doesNotMatch(workflow, /approved_sha|RELEASE_APPROVED_SHA|environment:|inputs:/);
-  assert.match(workflow, /release-preflight\.mjs manual/); assert.match(workflow, /npm audit --json/);
-  assert.doesNotMatch(workflow, /curl |jq |sed -i|Auto Detect|CUSTOM_DOMAIN|SUBDOMAIN_JSON/);
-  assert.match(workflow, /vars.RELEASE_APP_URL/);
-  assert.ok(workflow.indexOf("secret list") < workflow.indexOf("Deploy Worker (API + Frontend Assets)"));
+  assert.doesNotMatch(workflow, /release-preflight|needs: \[verify, security\]/);
+  for (const step of ["Setup & Bind Cloudflare D1 Database", "Auto Detect Custom Domain & Configure Worker Routes", "Auto-Configure & Sync AES_KEY Secret", "Sync Optional Secrets to Worker (if set)"]) assert.ok(workflow.includes(step));
+  assert.match(workflow, /D1_LIST/); assert.match(workflow, /CREATE_RES/);
+  assert.match(workflow, /CUSTOM_DOMAIN/); assert.match(workflow, /SUBDOMAIN_JSON/);
+  assert.match(workflow, /secret put AES_KEY/); assert.match(workflow, /openssl rand -hex 32/);
+  assert.match(workflow, /env\.APP_URL/);
+  assert.ok(workflow.indexOf("Deploy Worker (API + Frontend Assets)") < workflow.indexOf("Auto-Configure & Sync AES_KEY Secret"));
+  assert.match(workflow, /wranglerVersion: '4\.156\.2'/);
   assert.match(workflow, /VITE_API_BASE_URL: \//);
 });
 

@@ -1,6 +1,6 @@
 # 代码优化实施进度与兼容说明
 
-> 2026-11-04：已验证 schema 自举优化与日志表格修正纳入 GitHub 发布准备，不直接部署生产。fork 手动 main 部署无需 SHA 输入或 production 环境，默认使用自己的 workers.dev；下文保留历史阶段结果，当前部署见 [README](../README.md)。
+> 2026-11-04：schema 自举优化与日志表格修正已纳入 GitHub 源码。用户随后要求恢复原版自动/手动部署方式；无 SHA/production 环境依赖，可自动处理 D1、域名与 Secrets。本次恢复推送跳过 Actions，不直接部署生产；下文保留历史阶段结果，当前部署见 [README](../README.md)。
 
 日期：2026-11-03。审阅基线：`56f5b11c026673e6eb30545813511a782f3a2ff7`。
 

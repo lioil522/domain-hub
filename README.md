@@ -658,8 +658,8 @@ Domain Hub 2.0 当前提供三条正式部署路径：
 A. Cloudflare Worker 手动部署
    本地电脑 → Wrangler → Cloudflare Worker + D1
 
-B. GitHub Actions 手动部署
-   Fork + 配置自己的资源/Secrets → 手动选择 main → 验证/审计 → Cloudflare Worker + D1
+B. GitHub Actions 自动/手动部署
+   Fork + 配置自己的 Secrets → push main 或 Run workflow → Cloudflare Worker + D1
 
 C. Docker / 自建部署
    GHCR 镜像 或 本地 Docker Build → Docker Compose → Node + SQLite
@@ -733,7 +733,7 @@ Theme / Contrast         PASS
 - Workers Static Assets
 - 全球边缘部署
 - 不维护服务器
-- GitHub 手动部署（无需填写提交 SHA，push 不触发 Cloudflare 部署）
+- GitHub 自动/手动部署（push main 自动部署，也可 Run workflow，无需提交 SHA）
 
 ### 选择 Docker，如果你需要
 
@@ -904,19 +904,20 @@ Worker: domain-hub
 
 | 类别 | 权限 | 范围 | 用途 |
 |---|---|---|---|
-| Account / Workers | Workers Scripts Edit（新权限模型可对应 Workers Editor） | `domain-hub` Worker 或账号 | 发布已有 Worker、读取 Secret 名称元信息，不轮换 Secret |
-| Account / D1 | D1 Read / Edit | 明确审批的数据库 | 仅独立数据库检查/初始化/迁移需要；发布工作流不创建或读写 D1 |
-| Zone | Workers Routes Write | 受影响的 Zone | 仅审批配置确需改变 Route/Custom Domain 时；无自动域名探测 |
+| Account / Workers | Workers Scripts Edit（新权限模型可对应 Workers Editor） | `domain-hub` Worker 或账号 | 发布 Worker、读取和同步 Secrets |
+| Account / D1 | D1 Read / Edit | 自己的数据库或账号 | 未配置 D1 UUID 时自动查询或创建 `domain-hub-db` |
+| Zone | Zone Read / Workers Routes Read | 自己的 Zone | 自动查询 Zone 与已有 Worker Routes |
+| Zone | Workers Routes Write | 受影响的 Zone | 仅配置确需改变 Route/Custom Domain 时 |
 
 Cloudflare 当前文档规定：部署已经存在的 Worker 至少需要 Worker Editor；如果部署过程还需要变更 Route 或 Custom Domain，则还需要受影响 Zone 的 `Workers Routes Write`。绑定 D1 时，部署 Worker 本身不需要额外的 D1 权限；D1 权限主要用于直接读取/写入数据库或创建数据库。[Cloudflare Workers 权限模型](https://developers.cloudflare.com/workers/authorization/workers/)；[Cloudflare API Token 权限](https://developers.cloudflare.com/fundamentals/api/reference/permissions/)
 
-### 关于 D1：仅明确 UUID 绑定
+### 关于 D1：可选 UUID，或自动查找/创建
 
-`CLOUDFLARE_D1_DATABASE_ID` 必填，必须是已有数据库 UUID。缺失、格式错误、多个绑定或与已填配置不同立即停止；不查询名称猜库、不自动创建、不自动初始化 schema。新站初始化/已有库增量迁移必须单独授权，CI 发布可不授予 `D1 Edit`。
+原版工作流优先使用 `CLOUDFLARE_D1_DATABASE_ID`；未配置时按名称查询 `domain-hub-db`，未找到则尝试创建，因此自动模式需要 D1 编辑权限。已有站点建议明确填入原 UUID，避免误用其他同名库。流水线只绑定数据库，空库由应用首次 API 请求自动补齐 schema。
 
 ### 关于 Zone / Workers Routes 权限
 
-仓库模板默认 `workers_dev = true`，不包含上游站点的 Route 或 Zone，fork 后使用自己的 workers.dev 地址。Route/Custom Domain 和公开访问策略由部署者在配置中明确；已有站点升级须保留自己的配置，Wrangler 会应用该配置，不能假设保留云端手工配置。没有自动探测或据此改写访问策略的逻辑。摘要可显示仓库变量 `RELEASE_APP_URL`，不是健康验收；未设置时到 Cloudflare Dashboard 查看地址。若配置 Route，按官方规则准备对应 Zone 写权限。[Cloudflare Workers 角色与权限](https://developers.cloudflare.com/workers/authorization/workers/)
+仓库模板不包含上游站点的 Route 或 Zone，默认使用自己的 workers.dev 地址。原版工作流会查询 Custom Domains 和 Worker Routes；检测到自定义域名时关闭 workers.dev/预览入口，并在摘要中输出该域名，否则查询 workers.dev 子域并输出默认地址。已有站点仍须保留自己的路由配置，Wrangler 会应用仓库配置，不能假设保留所有云端手工配置。域名检测失败不等于不存在绑定；需要时检查权限和 Dashboard。[Cloudflare Workers 角色与权限](https://developers.cloudflare.com/workers/authorization/workers/)
 
 ### 第一次创建 Worker 的权限
 
@@ -935,11 +936,11 @@ Workers & Pages
 → domain-hub
 ```
 
-创建后，在 Worker 的 Settings → Variables and Secrets 添加 **Secret 类型**的 `AES_KEY`，使用足够长的随机字符串并安全保存；CI Token 使用较小权限即可。首次新站只生成一次，已有站点必须保留与原数据库配对的 Key。还需在自己的账号创建 D1 数据库并记录 UUID。
+创建后，CI Token 使用较小的 Worker 权限即可。D1 和 AES_KEY 可预先配置，也可由下文的原版工作流自动处理；已有站点必须保留原数据库 UUID 和配对 Key。
 
-#### 方案 B：独立新站引导
+#### 方案 B：首次由工作流创建
 
-自行通过 Dashboard 或本地 Wrangler 创建 Worker/D1、设置并离线保管 AES。发布工作流要求目标 Worker 已有 AES 元信息，不代办资源创建。空库在应用首次 API 请求时自动补齐 schema，首次打开网页由用户设置管理员；已有站点不得按新站步骤覆盖数据库或 Key。
+Token 具备新 Worker 创建权限及 D1 编辑权限时，可直接运行工作流：自动处理 D1、部署 Worker、配置 AES。空库在首次 API 请求时自动补齐 schema，首次打开网页由用户设置管理员。已有站点不得按新站步骤覆盖原库或 Key。
 
 > 推荐方案 A。这样可以避免长期 CI Token 持有创建/删除所有 Worker 的权限。
 
@@ -991,7 +992,7 @@ Invoke-RestMethod `
 
 ---
 
-## 方案 B：Fork 后通过 GitHub Actions 手动部署到 Cloudflare
+## 方案 B：Fork 后通过原版 GitHub Actions 部署到 Cloudflare
 
 仓库已经提供：
 
@@ -999,26 +1000,26 @@ Invoke-RestMethod `
 .github/workflows/deploy.yml
 ```
 
-**仅手动运行，不监听 push**：
+**push 到 main 自动部署，也支持手动运行**：
 
 ```text
 GitHub → Actions → Deploy to Cloudflare → Run workflow
 ```
 
-Fork 后先在 Actions 页面启用工作流，配置下文的三个仓库 Secrets，并创建自己的 Worker/D1、设置 Worker 的 `AES_KEY`。选择 `main` 后直接点击 **Run workflow**，无需填写提交 SHA，也不依赖 production 环境或审批变量。工作流仍限制手动 main 部署；提交或 push 不会触发 Cloudflare 上线。
+Fork 后先在 Actions 页面启用工作流，配置 `CLOUDFLARE_API_TOKEN` 和 `CLOUDFLARE_ACCOUNT_ID`。D1 UUID、AES_KEY 与其他 Secrets 可选；首次部署可自动查找/创建 D1、生成 AES。点击 **Run workflow** 或推送 main 即可，无需提交 SHA 或 production 环境。工作流恢复原版逻辑，Wrangler 使用当前依赖匹配的 4.156.2。
 
 ### Workflow 实际执行顺序
 
 ```text
-完整 verify + 两棵依赖树 npm audit（失败关闭，保留报告）
-  → 确认手动 main 部署
-  → Node 22 / npm ci → 明确已有 D1 UUID 绑定
-  → 发布前 AES_KEY 名称/类型元信息检查（不读 Key 值）
-  → 同源前端构建 → wrangler deploy --keep-vars
-  → 输出管理员配置的预期 URL → 独立健康/解密/容量验收
+Node 22 / npm ci
+  → 使用指定 D1 UUID，或按名称查询/创建 D1
+  → 检测自定义域名/Routes，配置入口并推导访问地址
+  → VITE_API_BASE_URL=/ 同源前端构建 → 部署 Worker 与静态资源
+  → 同步 GitHub AES_KEY；否则保留 Worker Key 或首次生成
+  → 同步已配置的可选 Secrets → 输出访问地址
 ```
 
-流水线不生成/写回/轮换 AES，也不同步可选 Secret。不创建 D1、不初始化 schema、不探测域名改写访问策略。AES 名称存在仅证明元信息，**不能证明与数据库配对或解密成功**；这些须在独立 staging 和备份检查中确认。
+恢复后的部署工作流不再依赖 verify/security 作业；独立 CI 和镜像工作流仍保留验证。**原版自动处理逻辑不是配对备份或数据安全验收**：已有站点应设置正确的原 D1 UUID，并确保 GitHub AES_KEY 与原 Worker Key 相同；不要更换 Key 或把查询失败当作新空站。自动 Key 写回 GitHub 是尽力而为，不能保证成功，部署后应自行安全保管。
 
 ---
 
@@ -1068,11 +1069,11 @@ Cloudflare Dashboard
 → Account ID
 ```
 
-### 必填数据库身份
+### 可选数据库身份
 
 #### `CLOUDFLARE_D1_DATABASE_ID`
 
-填入你自己创建或已确认的现有数据库 UUID：
+已有站点建议填入原数据库 UUID；新站可留空以自动查询/创建：
 
 ```text
 xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
@@ -1080,14 +1081,14 @@ xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 
 这样 CI 不需要创建 D1，Token 可以进一步收权。
 
-### Worker 已有 `AES_KEY`（不从 GitHub 同步）
+### 可选 `AES_KEY`（GitHub Secret）
 
-升级使用原 Worker Secret，并在受控存储保管与数据库配对的恢复材料。元信息检查失败就停止，不将查询失败当作缺失，也不自动补 Key。GitHub 里已有 `AES_KEY` 不会覆盖 Worker；真实跨密钥迁移见 [迁移手册](docs/release-and-migration.md)。
+配置 GitHub `AES_KEY` 时，工作流会将其同步到 Worker。未配置时先检查 Worker 已有 Key，存在则保留，否则生成随机 Key 并尝试写回 GitHub。已有站点若填写 GitHub Key，必须与原数据库配对，不能填写新的随机值；真实跨密钥迁移见 [迁移手册](docs/release-and-migration.md)。
 
-### 可选仓库变量
+### 访问地址与审批
 
-- `RELEASE_APP_URL`：可选的预期访问 URL，仅用于摘要；不要含 Token/密码。
-- 在 Settings → Secrets and variables → Actions → Variables 配置；不需要创建 production 环境或提交 SHA 审批变量。
+- 工作流自动检测访问地址，`RELEASE_APP_URL` 不再使用。
+- 不需要 production 环境或提交 SHA 审批变量。
 
 ### 可选 Secret
 
@@ -1097,7 +1098,7 @@ xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 | `WEBHOOK_URL` | 全局 Webhook URL |
 | `ALLOWED_ORIGIN` | 前后端分离部署时的 CORS 白名单 |
 
-可选 Secret 在独立授权配置中管理，**当前工作流不自动同步**。`ALLOWED_ORIGIN` 在同源部署中通常不需要。
+已配置的可选 Secrets 会由原版工作流同步到 Worker；未配置则不写入。`ALLOWED_ORIGIN` 在同源部署中通常不需要。
 
 ---
 
@@ -1108,26 +1109,24 @@ xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 ```text
 CLOUDFLARE_API_TOKEN
 CLOUDFLARE_ACCOUNT_ID
-CLOUDFLARE_D1_DATABASE_ID
 ```
 
-这是最适合长期生产运行的组合：
+仅两项可用于有相应创建权限的新站自动部署。已有站点推荐额外配置：
 
 ```text
-D1 已提前创建
-CI Token 不需要 D1 Create
-AES_KEY 固定且可恢复
+CLOUDFLARE_D1_DATABASE_ID（原库 UUID）
+AES_KEY（仅使用原库配对 Key，或依赖 Worker 已有 Key）
 ```
 
-没有“一键创建 D1”组合；不填 D1 UUID 就停止。另须提前在目标 Worker 配置 Secret 类型的 `AES_KEY`，无需提交 SHA 或环境审批配置。
+自动创建 D1 需要对应权限；无需提交 SHA 或环境审批配置。不要将自动部署视为已验证旧库/Key 配对。
 
 ---
 
 ## GitHub Actions 首次工作流部署
 
-### 第 1 步：Fork、启用 Actions 并准备自己的 Worker/D1
+### 第 1 步：Fork 并启用 Actions
 
-Fork 仓库后到 Actions 启用工作流。新站先在 Cloudflare Dashboard 创建 Worker `domain-hub` 和 D1，给 Worker 添加 Secret 类型的 `AES_KEY` 并妥善保管。默认模板使用自己的 workers.dev 地址（账号需已设置 workers.dev 子域），无需修改上游域名；若修改 Worker 名称，需同时修改 `wrangler.toml` 的 `name`。空库由应用首次请求自动建表，无需先运行 `schema.sql`。
+Fork 仓库后到 Actions 启用工作流。默认目标 Worker 为 `domain-hub`，模板没有上游域名；账号需已设置 workers.dev 子域才能通过默认地址访问。新站可自动部署，无需先运行 `schema.sql`。原版域名查询与摘要以 `domain-hub` 为目标，若改 Worker 名称须同时修改工作流与 `wrangler.toml`。
 
 已有站点复用原 Worker/数据库/AES，保留自己的路由和访问策略；建议先备份与验证增量迁移，不要按新站步骤重置管理员或 Key。
 
@@ -1139,7 +1138,7 @@ Fork 仓库后到 Actions 启用工作流。新站先在 Cloudflare Dashboard �
 Workers Scripts Edit / Workers Editor
 ```
 
-不授权 CI 创建 D1；Route 变更权限只按审批配置给定。
+自动模式另需 D1 编辑权限；检测域名需要对应查询权限，新 Worker 需要创建权限。Route 变更权限按自己的配置准备。
 
 ### 第 3 步：把 Token 放进 GitHub Secret
 
@@ -1153,15 +1152,15 @@ CLOUDFLARE_API_TOKEN
 CLOUDFLARE_ACCOUNT_ID
 ```
 
-### 第 5 步：配置 D1 ID
+### 第 5 步：可选配置 D1 ID
 
 ```text
 CLOUDFLARE_D1_DATABASE_ID
 ```
 
-### 第 6 步：确认 Worker 已有 AES_KEY
+### 第 6 步：可选配置 AES_KEY
 
-Worker 的 `AES_KEY` 必须是 Secret 类型；已有站点使用与当前库配对的原 Key。可设置仓库变量 `RELEASE_APP_URL`，但不是必填；依赖审计未通过仍会停止部署。
+新站可不填，由工作流生成；已有站点保留原 Worker Key，或在 GitHub 中填写同一个 Key，不得用新值覆盖。
 
 ### 第 7 步：执行 Workflow
 
@@ -1172,7 +1171,7 @@ GitHub
 → Run workflow
 ```
 
-选择 `main`，直接运行，等待验证与安全检查，无需填写提交 SHA。提交或 push 不触发 Cloudflare 部署。
+选择 `main`，直接运行，无需填写提交 SHA；之后 push main 也会自动部署。
 
 ### 第 8 步：检查日志
 
@@ -1181,20 +1180,22 @@ GitHub
 ```text
 Install Dependencies
         ↓
-Verify manual main deployment / Bind configured D1
+Setup & Bind Cloudflare D1 Database
         ↓
-Check existing AES secret metadata
+Auto Detect Custom Domain & Configure Worker Routes
         ↓
 Build Frontend
         ↓
 Deploy Worker
+        ↓
+Auto-Configure & Sync AES_KEY / Sync Optional Secrets
         ↓
 Summarize Access URL
 ```
 
 ### 第 9 步：打开访问地址
 
-若设置 `RELEASE_APP_URL`，Workflow 输出该预期地址；未设置时在 Cloudflare Dashboard → Workers & Pages → 对应 Worker 查看实际地址，例如：
+Workflow 自动输出检测到的域名或 workers.dev 地址；未检测到时在 Cloudflare Dashboard → Workers & Pages → 对应 Worker 查看实际地址，例如：
 
 ```text
 ### 访问地址
@@ -2069,15 +2070,15 @@ docker compose up -d
 ```text
 [ ] GitHub 仓库已准备
 [ ] Cloudflare Account ID 已确认
-[ ] Worker domain-hub 已创建（推荐首次手动创建）
-[ ] D1 domain-hub-db 已创建
-[ ] D1 Database ID 已记录
+[ ] Worker domain-hub 已创建，或 Token 具有首次创建权限
+[ ] D1 已准备，或 Token 具有自动查询/创建权限
+[ ] 已有站点的原 D1 Database ID 已记录
 [ ] Cloudflare API Token 已创建
 [ ] Token 使用最小权限
 [ ] CLOUDFLARE_API_TOKEN 已加入 GitHub Secrets
 [ ] CLOUDFLARE_ACCOUNT_ID 已加入 GitHub Secrets
-[ ] CLOUDFLARE_D1_DATABASE_ID 已加入 GitHub Secrets
-[ ] Worker 原 AES_KEY 已与最新库配对并安全备份（不从 GitHub 同步）
+[ ] CLOUDFLARE_D1_DATABASE_ID（可选；已有站点推荐配置原 UUID）
+[ ] AES_KEY（可选；已有站点必须与原库配对，新站可自动生成）
 [ ] ADMIN_TOKEN（可选）
 [ ] WEBHOOK_URL（可选）
 [ ] ALLOWED_ORIGIN（通常为空）
@@ -2085,10 +2086,10 @@ docker compose up -d
 [ ] 根/frontend npm audit 均通过（本轮独立副本双树0漏洞；发布时仍须重新审计）
 [ ] 已有站点升级前建议完成备份与迁移验证；新站保管好 AES_KEY
 [ ] fork 仓库 Actions 已启用；配置自己的 workers.dev/域名，不沿用上游路由
-[ ] 选择 main 手动运行 Workflow（无需提交 SHA 或 production 环境）
+[ ] 手动运行 Workflow 或 push main（无需提交 SHA 或 production 环境）
 [ ] Workflow Build Frontend 通过
 [ ] Workflow Deploy Worker 通过
-[ ] 发布前 AES 元信息检查通过；不轮换 Key
+[ ] AES 同步/保留/首次生成完成；原库配对 Key 不变且已保管
 [ ] Actions Summary 出现访问地址
 [ ] 浏览器能打开首页
 [ ] 新空站初始化成功；已有站点保留原管理员/2FA/凭据

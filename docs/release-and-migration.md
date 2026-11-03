@@ -1,6 +1,8 @@
 # 发布、迁移与回退手册
 
-更新：2026-11-03。此手册不授权任何真实写操作。依赖已获授权升级，两树审计0漏洞、Node22/24完整复验通过，见[升级验收](dependency-upgrade-acceptance.md)及[前批交付](follow-up-all-acceptance.md)。后续已另获授权完成原云端D1/AES成对备份及独立云端staging部署；workers.dev仍返回1101，但用户接入的独立测试Custom Domain已完成合成数据小样本功能验收及实际CPU采样，见[当前云端验收状态](cloud-staging-status-20261103.md)。大历史容量与生产审批等前置条件仍未满足；代码、离线测试或部署成功不等于生产可发布，原服务未切换。
+更新：2026-11-04。此手册不授权任何真实写操作。当前 GitHub 发布准备包含已验证的 schema 自举优化与日志表格修正；只推送源码，不切换原生产服务。fork 用户按 [README](../README.md) 配置自己的资源后手动运行 main 工作流，无需输入提交 SHA、配置审批变量或 production 环境。
+
+历史依赖升级、原云端 D1/AES 配对备份及独立 staging 验证见[升级验收](dependency-upgrade-acceptance.md)、[前批交付](follow-up-all-acceptance.md)及[历史云端验收状态](cloud-staging-status-20261103.md)。这些不是新一轮云端检查：staging 最新前端修正由用户确认可用，但 Cloudflare `budget` 使完整后置核验停止；迁移结构/数据正确性已按授权标准通过，不声称免费计划 CPU 或大历史容量达标。
 
 ## 1. 业务 JSON 迁移
 
@@ -16,20 +18,22 @@
 
 接口：`POST /api/data/preview`、`POST /api/data/import`，请求 `{ token, snapshot, sourceAesKey? }`；认证使用现有管理员通道，不在URL传Key。预览diff允许新增，更新/删除/冲突均为0；无法验证的冲突返回失败，不以预览成功掩盖。
 
-## 2. 发布前审批清单
+## 2. 已有站点升级建议与安全边界
+
+以下备份/staging 建议供已有数据的部署者安排，不是 fork 工作流的 SHA 或环境审批门禁。空站不需要原站点的备份或测试数据。
 
 1. 独立授权具体目标、变更、停写窗口和回退责任人；保存完整main SHA、代码/依赖锁/产物哈希。不得夹带未知用户改动。
 2. 在独立副本跑 `npm ci`（需另行允许安装）、`npm run verify:all`、Node构建、前端类型、独立13项浏览器和规模helper类型。根/frontend分别 `npm audit` 并保留JSON；任一审计失败停止，不用强制修复或降级门禁。
 3. 保存**最新数据库与原AES**恢复材料及其可用性验证，保留已有管理员/2FA/凭据/任务与用户新操作。运行服务期间不得复制单个SQLite主文件冒充一致备份；使用获批停写/备份流程并处理WAL。D1使用独立获批导出/恢复流程。
 4. 使用与生产完全隔离的staging Worker/D1或Node数据目录和测试凭据：验证增量schema/索引、原数据解密、JSON迁移预览/确认、ID冲突与审计回滚。**原数据本机恢复、解密、增量迁移与审计回滚已通过；独立云端staging通过授权测试Custom Domain完成小样本功能验收。实际CPU样本不等于大历史容量通过，仍不能代填生产审批**。
 5. 升级schema为增量，不删表/任务/AES。首次建立历史索引本身可能扫描深历史；先在staging测迁移时间和成本，不因 `IF NOT EXISTS` 就认定无开销。
-6. 仓库管理员配置 `production` Required reviewers、main限制、建议禁止自行审批/绕过审批；填 `RELEASE_APPROVED_SHA`。YAML `environment: production` 不自动配置保护规则。
+6. 手动选择 main 运行部署工作流；无需提交 SHA 或配置 production 环境。团队如需额外审批，可在自己的 fork 独立配置，不是本仓库部署前提。
 7. 必填Cloudflare Token、Account ID、**已有D1 UUID**；原Worker必须已有 `AES_KEY` 的secret_text元信息。元信息不能证明配对，须另验解密。不查库名猜身份、不自动创建D1/初始化schema、不轮换AES/可选Secret。
 8. 审查wrangler中Routes/Custom Domains、workers_dev/preview_urls及Cron。无自动域名探测/访问策略改写，Wrangler仍会应用已审批配置；`--keep-vars`不替代配置核查。`RELEASE_APP_URL`仅是摘要预期URL。
 
 ## 3. 获批后发布与验收
 
-工作流只接受 `workflow_dispatch` 的main及完整 `approved_sha`；三处SHA必须相等，依赖verify/security成功后才进入production审批和发布。push不会生产部署，concurrency不取消在途发布。Wrangler pin已对齐4.156.2；此前生产工作流的verify/security成功，但因 `RELEASE_APPROVED_SHA` 缺失停在审批，未部署。补齐staging等前置条件后才可配置审批；发布时须刷新审计，**不要绕开门禁直接执行wrangler或Docker发布**。
+工作流只接受 main 的 `workflow_dispatch`，依赖 verify/security 成功后检查配置的已有 D1 UUID 和 Worker AES Secret 元信息，再同源构建并发布。push 不会触发 Cloudflare 部署，concurrency 不取消在途发布；Wrangler pin 为 4.156.2。没有 SHA 输入、审批变量或 production 环境依赖；独立备份工作流仍是可选的恢复工具，不是部署前置步骤。默认模板使用部署者自己的 workers.dev 地址，不继承上游生产路由；已有站点应保留自己的配置与 Key。
 
 新空站的Worker/D1/schema/AES引导是独立流程；已有站点禁止“重新初始化”管理员或自动补一个新Key。生产前后端配套升级，Node须先停同库旧写入实例，不允许两个实例共享一库执行迁移。
 

@@ -3,13 +3,13 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import fs from "node:fs";
 import path from "node:path";
-import { assertReleaseApproval, bindReleaseDatabase, assertSecretMetadata } from "../../scripts/release-contract.mjs";
+import { assertManualDeployment, bindReleaseDatabase, assertSecretMetadata } from "../../scripts/release-contract.mjs";
 
-test("release gates require exact manually approved main SHA", () => {
-  const valid = { GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_REF: "refs/heads/main", GITHUB_SHA: "a".repeat(40), APPROVED_SHA: "a".repeat(40), RELEASE_APPROVED_SHA: "a".repeat(40) };
-  assertReleaseApproval(valid);
-  for (const [key, value] of [["GITHUB_EVENT_NAME", "push"], ["GITHUB_REF", "refs/heads/test"], ["APPROVED_SHA", "b".repeat(40)], ["RELEASE_APPROVED_SHA", ""], ["GITHUB_SHA", "short"]]) {
-    assert.throws(() => assertReleaseApproval({ ...valid, [key]: value }));
+test("fork deployment requires manual main dispatch but no SHA approval inputs", () => {
+  const valid = { GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_REF: "refs/heads/main" };
+  assertManualDeployment(valid);
+  for (const [key, value] of [["GITHUB_EVENT_NAME", "push"], ["GITHUB_EVENT_NAME", "pull_request"], ["GITHUB_REF", "refs/heads/test"], ["GITHUB_REF", "refs/tags/v2"]]) {
+    assert.throws(() => assertManualDeployment({ ...valid, [key]: value }));
   }
 });
 
@@ -24,14 +24,24 @@ test("release D1 binding rejects missing, mismatched or ambiguous identity; AES 
   assertSecretMetadata([{ name: "AES_KEY", type: "secret_text" }]);
 });
 
-test("deployment has security and approval gates, no auto D1 creation or AES/optional secret rotation", () => {
+test("fork deployment retains verification and secret safety without environment or SHA gates", () => {
   const workflow = fs.readFileSync(".github/workflows/deploy.yml", "utf8");
   assert.doesNotMatch(workflow, /\n\s+push:|secret put|secret bulk|openssl rand|D1_LIST|CREATE_RES/);
-  assert.match(workflow, /needs: \[verify, security\]/); assert.match(workflow, /environment: production/);
-  assert.match(workflow, /RELEASE_APPROVED_SHA/); assert.match(workflow, /npm audit --json/);
+  assert.match(workflow, /needs: \[verify, security\]/); assert.match(workflow, /workflow_dispatch:/);
+  assert.doesNotMatch(workflow, /approved_sha|RELEASE_APPROVED_SHA|environment:|inputs:/);
+  assert.match(workflow, /release-preflight\.mjs manual/); assert.match(workflow, /npm audit --json/);
   assert.doesNotMatch(workflow, /curl |jq |sed -i|Auto Detect|CUSTOM_DOMAIN|SUBDOMAIN_JSON/);
   assert.match(workflow, /vars.RELEASE_APP_URL/);
   assert.ok(workflow.indexOf("secret list") < workflow.indexOf("Deploy Worker (API + Frontend Assets)"));
+  assert.match(workflow, /VITE_API_BASE_URL: \//);
+});
+
+test("fork template uses workers.dev without inheriting an upstream production domain", () => {
+  const config = fs.readFileSync("wrangler.toml", "utf8");
+  assert.match(config, /^workers_dev = true$/m);
+  assert.doesNotMatch(config, /\[\[routes\]\]|licacv\.com|zone_id\s*=/);
+  assert.match(config, /run_worker_first = \["\/api\/\*"\]/);
+  assert.match(config, /database_id = "change_me_to_your_d1_db_id"/);
 });
 
 test("route layer has no direct concrete provider imports", () => {

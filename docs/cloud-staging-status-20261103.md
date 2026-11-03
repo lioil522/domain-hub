@@ -1,5 +1,7 @@
 # 2026-11-03 云端发布前状态（小样本功能验收通过，生产仍阻断）
 
+> 本文保留 2026-11-03 的历史状态，不是当前部署配置。2026-11-04 用户授权只推送源码供 fork 部署：工作流不再要求 SHA 输入或 production 环境，模板不再包含原生产 Route；没有因此部署或改动线上路由。最新步骤见 [README](../README.md) 与 [发布手册](release-and-migration.md)。
+
 这是状态记录，不是发布授权或通过收据。生产站仍是 `https://domain.licacv.com`，本轮未部署生产、未触碰原本地服务，也未执行真实服务商操作。
 
 ## 已验证
@@ -32,7 +34,7 @@
 - 原验收脚本在成功导入和解密后的收尾阶段使用了D1不支持的`PRAGMA integrity_check`，API返回400 / `7500`，原失败收据保留。按[官方D1 SQL文档](https://developers.cloudflare.com/d1/sql-api/sql-statements/)改用受支持的`PRAGMA quick_check`；只读后续检查返回`ok`，`foreign_key_check`无违规，20表/零sync任务/账号21高水位/域名778/解密及资源保全均复核，未重放导入。前段与只读收尾合计99项检查通过；这不是对完整远端`integrity_check`的通过声明。受限本机证据：`remote-acceptance-NGd3rU`（原失败）、`readonly-finalization-GNBxTT`（收尾通过）、`custom-host-inspect-iFQnLo`和`disable-previews-4i05Sy`。业务及健康检查通过不代表生产发布门禁已满足。
 - 有效受限诊断Token的staging精确服务过滤、`dry: true`查询现在获得23个真实事件；其中本次合成数据样本Workers Logs CPU：成功登录40ms、成功导入17ms、强制失败导入14ms、成功预览8ms/10ms、auth/status 13ms/20ms。新GraphQL样本也可用，返回的staging执行错误及出站subrequests计数为0；预期业务拒绝400/401不是未捕获执行异常。这些仅是小样本测量，不是压测、SLO/额度保证或大历史容量证据；未把网络耗时、D1耗时或统计字段单位混作CPU。受限本机证据：`logquery-w1ULwm`、`metrics-3gOq3m`；没有输出Token、密码、密文、请求头或请求正文。
 
-## 必须继续保持的阻断
+## 当时的生产阻断（历史记录）
 
 1. 小样本云端功能及实际CPU已验证，但大历史/目标负载容量仍未证明；保留workers.dev的1101证据，不把Custom Domain正常或单次低CPU当作完整容量/平台根因结论。
 2. 所有生产配置变更须重新验证并以新的精确main SHA审核；不要用旧SHA批准新配置。

@@ -257,7 +257,7 @@ test("production HTTP counts cold schema before auth and caches readiness by raw
   const cold = new InvocationBudget();
   const response = await runHttpInvocation(new Request("https://fixture.invalid/api/accounts"), { DB: raw }, context, cold);
   assert.equal(response.status, 401);
-  assert.equal(cold.snapshot().used.d1, 5, "base batch + 3 column reads + additive task batch");
+  assert.equal(cold.snapshot().used.d1, 2, "schema inspection batch + atomic migration batch");
   const warm = new InvocationBudget();
   assert.equal((await runHttpInvocation(new Request("https://fixture.invalid/api/accounts"), { DB: raw }, context, warm)).status, 401);
   assert.equal(warm.snapshot().used.d1, 0, "a request wrapper must not re-run migrations");
@@ -274,7 +274,7 @@ test("production HTTP schema exhaustion fails closed and a new invocation retrie
   assert.equal(budget.snapshot().used.d1, 1);
   const retry = new InvocationBudget();
   assert.equal((await runHttpInvocation(new Request("https://fixture.invalid/api/accounts"), { DB: raw }, context, retry)).status, 401);
-  assert.equal(retry.snapshot().used.d1, 5);
+  assert.equal(retry.snapshot().used.d1, 2);
 });
 
 test("production scheduled/Node shared pipeline accounts bootstrap, settings, candidates and logs", async t => {

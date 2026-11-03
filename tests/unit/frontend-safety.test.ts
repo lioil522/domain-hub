@@ -483,10 +483,35 @@ test("local operation events exclude passive reads/plan polling and contain no r
   assert.equal(events[0].actionsChanged, false); assert.deepEqual(Object.keys(events[0]).sort(), ["actionsChanged", "id", "phase", "session"]);
 });
 
-test("waterfall renders chronologically without a table or hiding rows during refresh", () => {
-  const html = renderToString(createElement(LogsPage, { logs: [feedRow(2), feedRow(1)], loadingLogs: true, logCategory: "all", setLogCategory: () => {}, actionLoading: null, onClearLogs: () => {}, streaming: true, onRefreshLogs: () => {} }));
-  assert.match(html, /role="log"/); assert.match(html, /实时追加/); assert.equal(html.includes("<table"), false);
-  assert.ok(html.indexOf("feed-row-1") < html.indexOf("feed-row-2"));
+test("logs table shows newest IDs first and keeps existing rows visible during refresh", () => {
+  const logs = [feedRow(2), feedRow(1), feedRow(3)];
+  const html = renderToString(createElement(LogsPage, { logs, loadingLogs: true, logCategory: "all", setLogCategory: () => {}, actionLoading: null, onClearLogs: () => {}, streaming: true, onRefreshLogs: () => {} }));
+  assert.match(html, /role="log"/); assert.match(html, /实时更新/); assert.match(html, /<table/);
+  for (const header of ["时间", "类型", "模块", "描述信息"]) assert.match(html, new RegExp(`<th[^>]*scope="col"[^>]*>${header}</th>`));
+  assert.equal((html.match(/<td\b/g) ?? []).length, 12);
+  assert.ok(html.indexOf("feed-row-3") < html.indexOf("feed-row-2") && html.indexOf("feed-row-2") < html.indexOf("feed-row-1"));
+  assert.deepEqual(logs.map(row => row.id), [2, 1, 3], "display sorting must not mutate feed state");
+  assert.match(html, /overflow-x-auto/); assert.doesNotMatch(html, /<ol|<li\b|max-h-\[68vh\]|跟随最新日志/);
+  assert.match(html.match(/<button[^>]*aria-label="刷新运行日志"[^>]*>/)?.[0] ?? "", /disabled=""/);
+});
+
+test("logs table preserves expandable escaped details, semantic levels and idle refresh controls", () => {
+  const logs = ["info", "success", "warning", "error"].map((type, index) => ({ ...feedRow(index + 1), type, details: '<script>unsafe()</script>' }));
+  const html = renderToString(createElement(LogsPage, { logs, loadingLogs: false, logCategory: "all", setLogCategory: () => {}, actionLoading: "clear-logs", onClearLogs: () => {}, streaming: false, onRefreshLogs: () => {} }));
+  assert.equal((html.match(/<details\b/g) ?? []).length, 4);
+  assert.match(html, /&lt;script&gt;unsafe\(\)&lt;\/script&gt;/); assert.doesNotMatch(html, /<script>/);
+  for (const tone of ["idle", "ok", "warn", "danger"]) assert.match(html, new RegExp(`bg-state-${tone}-bg`));
+  assert.match(html, /空闲 · 自动刷新已停止/);
+  assert.doesNotMatch(html.match(/<button[^>]*aria-label="刷新运行日志"[^>]*>/)?.[0] ?? "", /disabled=""/);
+  assert.match(html, /disabled=""[^>]*>清空运行日志<\/button>/);
+});
+
+test("logs table retains initial loading and empty-category states", () => {
+  const props = { logs: [], logCategory: "auth" as const, setLogCategory: () => {}, actionLoading: null, onClearLogs: () => {}, streaming: false, onRefreshLogs: () => {} };
+  const loading = renderToString(createElement(LogsPage, { ...props, loadingLogs: true }));
+  assert.match(loading, /animate-spin/); assert.doesNotMatch(loading, /<table|该分类下暂无运行日志/);
+  const empty = renderToString(createElement(LogsPage, { ...props, loadingLogs: false }));
+  assert.match(empty, /该分类下暂无运行日志/); assert.doesNotMatch(empty, /<table/);
 });
 
 for (const status of ["completed", "partial", "failed", "cancelled"] as const) {

@@ -1,12 +1,12 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { ScrollText, LogIn, Server, Activity, RefreshCw, ArrowDown } from "lucide-react";
+import { useMemo } from "react";
+import { ScrollText, LogIn, Server, Activity, RefreshCw } from "lucide-react";
 import { Badge } from "../../../components/Badge";
 import type { AppLog } from "../../../types/log";
 
 /**
  * LogsPage —— 运行日志标签页
  *
- * 最近 100 条按时间线追加；活动期间增量更新，空闲停止轮询。
+ * 最近 100 条以表格倒序显示；活动期间增量更新，空闲停止轮询。
  */
 export interface LogsPageProps {
   logs: AppLog[];
@@ -49,20 +49,14 @@ function logRowParts(log: AppLog) {
 
 export function LogsPage(props: LogsPageProps) {
   const { logs, loadingLogs, logCategory, setLogCategory, actionLoading, onClearLogs, streaming, onRefreshLogs } = props;
-  const rows = useMemo(() => [...logs].sort((a, b) => a.id - b.id), [logs]);
-  const viewport = useRef<HTMLDivElement>(null);
-  const [following, setFollowing] = useState(true);
-  const lastId = rows[rows.length - 1]?.id;
-  useEffect(() => {
-    if (following && viewport.current) viewport.current.scrollTop = viewport.current.scrollHeight;
-  }, [lastId, rows.length, following]);
+  const rows = useMemo(() => [...logs].sort((a, b) => b.id - a.id), [logs]);
 
   return (
     <div className="space-y-4 pt-5 md:pt-6">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex flex-wrap items-center gap-2">
           <h2 className="text-base sm:text-lg font-bold text-content-primary">运行日志 (最近100条)</h2>
-          <Badge tone={streaming ? "ok" : "idle"}>{streaming ? "实时追加" : "空闲 · 自动刷新已停止"}</Badge>
+          <Badge tone={streaming ? "ok" : "idle"}>{streaming ? "实时更新" : "空闲 · 自动刷新已停止"}</Badge>
         </div>
         <div className="flex items-center gap-2">
         <button onClick={onRefreshLogs} disabled={loadingLogs} aria-label="刷新运行日志" className="p-2 rounded-lg text-content-muted hover:text-accent hover:bg-hovered disabled:opacity-50"><RefreshCw className={`w-4 h-4 ${loadingLogs ? "animate-spin" : ""}`} /></button>
@@ -108,35 +102,37 @@ export function LogsPage(props: LogsPageProps) {
           <p className="text-content-muted">该分类下暂无运行日志</p>
         </div>
       ) : (
-        <div className="relative">
-          <div ref={viewport} role="log" aria-label="运行日志时间线" aria-live="polite" aria-relevant="additions" tabIndex={0}
-            onScroll={() => { const element = viewport.current; if (element) setFollowing(element.scrollHeight - element.scrollTop - element.clientHeight < 48); }}
-            className="max-h-[68vh] min-h-48 overflow-y-auto overscroll-contain rounded-xl border border-border-base bg-surface p-3 sm:p-5 scrollbar-thin">
-            <ol className="space-y-3 border-l border-border-base ml-2 pl-5">
+        <div role="log" aria-label="运行日志（最新在前）" aria-live="polite" aria-relevant="additions" tabIndex={0}
+          className="overflow-x-auto rounded-xl border border-border-base bg-surface scrollbar-thin">
+          <table aria-label="最近100条运行日志" className="w-full min-w-[720px] table-fixed text-left text-sm">
+            <thead className="bg-elevated text-xs text-content-muted">
+              <tr>
+                <th scope="col" className="w-44 px-4 py-4 font-medium">时间</th>
+                <th scope="col" className="w-28 px-4 py-4 font-medium">类型</th>
+                <th scope="col" className="w-32 px-4 py-4 font-medium">模块</th>
+                <th scope="col" className="px-4 py-4 font-medium">描述信息</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-border-soft text-content-secondary">
             {rows.map((log) => {
               const parts = logRowParts(log);
               return (
-                <li
+                <tr
                   key={log.id}
-                  className="relative bg-elevated/40 border border-border-base rounded-xl p-3 space-y-2 break-words"
+                  className="hover:bg-hovered transition-colors"
                 >
-                  <span aria-hidden="true" className={`absolute -left-7 top-4 w-3 h-3 rounded-full border-2 border-surface ${log.type === "error" ? "bg-state-danger-fg" : log.type === "warning" ? "bg-state-warn-fg" : "bg-accent"}`} />
-                  <div className="flex items-center justify-between gap-2 text-xs">
-                    {parts.badge}
-                    <span className="text-content-muted font-mono truncate">{parts.time}</span>
-                  </div>
-                  <div className="text-sm text-content-secondary break-words">{log.message}</div>
-                  <div className="flex items-center gap-1.5 text-[11px] text-content-muted">
-                    <Server className="w-3 h-3 flex-shrink-0" />
-                    <span className="capitalize">{log.category}</span>
-                  </div>
-                  {parts.details}
-                </li>
+                  <td className="px-4 py-4 text-[11px] text-content-muted font-mono whitespace-nowrap">{parts.time}</td>
+                  <td className="px-4 py-4">{parts.badge}</td>
+                  <td className="px-4 py-4 font-semibold capitalize break-words">{log.category}</td>
+                  <td className="px-4 py-4 break-words">
+                    {log.message}
+                    {parts.details}
+                  </td>
+                </tr>
               );
             })}
-            </ol>
-          </div>
-          {!following && <button onClick={() => setFollowing(true)} className="absolute bottom-3 right-4 inline-flex items-center gap-1.5 rounded-lg bg-accent px-3 py-2 text-xs font-semibold text-accent-contrast shadow-lg"><ArrowDown className="w-3.5 h-3.5" />跟随最新日志</button>}
+            </tbody>
+          </table>
         </div>
       )}
     </div>

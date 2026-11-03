@@ -1,15 +1,13 @@
-# 已有站点发布：保留原 Worker 和已核查的 Route；不转换成 Custom Domain。
+# 通用 fork 模板：先在自己的账号创建同名 Worker、D1 并配置 AES_KEY。
+# 已有站点升级请保留自己的 Worker 名称、路由与访问策略，不直接覆盖配置。
 name = "domain-hub"
 main = "src/index.ts"
 compatibility_date = "2024-04-01"
-workers_dev = false
+workers_dev = true
 preview_urls = false
 
-# 2026-11-03 已只读核查账号全部 7 个 Zone；原 Worker 仅使用这一条 Route。
-# 新站/其他目标须单独审查并替换，不能沿用本生产路由。
-[[routes]]
-pattern = "domain.licacv.com/*"
-zone_id = "61365e304fcd560431c460053e81e5f5"
+# 默认通过自己的 workers.dev 地址访问，不包含上游仓库的域名或 Zone。
+# 若使用自己的 Route/Custom Domain，请自行配置并准备相应 Zone 权限。
 
 # 静态资源托管：前端产物与后端同源，同一个 Worker 发出，不再需要 Cloudflare Pages。
 #

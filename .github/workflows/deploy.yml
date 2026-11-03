@@ -2,11 +2,6 @@ name: Deploy to Cloudflare
 
 on:
   workflow_dispatch:
-    inputs:
-      approved_sha:
-        description: '完整40位提交SHA（已完成安全检查、staging与数据库/AES成对备份）'
-        required: true
-        type: string
 
 permissions:
   contents: read
@@ -43,17 +38,16 @@ jobs:
           path: audit-*.json
   deploy:
     needs: [verify, security]
-    environment: production
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Verify explicit release approval
+      - name: Verify manual main deployment
         env:
-          APPROVED_SHA: ${{ inputs.approved_sha }}
-          RELEASE_APPROVED_SHA: ${{ vars.RELEASE_APPROVED_SHA }}
-        run: node scripts/release-preflight.mjs approve
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF: ${{ github.ref }}
+        run: node scripts/release-preflight.mjs manual
 
       # wrangler 4 的 engines 要求 Node >= 22
       - name: Setup Node.js
@@ -67,7 +61,7 @@ jobs:
           npm ci
           cd frontend && npm ci
 
-      - name: Bind explicitly approved existing D1 database (never auto-create)
+      - name: Bind configured existing D1 database (never auto-create)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -82,7 +76,7 @@ jobs:
           npx --no-install wrangler secret list --format json > secret-names.json
           node scripts/release-preflight.mjs secrets
 
-      # Routes/custom domains/workers.dev policy must be reviewed in config.
+      # Forks default to workers.dev; existing sites must retain their own route config.
       # Never interpret failed or partial API discovery as an absent binding.
 
       # 必须在 wrangler deploy 之前：wrangler.toml 的 assets.directory 指向 frontend/dist，
@@ -116,8 +110,8 @@ jobs:
             if [ -n "$APP_URL" ]; then
               echo "\`${APP_URL}\`"
               echo
-              echo "这是管理员配置的预期地址，不是健康/容量/迁移验收结果；请按发布手册检查已有管理员与凭据。"
+              echo "这是配置的预期地址，不是健康/容量/迁移验收结果；请检查管理员与凭据。"
             else
-              echo "未配置 RELEASE_APP_URL；请使用已审批配置中的访问地址执行独立验收。"
+              echo "请在 Cloudflare Dashboard → Workers & Pages → 对应 Worker 查看 workers.dev 地址或自定义域名。"
             fi
           } >> "$GITHUB_STEP_SUMMARY"

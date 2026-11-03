@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { readFileSync } from "node:fs";
 import { build } from "esbuild";
 import { Miniflare, convertV4MiniflareOptions } from "miniflare";
-import { createCipheriv, createHash } from "node:crypto";
+import { createCipheriv, createHash, randomBytes, pbkdf2Sync } from "node:crypto";
 
 const { outputFiles: [bundle] } = await build({ entryPoints: ["tests/workers/p1-fixture.ts"], bundle: true,
   platform: "neutral", target: "es2022", format: "esm", write: false });
@@ -76,7 +76,7 @@ const fence = task => ({ id: task.id, generation: task.generation, scope_revisio
 test("workerd/D1: production entry counts cold/warm schema and session authentication", async t => {
   const { request } = await fixture(t);
   const cold = await request({ op: "http" });
-  assert.equal(cold.status, 401); assert.equal(cold.budget.used.d1, 5);
+  assert.equal(cold.status, 401); assert.equal(cold.budget.used.d1, 2);
   const warm = await request({ op: "http" });
   assert.equal(warm.status, 401); assert.equal(warm.budget.used.d1, 0);
   const auth = await request({ op: "http", auth: "1" });
@@ -96,7 +96,75 @@ test("workerd/D1: schema exhaustion is closed and next invocation can retry", as
   const failed = await request({ op: "http", d1: "1" });
   assert.equal(failed.status, 503); assert.equal(failed.budget.used.d1, 1);
   const retry = await request({ op: "http" });
-  assert.equal(retry.status, 401); assert.equal(retry.budget.used.d1, 5);
+  assert.equal(retry.status, 401); assert.equal(retry.budget.used.d1, 2);
+});
+
+const allSchema = readFileSync("schema.sql", "utf8");
+const legacySchema = allSchema.slice(0, allSchema.indexOf("-- 10."));
+async function provisionLegacy(d1, sql = legacySchema) {
+  const statements = sql.replace(/--[^\r\n]*/g, "").split(";").map(part => part.trim()).filter(Boolean);
+  await d1.batch(statements.map(part => d1.prepare(part)));
+}
+async function schemaState(d1) {
+  const schema = (await d1.prepare("SELECT type,name,sql FROM sqlite_master WHERE name NOT GLOB 'sqlite_*' AND name NOT GLOB '_cf_*' ORDER BY name").all()).results;
+  const tables = schema.filter(row => row.type === "table").map(row => row.name);
+  const rows = await d1.batch([...tables.map(name => d1.prepare(`SELECT * FROM "${name}" ORDER BY rowid`)), d1.prepare("SELECT name,seq FROM sqlite_sequence ORDER BY name")]);
+  return { schema, rows: Object.fromEntries(tables.map((name, n) => [name, rows[n].results])), sequences: rows.at(-1).results };
+}
+const encryptOffline = (text, aesKey) => {
+  const iv = randomBytes(12), cipher = createCipheriv("aes-256-gcm", createHash("sha256").update(aesKey).digest(), iv);
+  return `${iv.toString("hex")}:${Buffer.concat([cipher.update(text, "utf8"), cipher.final(), cipher.getAuthTag()]).toString("hex")}`;
+};
+
+test("workerd/D1: 80 x 7 legacy status uses 3 calls, preserves rows/sequences and decrypts independent AES 2FA", async t => {
+  let outbound = 0; const aesKey = "offline-bootstrap-workerd-aes";
+  const { d1, request } = await fixture(t, () => { outbound++; throw new Error("No bootstrap outbound"); }, aesKey);
+  await provisionLegacy(d1);
+  const encrypted = encryptOffline("offline-account-secret", aesKey);
+  const insert = d1.prepare("INSERT INTO accounts(id,alias,api_key,api_secret) VALUES(?,'offline',?,?)");
+  await d1.batch(Array.from({ length: 80 }, (_, n) => insert.bind(n + 1, `offline-${n + 1}`, encrypted)));
+  const domain = d1.prepare("INSERT INTO domains_cache(id,account_id,subdomain,rootdomain,full_domain,status,expires_at) VALUES(?,?,?,'example.test',?,'active','2027-01-01')");
+  for (let account = 1; account <= 80; account++) await d1.batch(Array.from({ length: 7 }, (_, n) => domain.bind(account * 100 + n, account, `d${n}`, `a${account}-d${n}.example.test`)));
+  const salt = randomBytes(16), hash = pbkdf2Sync("offline-password", salt, 100000, 32, "sha256").toString("hex");
+  await d1.prepare("INSERT INTO settings(key,value) VALUES('auth_username','offline'),('auth_pass_hash',?),('auth_pass_salt',?),('auth_2fa_enabled','1'),('auth_2fa_secret',?),('auth_initialized','1')")
+    .bind(hash, salt.toString("hex"), encryptOffline("JBSWY3DPEHPK3PXP", aesKey)).run();
+  const before = await schemaState(d1), cold = await request({ op: "schema-http" });
+  assert.equal(cold.status, 200); assert.deepEqual(cold.body, { success: true, initialized: true, two_fa_enabled: true });
+  assert.deepEqual(cold.budget.used, { d1: 3, external: 0 });
+  const after = await schemaState(d1);
+  for (const [name, rows] of Object.entries(before.rows)) assert.deepEqual(after.rows[name], rows, name);
+  assert.deepEqual(after.sequences, before.sequences); assert.equal(Object.keys(after.rows).length, 20);
+  assert.equal(after.rows.accounts.length, 80); assert.equal(after.rows.domains_cache.length, 560);
+  assert.deepEqual(after.rows.domain_mutation_clock, [{ id: 1, version: 0 }]);
+  const warm = await request({ op: "schema-http" }); assert.equal(warm.status, 200); assert.equal(warm.budget.used.d1, 1);
+  assert.deepEqual(await schemaState(d1), after); assert.equal(outbound, 0);
+});
+
+test("workerd/D1: legacy ALTERs, CREATEs and clock initialization roll back together on late failure", async t => {
+  const { d1, request } = await fixture(t);
+  const oldest = legacySchema.replace(/\r\n/g, "\n").replace(/^[ \t]*(provider|website|dns_provider|provider_account_id|remote_id) TEXT[^\n]*\n/gm, "")
+    .replace(/(CREATE TABLE IF NOT EXISTS custom_domains \([\s\S]*?)\s+registered_at TEXT,[^\r\n]*[\r\n]+/, "$1\n");
+  await provisionLegacy(d1, oldest);
+  await d1.prepare("INSERT INTO accounts(id,alias,api_key,api_secret) VALUES(99,'offline','offline','offline-secret')").run();
+  await d1.exec("CREATE TABLE idx_domains_expiry(n INTEGER)");
+  const before = await schemaState(d1), failed = await request({ op: "schema-http" });
+  assert.equal(failed.status, 503); assert.equal(failed.body.error_code, "storage_unavailable");
+  assert.deepEqual(await schemaState(d1), before); assert.equal(failed.budget.used.d1, 2);
+  await d1.exec("DROP TABLE idx_domains_expiry");
+  const retry = await request({ op: "schema-http" }); assert.equal(retry.status, 200); assert.equal(retry.budget.used.d1, 3);
+  const after = await schemaState(d1); assert.equal(Object.keys(after.rows).length, 20);
+  assert.equal(after.rows.accounts[0].provider, "dnshe"); assert.equal(after.rows.accounts[0].api_secret, "offline-secret");
+  assert.deepEqual(after.sequences, before.sequences); assert.deepEqual(after.rows.domain_mutation_clock, [{ id: 1, version: 0 }]);
+  assert.deepEqual((await d1.prepare("PRAGMA foreign_key_check").all()).results, []);
+});
+
+test("workerd/D1: one-call budget leaves empty schema untouched; two calls bootstrap without ALTER duplicates", async t => {
+  const { d1, request } = await fixture(t);
+  const failed = await request({ op: "schema", d1: "1" }); assert.equal(failed.ready, false); assert.equal(failed.budget.used.d1, 1);
+  assert.equal(await d1.prepare("SELECT count(*) AS n FROM sqlite_master WHERE type='table' AND name NOT GLOB '_cf_*' AND name NOT GLOB 'sqlite_*'").first("n"), 0);
+  const next = await request({ op: "schema", d1: "2" }); assert.equal(next.ready, true); assert.equal(next.budget.used.d1, 2);
+  assert.equal(await d1.prepare("SELECT count(*) AS n FROM sqlite_master WHERE type='table' AND name NOT GLOB '_cf_*' AND name NOT GLOB 'sqlite_*'").first("n"), 20);
+  assert.equal((await d1.prepare("PRAGMA quick_check").all()).results[0].quick_check, "ok");
 });
 
 test("workerd/D1: distinct invocations acquire once, commit atomically and reject old replay", async t => {

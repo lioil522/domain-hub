@@ -14,6 +14,13 @@ export default {
     const operation = query.get("op");
     const budget = new InvocationBudget({ d1: Number(query.get("d1") ?? 40), external: Number(query.get("external") ?? 40) });
     const db = withBudgetD1(env.DB, budget);
+    if (operation === "schema") {
+      return Response.json({ ready: await new DatabaseManager(db).ensureTables(), budget: budget.snapshot() });
+    }
+    if (operation === "schema-http") {
+      const response = await runHttpInvocation(new Request("https://fixture.invalid/api/auth/status"), env, ctx, budget);
+      return Response.json({ status: response.status, body: await response.json(), budget: budget.snapshot() });
+    }
     if (operation === "automation-init") {
       const manager = new DatabaseManager(env.DB);
       if (!(await manager.ensureTables())) throw new Error("offline automation bootstrap failed");

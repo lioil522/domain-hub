@@ -658,8 +658,8 @@ Domain Hub 2.0 当前提供三条正式部署路径：
 A. Cloudflare Worker 手动部署
    本地电脑 → Wrangler → Cloudflare Worker + D1
 
-B. GitHub Actions 审批发布
-   手动选择 main 完整 SHA + production 审批 + 验证/审计 → Cloudflare Worker + D1
+B. GitHub Actions 手动部署
+   Fork + 配置自己的资源/Secrets → 手动选择 main → 验证/审计 → Cloudflare Worker + D1
 
 C. Docker / 自建部署
    GHCR 镜像 或 本地 Docker Build → Docker Compose → Node + SQLite
@@ -733,7 +733,7 @@ Theme / Contrast         PASS
 - Workers Static Assets
 - 全球边缘部署
 - 不维护服务器
-- GitHub 手动审批后发布（push 不触发生产部署）
+- GitHub 手动部署（无需填写提交 SHA，push 不触发 Cloudflare 部署）
 
 ### 选择 Docker，如果你需要
 
@@ -916,7 +916,7 @@ Cloudflare 当前文档规定：部署已经存在的 Worker 至少需要 Worker
 
 ### 关于 Zone / Workers Routes 权限
 
-已移除自动探测及据此改写 `workers_dev` / `preview_urls` 的逻辑，避免查询失败被当成“未绑定”。Route/Custom Domain 和公开访问策略必须在审批配置中明确；Wrangler 会应用该配置，不能假设保留云端手工配置。摘要仅显示 `production` 的 `RELEASE_APP_URL`，不是自动发现或健康验收。若审批配置改变 Route，按官方规则准备对应 Zone 写权限。[Cloudflare Workers 角色与权限](https://developers.cloudflare.com/workers/authorization/workers/)
+仓库模板默认 `workers_dev = true`，不包含上游站点的 Route 或 Zone，fork 后使用自己的 workers.dev 地址。Route/Custom Domain 和公开访问策略由部署者在配置中明确；已有站点升级须保留自己的配置，Wrangler 会应用该配置，不能假设保留云端手工配置。没有自动探测或据此改写访问策略的逻辑。摘要可显示仓库变量 `RELEASE_APP_URL`，不是健康验收；未设置时到 Cloudflare Dashboard 查看地址。若配置 Route，按官方规则准备对应 Zone 写权限。[Cloudflare Workers 角色与权限](https://developers.cloudflare.com/workers/authorization/workers/)
 
 ### 第一次创建 Worker 的权限
 
@@ -935,11 +935,11 @@ Workers & Pages
 → domain-hub
 ```
 
-创建后，CI Token 使用较小权限即可。
+创建后，在 Worker 的 Settings → Variables and Secrets 添加 **Secret 类型**的 `AES_KEY`，使用足够长的随机字符串并安全保存；CI Token 使用较小权限即可。首次新站只生成一次，已有站点必须保留与原数据库配对的 Key。还需在自己的账号创建 D1 数据库并记录 UUID。
 
 #### 方案 B：独立新站引导
 
-在单独获批的新站初始化中创建 Worker/D1、设置并离线保管 AES、检查管理员初始化与 schema。生产发布工作流要求目标 Worker 已有 AES 元信息，不代办新站引导。已有站点不得按新站步骤覆盖。
+自行通过 Dashboard 或本地 Wrangler 创建 Worker/D1、设置并离线保管 AES。发布工作流要求目标 Worker 已有 AES 元信息，不代办资源创建。空库在应用首次 API 请求时自动补齐 schema，首次打开网页由用户设置管理员；已有站点不得按新站步骤覆盖数据库或 Key。
 
 > 推荐方案 A。这样可以避免长期 CI Token 持有创建/删除所有 Worker 的权限。
 
@@ -991,7 +991,7 @@ Invoke-RestMethod `
 
 ---
 
-## 方案 B：GitHub Actions 审批发布到 Cloudflare
+## 方案 B：Fork 后通过 GitHub Actions 手动部署到 Cloudflare
 
 仓库已经提供：
 
@@ -1005,13 +1005,13 @@ Invoke-RestMethod `
 GitHub → Actions → Deploy to Cloudflare → Run workflow
 ```
 
-选择 `main`，填写已批准的完整40位 `approved_sha`；必须与运行 SHA 和 `production` 环境的 `RELEASE_APPROVED_SHA` 完全相等。仓库管理员须配置环境审批人、限制 main，建议禁止自行审批/绕过审批。
+Fork 后先在 Actions 页面启用工作流，配置下文的三个仓库 Secrets，并创建自己的 Worker/D1、设置 Worker 的 `AES_KEY`。选择 `main` 后直接点击 **Run workflow**，无需填写提交 SHA，也不依赖 production 环境或审批变量。工作流仍限制手动 main 部署；提交或 push 不会触发 Cloudflare 上线。
 
 ### Workflow 实际执行顺序
 
 ```text
 完整 verify + 两棵依赖树 npm audit（失败关闭，保留报告）
-  → production 人工审批 → 精确 SHA 复核
+  → 确认手动 main 部署
   → Node 22 / npm ci → 明确已有 D1 UUID 绑定
   → 发布前 AES_KEY 名称/类型元信息检查（不读 Key 值）
   → 同源前端构建 → wrangler deploy --keep-vars
@@ -1072,7 +1072,7 @@ Cloudflare Dashboard
 
 #### `CLOUDFLARE_D1_DATABASE_ID`
 
-填入已审批的现有数据库 UUID：
+填入你自己创建或已确认的现有数据库 UUID：
 
 ```text
 xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
@@ -1084,11 +1084,10 @@ xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 
 升级使用原 Worker Secret，并在受控存储保管与数据库配对的恢复材料。元信息检查失败就停止，不将查询失败当作缺失，也不自动补 Key。GitHub 里已有 `AES_KEY` 不会覆盖 Worker；真实跨密钥迁移见 [迁移手册](docs/release-and-migration.md)。
 
-### production 环境变量与审批
+### 可选仓库变量
 
-- `RELEASE_APPROVED_SHA`：审批过的完整40位 main SHA，变更后必须重新验收和审批。
 - `RELEASE_APP_URL`：可选的预期访问 URL，仅用于摘要；不要含 Token/密码。
-- Required reviewers / main 部署分支限制：必须由仓库管理员配置，YAML 的 `environment` 声明不会自动创建审批规则。
+- 在 Settings → Secrets and variables → Actions → Variables 配置；不需要创建 production 环境或提交 SHA 审批变量。
 
 ### 可选 Secret
 
@@ -1120,15 +1119,17 @@ CI Token 不需要 D1 Create
 AES_KEY 固定且可恢复
 ```
 
-没有“一键创建 D1”组合；不填 D1 UUID 就停止。另须有 Worker 原 AES 元信息、production 审批规则和精确批准 SHA。
+没有“一键创建 D1”组合；不填 D1 UUID 就停止。另须提前在目标 Worker 配置 Secret 类型的 `AES_KEY`，无需提交 SHA 或环境审批配置。
 
 ---
 
 ## GitHub Actions 首次工作流部署
 
-### 第 1 步：独立完成新站引导或已有站点迁移验证
+### 第 1 步：Fork、启用 Actions 并准备自己的 Worker/D1
 
-新站自行获批创建 D1/Worker、初始化 schema、配置 AES；已有站点复用原库/原 AES并验证增量 schema。先做成对备份与 staging 验收，保存 UUID，不在流水线中猜测。
+Fork 仓库后到 Actions 启用工作流。新站先在 Cloudflare Dashboard 创建 Worker `domain-hub` 和 D1，给 Worker 添加 Secret 类型的 `AES_KEY` 并妥善保管。默认模板使用自己的 workers.dev 地址（账号需已设置 workers.dev 子域），无需修改上游域名；若修改 Worker 名称，需同时修改 `wrangler.toml` 的 `name`。空库由应用首次请求自动建表，无需先运行 `schema.sql`。
+
+已有站点复用原 Worker/数据库/AES，保留自己的路由和访问策略；建议先备份与验证增量迁移，不要按新站步骤重置管理员或 Key。
 
 ### 第 2 步：创建 Cloudflare API Token
 
@@ -1158,9 +1159,9 @@ CLOUDFLARE_ACCOUNT_ID
 CLOUDFLARE_D1_DATABASE_ID
 ```
 
-### 第 6 步：核验原 AES 并配置 production 审批
+### 第 6 步：确认 Worker 已有 AES_KEY
 
-Worker 已有 AES 与当前库配对；配置 Required reviewers/main 限制、`RELEASE_APPROVED_SHA` 和可选 `RELEASE_APP_URL`。依赖审计未通过不能上线。
+Worker 的 `AES_KEY` 必须是 Secret 类型；已有站点使用与当前库配对的原 Key。可设置仓库变量 `RELEASE_APP_URL`，但不是必填；依赖审计未通过仍会停止部署。
 
 ### 第 7 步：执行 Workflow
 
@@ -1171,7 +1172,7 @@ GitHub
 → Run workflow
 ```
 
-填写完整 `approved_sha`，等待验证/安全检查和 production 审批。提交或 push 不触发生产发布；不要用 `git add .` 混入未知用户改动。
+选择 `main`，直接运行，等待验证与安全检查，无需填写提交 SHA。提交或 push 不触发 Cloudflare 部署。
 
 ### 第 8 步：检查日志
 
@@ -1180,7 +1181,7 @@ GitHub
 ```text
 Install Dependencies
         ↓
-Verify explicit release approval / Bind existing D1
+Verify manual main deployment / Bind configured D1
         ↓
 Check existing AES secret metadata
         ↓
@@ -1193,7 +1194,7 @@ Summarize Access URL
 
 ### 第 9 步：打开访问地址
 
-Workflow 仅输出 `RELEASE_APP_URL` 配置的预期地址，例如：
+若设置 `RELEASE_APP_URL`，Workflow 输出该预期地址；未设置时在 Cloudflare Dashboard → Workers & Pages → 对应 Worker 查看实际地址，例如：
 
 ```text
 ### 访问地址
@@ -2082,9 +2083,9 @@ docker compose up -d
 [ ] ALLOWED_ORIGIN（通常为空）
 [ ] npm run verify:all 本地通过
 [ ] 根/frontend npm audit 均通过（本轮独立副本双树0漏洞；发布时仍须重新审计）
-[ ] 独立 staging / 迁移 / 最新数据库+AES成对恢复验证通过
-[ ] production 审批人/main限制/RELEASE_APPROVED_SHA 已配置
-[ ] main 完整 approved_sha 手动运行 Workflow，并通过环境审批
+[ ] 已有站点升级前建议完成备份与迁移验证；新站保管好 AES_KEY
+[ ] fork 仓库 Actions 已启用；配置自己的 workers.dev/域名，不沿用上游路由
+[ ] 选择 main 手动运行 Workflow（无需提交 SHA 或 production 环境）
 [ ] Workflow Build Frontend 通过
 [ ] Workflow Deploy Worker 通过
 [ ] 发布前 AES 元信息检查通过；不轮换 Key

@@ -16,6 +16,8 @@
 - Node 构建及 workerd/Node 本地恢复、认证与分段恢复冒烟已通过。
 - 未测试真实服务商凭据、生产数据库、真实云端 Queue 或完整浏览器 E2E。
 
+首次推送 `caf69fd` 后，Worker 自动部署在 TOML 解析阶段失败：新增分钟触发器前的一条 Cron 缺少分隔逗号。后续修复补齐逗号，并将 `wrangler deploy --dry-run` 加入 `verify:all`，检查配置和实际 Worker 打包但不执行云端部署。后续提交及部署结果以 Git/Actions 记录为准。
+
 ## 升级重点
 
 1. 前后端一起更新，保留原 AES_KEY，升级前备份数据库和密钥。

@@ -5,6 +5,8 @@ import { toASCII, isRegistrableDomain } from "../punycode";
 import { successRes, errorRes } from "./response";
 import { WhoisService } from "../services/whois-service";
 import type { Bindings, Variables } from "./types";
+import { AppError, UpstreamRateLimitError } from "../errors";
+import type { ContentfulStatusCode } from "hono/utils/http-status";
 
 export interface WhoisRouteDeps {
   logService: (db: DatabaseManager) => { write: (level: string, source: string, message: string, meta?: unknown) => Promise<unknown> };
@@ -43,7 +45,8 @@ app.get("/api/whois", async (c) => {
     return c.json(successRes({ whois: res }));
   } catch (e: unknown) {
     const message = e instanceof Error ? e.message : "WHOIS 查询异常";
-    return c.json(errorRes(message), 400);
+    if (e instanceof UpstreamRateLimitError && e.retryAfter) c.header("Retry-After", e.retryAfter);
+    return c.json(errorRes(message, e instanceof AppError ? e.code : "upstream_error"), (e instanceof AppError ? e.statusCode : 502) as ContentfulStatusCode);
   }
 });
 

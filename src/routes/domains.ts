@@ -17,6 +17,8 @@ import { successRes, errorRes } from "./response";
 import { UNDELETABLE_STATUS, translateDeleteError } from "../services/domain-operations";
 import { createDomainProviderAdapter } from "../providers/adapters";
 import { detectDnsProvider } from "../dns-provider";
+import { startSyncAction } from "../services/sync-action-service";
+import type { resyncAccountsInBackground } from "../services/account-sync-service";
 
 function accountService(db: DatabaseManager) { return new AccountService(new AccountRepository(db)); }
 function domainService(db: DatabaseManager) { return new DomainService(new DomainRepository(db)); }
@@ -24,7 +26,7 @@ function logService(db: DatabaseManager) { return new LogService(new LogReposito
 function auditService(db: DatabaseManager) { return new AuditService(new AuditRepository(db)); }
 
 export interface DomainRouteDeps {
-  resyncAccountsInBackground: (db: DatabaseManager, accountIds: number[], trigger?: "manual" | "auto") => Promise<void>;
+  resyncAccountsInBackground: typeof resyncAccountsInBackground;
   fetchAllQuotas: (db: DatabaseManager) => Promise<{ accounts: Array<{ id: number; alias: string }>; quotas: unknown[] }>;
 }
 
@@ -161,8 +163,9 @@ export function registerDomainRoutes(app: Hono<AppEnv>, deps: DomainRouteDeps) {
     try {
       // 异步执行同步以防止 HTTP 响应超时 (Cloudflare Worker 允许在 waitUntil 里跑异步)
       const webhookType = (c.env.WEBHOOK_TYPE || "custom") as WebhookType;
-      c.executionCtx.waitUntil(runDailySyncAndRenewal(dbManager, c.env.WEBHOOK_URL, webhookType));
-      return c.json(successRes({ message: "域名同步后台任务已启动，请稍后刷新查看最新数据" }));
+      const actionId = await startSyncAction(dbManager, { label: "全量同步与续期" },
+        () => runDailySyncAndRenewal(dbManager, c.env.WEBHOOK_URL, webhookType), promise => c.executionCtx.waitUntil(promise));
+      return c.json(successRes({ action_id: actionId, message: "域名同步后台任务已启动，请查看操作中心的实际执行结果" }), 202);
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : "未知错误";
       return c.json(errorRes(message), 500);
@@ -187,8 +190,9 @@ export function registerDomainRoutes(app: Hono<AppEnv>, deps: DomainRouteDeps) {
       if (provider === "custom") {
         return c.json(successRes({ message: "自定义分组无需同步（手动管理域名）" }));
       }
-      c.executionCtx.waitUntil(deps.resyncAccountsInBackground(dbManager, [accountId], "manual"));
-      return c.json(successRes({ message: "该账号的域名同步已在后台启动，请稍后刷新" }));
+      const actionId = await startSyncAction(dbManager, { label: `账号 ${accountId} 同步`, accountIds: [accountId] },
+        context => deps.resyncAccountsInBackground(dbManager, [accountId], "manual", context), promise => c.executionCtx.waitUntil(promise));
+      return c.json(successRes({ action_id: actionId, message: "该账号的域名同步已在后台启动，请查看实际执行结果" }), 202);
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : "未知错误";
       return c.json(errorRes(message), 500);
@@ -237,12 +241,14 @@ export function registerDomainRoutes(app: Hono<AppEnv>, deps: DomainRouteDeps) {
         return c.json(successRes({ message: `没有绑定任何 ${provider} 账号，无需同步` }));
       }
       const ids = accounts.map((a) => a.id);
-      c.executionCtx.waitUntil(deps.resyncAccountsInBackground(dbManager, ids, "manual"));
+      const actionId = await startSyncAction(dbManager, { label: `${provider} 账号同步`, accountIds: ids },
+        context => deps.resyncAccountsInBackground(dbManager, ids, "manual", context), promise => c.executionCtx.waitUntil(promise));
       return c.json(
         successRes({
           message: `${provider} 的 ${ids.length} 个账号同步已在后台启动，请稍后刷新`,
-          count: ids.length
-        })
+          count: ids.length,
+          action_id: actionId,
+        }), 202
       );
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : "未知错误";

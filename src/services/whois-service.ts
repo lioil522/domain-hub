@@ -3,6 +3,7 @@ import { DNSHEClient } from "../dnshe";
 import { NON_QUOTA_PROVIDERS } from "../db";
 import { AccountRepository } from "../repositories/account-repository";
 import { AccountService } from "./account-service";
+import { UpstreamError } from "../errors";
 
 export class WhoisService {
   constructor(private readonly db: DatabaseManager) {}
@@ -24,6 +25,10 @@ export class WhoisService {
 
   async query(domain: string, accountId?: number) {
     const client = await this.getClient(accountId);
-    return client.whois(domain);
+    const result = await client.whois(domain);
+    if (!result || result.success !== true || typeof result.registered !== "boolean") {
+      throw new UpstreamError(result?.message || "WHOIS 上游未返回明确的注册状态");
+    }
+    return result;
   }
 }

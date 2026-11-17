@@ -14,6 +14,8 @@ import { AccountRepository } from "../repositories/account-repository";
 import { CacheService } from "../cache/cache";
 import { CACHE_KEYS } from "../cache";
 import { createDomainProviderAdapter } from "../providers/adapters";
+import { batchedPromiseAll } from "../cron/utils";
+import { summarizeAccountSync, type AccountSyncResult, type AccountSyncSummary } from "./sync-results";
 
 function logService(db: DatabaseManager): LogService {
   return new LogService(new LogRepository(db));
@@ -81,28 +83,30 @@ export async function syncViaProviderAdapter(dbManager: DatabaseManager, account
 export async function deepSyncAccountDomains(dbManager: DatabaseManager, accountId: number, client: DNSHEClient): Promise<number> {
   const subdomains = await fetchAllSubdomainsFromClient(client);
 
-  // 并发拉取每个子域名的 DNS 记录，自动计算真实状态
-  const enriched = await Promise.all(
-    subdomains.map(async (sub) => {
+  let failedRecords = 0;
+  // Bound outbound concurrency. Failed record queries preserve known state and are reported as failures.
+  const enriched = await batchedPromiseAll(
+    subdomains, async (sub) => {
       try {
         const recordsRes = await client.listDnsRecords(sub.id);
-        const records = recordsRes.records || [];
+        if (recordsRes.success !== true || !Array.isArray(recordsRes.records)) throw new Error(recordsRes.message || "解析记录响应无效");
+        const records = recordsRes.records;
 
         // 深度同步拿到的真实解析记录一并回填缓存，后续打开 DNS 面板直接命中、零上游调用
         await dbManager.setCache(`api_cache:dns:${sub.id}`, JSON.stringify(records));
 
         return { ...sub, ...computeDnsState(records) };
       } catch (e: unknown) {
+        failedRecords++;
         console.error(`listDnsRecords failed for subdomain ${sub.id}:`, e);
         // 上游临时失败时不带 dns_state_known，缓存中已识别出的三态与托管商保持不变。
         return { ...sub };
       }
-    })
+    }, 5
   );
 
-  if (enriched.length > 0) {
-    await dbManager.syncAccountDomains(accountId, enriched);
-  }
+  await dbManager.syncAccountDomains(accountId, enriched);
+  if (failedRecords) throw new Error(`${failedRecords} 个域名解析状态未确定，已保留已知状态，请重试同步`);
   return subdomains.length;
 }
 
@@ -121,12 +125,16 @@ export async function deepSyncAccountDomains(dbManager: DatabaseManager, account
 export async function resyncAccountsInBackground(
   dbManager: DatabaseManager,
   accountIds: number[],
-  trigger: "manual" | "auto" = "auto"
-) {
+  trigger: "manual" | "auto" = "auto",
+  options: { sleep?: (ms: number) => Promise<void>; onResult?: (result: AccountSyncResult) => Promise<void>; isCancelled?: () => Promise<boolean> } = {},
+): Promise<AccountSyncSummary> {
   const triggerLabel = trigger === "manual" ? "手动同步" : "后台同步";
-  for (const id of accountIds) {
+  const results: AccountSyncResult[] = [];
+  for (const id of [...new Set(accountIds)]) {
+    if (options.isCancelled && await options.isCancelled()) break;
     // 先取别名用于日志；取不到就用 id 兜底（账号可能已被删除）
     let aliasForLog = `账号 ${id}`;
+    let result: AccountSyncResult;
     try {
       const { client, alias, provider } = await dbManager.getClientForAccount(id);
       aliasForLog = alias || aliasForLog;
@@ -138,33 +146,23 @@ export async function resyncAccountsInBackground(
           "sync",
           `${triggerLabel}：账号 [${alias}] 是自定义分组，无上游接口，跳过同步`
         );
-        continue;
+        result = { accountId: id, alias, status: "skipped" };
+      } else {
+        await logService(dbManager).write("info", "sync", `${triggerLabel}：开始同步账号 [${alias}]`);
+        await dbManager.refreshAccountQuotaCache(id, alias, provider);
+        const cf = client instanceof CloudflareClient ? await syncCloudflareSlice(dbManager, id, client) : null;
+        const synced = cf ? cf.totalSynced
+          : client instanceof DigitalPlatClient ? await syncDigitalPlatDomains(dbManager, id, client)
+          : PARSE_ONLY_PROVIDERS.includes(provider) ? await syncViaProviderAdapter(dbManager, id, provider, client)
+          : client instanceof DNSHEClient ? await deepSyncAccountDomains(dbManager, id, client)
+          : (() => { throw new Error("未知的账号客户端"); })();
+        const unit = client instanceof CloudflareClient || client instanceof HuaweiCloudClient ? "个 zone" : "个域名";
+        await logService(dbManager).write(
+          cf && !cf.completed ? "info" : "success", "sync",
+          cf && !cf.completed ? `${triggerLabel}：账号 [${alias}] 分片已提交，下一次从第 ${cf.nextPage} 页继续` : `${triggerLabel}：账号 [${alias}] 同步完成，共 ${synced} ${unit}`
+        );
+        result = { accountId: id, alias, status: cf && !cf.completed ? "paused" : "completed", domainCount: synced, nextPage: cf?.nextPage };
       }
-
-      await logService(dbManager).write("info", "sync", `${triggerLabel}：开始同步账号 [${alias}]`);
-
-      // 先刷配额缓存再同步域名：前端是以「该账号的域名已落库」作为后台任务完成的信号，
-      // 放在后面做会让配额缓存慢于这个信号，用户切到配额页仍是旧数据
-      await dbManager.refreshAccountQuotaCache(id, alias, provider);
-
-      const synced = client instanceof CloudflareClient
-        ? await syncCloudflareZones(dbManager, id, client)
-        : client instanceof DigitalPlatClient
-          ? await syncDigitalPlatDomains(dbManager, id, client)
-          : PARSE_ONLY_PROVIDERS.includes(provider)
-            ? await syncViaProviderAdapter(dbManager, id, provider, client)
-            : client instanceof DNSHEClient
-              ? await deepSyncAccountDomains(dbManager, id, client)
-              : 0;
-
-      // 按 provider 给出可读的完成措辞 —— zone 和「域名」是两种不同的东西，不该混称
-      const unit = client instanceof CloudflareClient || client instanceof HuaweiCloudClient ? "个 zone" : "个域名";
-      await logService(dbManager).write(
-        "success",
-        "sync",
-        `${triggerLabel}：账号 [${alias}] 同步完成，共 ${synced} ${unit}`
-      );
-      console.log(`Deep sync finished for account ${id}: ${synced} domains`);
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : "未知错误";
       const stack = e instanceof Error ? (e.stack || message) : message;
@@ -176,9 +174,13 @@ export async function resyncAccountsInBackground(
         stack
       );
       console.error(`Background account resync failed for account ${id}:`, e);
+      result = { accountId: id, alias: aliasForLog, status: "failed", error: message };
     }
-    await sleep(1200);
+    results.push(result);
+    if (options.onResult) await options.onResult(result);
+    await (options.sleep || sleep)(1200);
   }
+  return summarizeAccountSync(results);
 }
 
 // NOTE: 简易异步等待工具

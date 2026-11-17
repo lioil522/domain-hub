@@ -1,305 +1,164 @@
-import type { Dispatch, MutableRefObject, SetStateAction } from "react";
+import { useEffect, useRef, type Dispatch, type MutableRefObject, type SetStateAction } from "react";
 import type { ApiFetch } from "../../../api/client";
 import type { Account } from "../../../types/account";
-import type { AvailableDomain, ScanCursor, ScanLog, ScanStatus, ScannerParams } from "../utils/scanner-types";
-import { createBatchPlan, type ScannerTask } from "../utils/scanner-batch-planner";
-import { primeScannerSkipPool } from "../utils/scanner-batch-pool";
-import { runScannerWorkers } from "../utils/scanner-batch-executor";
-import { clearScanCursor as clearPersistedScanCursor, saveScanCursor as persistScanCursor } from "../utils/scanner-storage";
+import type { AvailableDomain, ScanCursor, ScanCursorV2, ScanLog, ScanStatus, ScannerParams, ScannerPlanSnapshot } from "../utils/scanner-types";
+import type { ScannerTask } from "../utils/scanner-batch-planner";
+import { captureScannerPlan, isScanCursorV2, restoreScannerPlan } from "../utils/scanner-checkpoint";
+import { BrowserScannerRun } from "../utils/scanner-browser-run";
+import { clearScanCursor as clearPersistedCursor, loadScanCursor, saveScanCursor as persistCursor, scannerBackendKey } from "../utils/scanner-storage";
 
 type Toast = (kind: "success" | "error" | "info" | "warning", message: string) => void;
-type ResolveBank = (name: string) => string[] | null;
-
 type Options = {
   apiFetch: ApiFetch;
+  backendUrl: string;
+  sessionToken: string | null;
   showToast: Toast;
   dnsheAccounts: Account[];
-  batchRules: string;
-  excludeChars: string;
-  batchLength: number;
-  resolveBank: ResolveBank;
+  batchRules: string; excludeChars: string; batchLength: number;
+  resolveBank: (name: string) => string[] | null;
   selectedRoots: string[];
-  seqMode: boolean;
-  seqCharset: "字母" | "数字" | "字母数字";
-  seqLength: number;
-  seqStart: string;
-  enableReservedFilter: boolean;
-  reservedPrefixes: string[];
-  ignorePool: boolean;
+  seqMode: boolean; seqCharset: "字母" | "数字" | "字母数字"; seqLength: number; seqStart: string;
+  enableReservedFilter: boolean; reservedPrefixes: string[]; ignorePool: boolean;
   scanControlRef: MutableRefObject<ScanStatus>;
   setScanStatus: Dispatch<SetStateAction<ScanStatus>>;
   setScanProgress: Dispatch<SetStateAction<ScannerParams>>;
   availableDomainsList: AvailableDomain[];
   setAvailableDomainsList: Dispatch<SetStateAction<AvailableDomain[]>>;
   setScanLogs: Dispatch<SetStateAction<ScanLog[]>>;
-  setScanCursor: Dispatch<SetStateAction<ScanCursor | null>>;
+  setScanCursor: Dispatch<SetStateAction<ScanCursor | ScanCursorV2 | null>>;
   scanCursorRef: MutableRefObject<{ lastCandidate: string; taskIndex: number; checked: number }>;
 };
 
-export function useScannerBatchScan({
-  apiFetch, showToast, dnsheAccounts, batchRules, excludeChars, batchLength, resolveBank,
-  selectedRoots, seqMode, seqCharset, seqLength, seqStart, enableReservedFilter, reservedPrefixes,
-  ignorePool, scanControlRef, setScanStatus, setScanProgress,
-  availableDomainsList, setAvailableDomainsList, setScanLogs,
-  setScanCursor, scanCursorRef
-}: Options) {
-  const updateScanStatus = (status: ScanStatus) => {
-    scanControlRef.current = status;
-    setScanStatus(status);
-  };
+export function useScannerBatchScan(options: Options) {
+  const { backendUrl, sessionToken, showToast, scanControlRef, setScanStatus, setScanProgress,
+    setAvailableDomainsList, setScanLogs, setScanCursor, scanCursorRef } = options;
+  const active = useRef<BrowserScannerRun | null>(null);
+  const cleared = useRef(false);
+  const storageWarning = useRef(false);
+  const updateScanStatus = (status: ScanStatus) => { scanControlRef.current = status; setScanStatus(status); };
 
-  // 保存/清除断点光标
-  const saveScanCursor = (lastCandidate: string, taskIndex: number, checked: number) => {
-    const cursor: ScanCursor = {
-      seqMode,
-      charset: seqCharset,
-      length: seqLength,
-      lastCandidate,
-      taskIndex,
-      checked,
-      savedAt: new Date().toLocaleString()
-    };
-    persistScanCursor(cursor);
-    setScanCursor(cursor);
+  const save = (cursor: ScanCursorV2) => {
+    scanCursorRef.current = { lastCandidate: cursor.lastCandidate, taskIndex: cursor.taskIndex, checked: cursor.checked };
+    try {
+      persistCursor(cursor);
+      setScanCursor(cursor);
+      storageWarning.current = false;
+    } catch {
+      updateScanStatus("paused");
+      if (!storageWarning.current) showToast("warning", "断点保存失败，已暂停。请导出已有结果并清理浏览器存储后继续；刷新只能恢复最后成功保存的断点。");
+      storageWarning.current = true;
+    }
   };
-
   const clearScanCursor = () => {
-    clearPersistedScanCursor();
-    setScanCursor(null);
+    try { clearPersistedCursor(backendUrl); setScanCursor(null); return true; }
+    catch { showToast("warning", "无法清除本地断点，刷新仍可能恢复旧扫描，请检查浏览器存储权限"); return false; }
   };
+  const saveScanCursor = (_candidate: string, _index: number, _checked: number) => {
+    const run = active.current;
+    if (run) save(run.snapshot());
+  };
+  useEffect(() => () => {
+    const run = active.current;
+    if (!run) return;
+    run.publish(true);
+    run.abort();
+    active.current = null;
+    scanControlRef.current = "paused";
+    setScanStatus("paused");
+  }, [backendUrl, sessionToken]);
 
-  // 执行批量扫域名引擎（resumeFrom 非空时表示从断点续查）
   const handleStartBatchScan = async (resumeFrom?: string) => {
-    if (scanControlRef.current === "paused") {
+    if (!sessionToken) return;
+    if (active.current && scanControlRef.current === "running") return;
+    if (active.current?.running && scanControlRef.current === "paused") {
+      storageWarning.current = false;
       updateScanStatus("running");
-      showToast("info", "▶️ 已恢复批量扫描任务！");
+      showToast("info", "已恢复查询；限流等待时间仍会被遵守");
       return;
     }
-
-    if (selectedRoots.length === 0) {
-      showToast("error", "请至少勾选一个根域名后缀！");
+    const stored = resumeFrom !== undefined || scanControlRef.current === "paused" ? loadScanCursor(backendUrl) : null;
+    if (stored && !isScanCursorV2(stored)) {
+      showToast("warning", "旧版断点未保存完整规则，无法安全恢复，请选择重新开始");
       return;
     }
-
-    const planResult = createBatchPlan({
-      seqMode,
-      seqCharset,
-      seqLength,
-      seqStart: resumeFrom || seqStart,
-      batchRules,
-      excludeChars,
-      batchLength,
-      resolveBank,
-      selectedRoots,
-      enableReservedFilter,
-      reservedPrefixes,
-    });
-
-    if (!planResult.ok) {
-      const issue = planResult.issue;
-      if (issue.kind === "empty-roots") showToast("error", "请至少勾选一个根域名后缀！");
-      else if (issue.kind === "invalid-sequence") showToast("error", "顺序模式未能生成候选，请检查字符集与长度设置！");
-      else if (issue.kind === "unknown-tokens") showToast("error", `规则中存在无法识别的标签：${issue.tokens.join("、")}`);
-      else if (issue.kind === "empty-rules") showToast("error", "根据当前规则未能生成有效的前缀词库，请修改规则！");
-      else showToast("error", "全部候选前缀都属于官方保留名单，无可查询项！");
-      return;
-    }
-
-    for (const warning of planResult.warnings) showToast(
-      warning.startsWith("⚠️") ? "warning" : "info",
-      warning,
-    );
-
-    const allTasks = planResult.plan.tasks;
-    const totalTasks = allTasks;
-
-    const POOL_BATCH = 400;
-    let poolFailed = false;
-    const skipSet = ignorePool
-      ? new Set<string>()
-      : await primeScannerSkipPool({
-          apiFetch,
-          tasks: allTasks,
-          batchSize: POOL_BATCH,
-          onFailure: error => {
-            poolFailed = true;
-            console.error("查重池查询失败，将退化为全量扫描:", error);
-            setScanLogs(prev => [
-              {
-                id: Date.now() + Math.random(),
-                time: new Date().toLocaleTimeString(),
-                text: "⚠️ 查重池查询失败，本轮已退化为全量扫描（不影响结果，仅多消耗 API 配额）",
-                status: "error"
-              },
-              ...prev.slice(0, 49)
-            ]);
-            showToast("warning", "⚠️ 查重池查询失败，已退化为全量扫描");
-          },
-          onBackgroundComplete: count => {
-            if (!poolFailed && count > 0) {
-              setScanLogs(prev => [
-                {
-                  id: Date.now() + Math.random(),
-                  time: new Date().toLocaleTimeString(),
-                  text: `🗂️ 查重池加载完毕，共命中 ${count} 个已注册域名（扫描中自动跳过）`,
-                  status: "info"
-                },
-                ...prev.slice(0, 49)
-              ]);
-            }
-          },
+    const restored = isScanCursorV2(stored) ? stored : undefined;
+    let tasks: ScannerTask[];
+    let plan: ScannerPlanSnapshot;
+    try {
+      if (restored) {
+        tasks = restoreScannerPlan(restored).tasks;
+        plan = restored.plan;
+      } else {
+        const captured = captureScannerPlan({
+          seqMode: options.seqMode, seqCharset: options.seqCharset, seqLength: options.seqLength, seqStart: options.seqStart,
+          batchRules: options.batchRules, excludeChars: options.excludeChars, batchLength: options.batchLength,
+          resolveBank: options.resolveBank, selectedRoots: options.selectedRoots,
+          enableReservedFilter: options.enableReservedFilter, reservedPrefixes: options.reservedPrefixes, ignorePool: options.ignorePool,
         });
-
-    if (!ignorePool && skipSet.size > 0) {
-      showToast("info", `🗂️ 查重池已命中 ${skipSet.size} 个已注册域名，将在扫描中自动跳过`);
-    }
-
-    if (allTasks.length > 0 && skipSet.size >= allTasks.length) {
-      showToast("success", "🎉 本轮全部候选均已在查重池中确认为已注册，无需重复查询！");
-      updateScanStatus("completed");
-      return;
-    }
-
-    // 多账号并发查重：调度器只负责领取任务、暂停/恢复、查重池跳过和账号限频。
-    const RATE_LIMIT_MS = 1200;
-    const workerAccounts = dnsheAccounts.length > 0 ? dnsheAccounts : [null];
-    const workerCount = workerAccounts.length;
-
-    updateScanStatus("running");
-    setScanProgress({ total: totalTasks.length, checked: 0, available: availableDomainsList.length });
-    showToast(
-      "info",
-      `🚀 开始多账号并发查重！绑定 ${workerCount} 个 API 账号，${workerCount} 条流水线并行（每个 API 独立保障 1.2s 限频），查重吞吐提升约 ${workerCount} 倍！`
-    );
-
-    let checkedCount = 0;
-
-    const processTask = async (
-      task: ScannerTask,
-      account: (typeof workerAccounts)[number],
-      nextTaskIndex: number,
-    ) => {
-      const accountQuery = account ? `&account_id=${account.id}` : "";
-      const accAlias = account ? account.alias : "公共轮询";
-      const nowTime = new Date().toLocaleTimeString();
-      try {
-        const res = await apiFetch(`/api/whois?domain=${encodeURIComponent(task.queryFull)}${accountQuery}&batch=1`);
-        const data = await res.json();
-
-        if (res.status === 429 || data.error_code === "rate_limited" || data.error_code === "quota_exceeded") {
-          saveScanCursor(task.sub, nextTaskIndex, checkedCount);
-          updateScanStatus("paused");
-          setScanLogs(prev => [
-            { id: Date.now() + Math.random(), time: nowTime, text: `[${accAlias}] ⛔ 触发 API 限流/配额上限，已自动暂停（断点已保存至 ${task.sub}）`, status: "error" },
-            ...prev.slice(0, 49)
-          ]);
-          showToast("warning", "⛔ 触发 API 限流，已自动暂停并保存断点，稍后可点击继续");
+        if (!captured.result.ok) {
+          showToast("error", captured.result.issue.kind === "too-many-tasks" ? "任务超过 30 万上限，请减少规则或根域名数量后分批扫描" : "无法生成扫描任务，请检查根域名、规则、字符集及保留名单");
           return;
         }
-
-        if (data.success && data.whois && data.whois.registered === false) {
-          setAvailableDomainsList(prev => [
-            { fullDomain: task.full, subdomain: task.sub, rootdomain: task.root, time: nowTime },
-            ...prev
-          ]);
-          checkedCount++;
-          setScanProgress(p => ({ ...p, checked: checkedCount, available: p.available + 1 }));
-          setScanLogs(prev => [
-            { id: Date.now() + Math.random(), time: nowTime, text: `[${accAlias}] 校验域名 ${task.full} ➔ 🎉 尚未注册（可立即在线注册！）`, status: "available" },
-            ...prev.slice(0, 49)
-          ]);
-        } else {
-          checkedCount++;
-          setScanProgress(p => ({ ...p, checked: checkedCount }));
-          setScanLogs(prev => [
-            { id: Date.now() + Math.random(), time: nowTime, text: `[${accAlias}] 校验域名 ${task.full} ➔ 已被他人注册`, status: "registered" },
-            ...prev.slice(0, 49)
-          ]);
-        }
-      } catch (err) {
-        checkedCount++;
-        setScanProgress(p => ({ ...p, checked: checkedCount }));
-        setScanLogs(prev => [
-          { id: Date.now() + Math.random(), time: nowTime, text: `[${accAlias}] 校验域名 ${task.full} ➔ ⚠️ 查询请求异常，已跳过`, status: "error" },
-          ...prev.slice(0, 49)
-        ]);
+        tasks = captured.result.plan.tasks;
+        plan = captured.plan;
       }
-    };
-
-    const { skippedCount } = await runScannerWorkers({
-      tasks: totalTasks,
-      accounts: workerAccounts,
-      rateLimitMs: RATE_LIMIT_MS,
-      getStatus: () => scanControlRef.current,
-      waitWhilePaused: async () => {
-        while (scanControlRef.current === "paused") {
-          await new Promise(resolve => setTimeout(resolve, 300));
-        }
-      },
-      shouldSkip: task => !ignorePool && skipSet.has(task.queryFull),
-      onTaskClaimed: (task, index) => {
-        scanCursorRef.current = { lastCandidate: task.sub, taskIndex: index, checked: checkedCount };
-      },
-      onSkipped: () => {
-        checkedCount++;
-        setScanProgress(p => ({ ...p, checked: checkedCount }));
-      },
-      processTask,
+    }
+    catch (error) { showToast("error", error instanceof Error ? error.message : "断点恢复失败"); return; }
+    if (restored) setAvailableDomainsList(restored.availableDomains);
+    active.current?.abort();
+    storageWarning.current = false;
+    const run: BrowserScannerRun = new BrowserScannerRun({
+      apiFetch: options.apiFetch, accounts: options.dnsheAccounts, tasks,
+      plan, backend: scannerBackendKey(backendUrl), restored,
+      available: cleared.current ? [] : options.availableDomainsList,
+      getStatus: () => scanControlRef.current, isCurrent: (): boolean => active.current === run,
+      onAvailable: item => setAvailableDomainsList(prev => prev.some(value => value.fullDomain === item.fullDomain) ? prev : [item, ...prev]),
+      onProgress: setScanProgress,
+      onLog: log => setScanLogs(prev => [log, ...prev.slice(0, 49)]),
+      onPause: message => { updateScanStatus("paused"); showToast("warning", message); },
+      onCheckpoint: cursor => save(cursor),
     });
-
-    if (scanControlRef.current === "running") {
-      updateScanStatus("completed");
-      clearScanCursor(); // 正常跑完，断点光标不再需要
-      showToast(
-        "success",
-        skippedCount > 0
-          ? `🎉 所有生成的域名字典查询完毕！其中 ${skippedCount} 个命中查重池已跳过，节省了同等数量的 API 配额。`
-          : "🎉 所有生成的域名字典查询完毕！"
-      );
+    active.current = run;
+    cleared.current = false;
+    updateScanStatus("running");
+    run.publish(true);
+    if (storageWarning.current) { run.abort(); active.current = null; return; }
+    showToast("info", restored ? "按保存的规则、词库与连续完成检查点恢复；未完成项会重新查询" : "开始查询，最多使用 16 条账号流水线；未知结果会暂停并保留待重试");
+    try {
+      const result = await run.start();
+      if (active.current !== run || run.controller.signal.aborted) return;
+      if (result && result.nextIndex === tasks.length) {
+        updateScanStatus("completed");
+        clearScanCursor();
+        active.current = null;
+        showToast("success", `本轮查询完成，${result.skippedCount} 个已注册域名命中查重池`);
+      }
+    } catch (error) {
+      if (active.current !== run || run.controller.signal.aborted) return;
+      updateScanStatus("paused");
+      run.publish(true);
+      showToast("error", error instanceof Error ? error.message : "扫描失败，已保存断点");
     }
   };
-
-  // 导出生成的 txt 结果
-  const handleExportAvailableTxt = () => {
-    if (availableDomainsList.length === 0) {
-      showToast("info", "暂无已发现的可用域名供导出！");
-      return;
-    }
-
-    const content = availableDomainsList.map(item => item.fullDomain).join("\n");
-    const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `available_domains_${Date.now()}.txt`;
-    a.click();
-    URL.revokeObjectURL(url);
-    showToast("success", "已成功导出可用域名 txt 文本！");
-  };
-
   const resetScan = () => {
+    active.current?.abort();
+    active.current = null;
+    cleared.current = true;
     updateScanStatus("idle");
-    setAvailableDomainsList([]);
-    setScanLogs([]);
-    setScanProgress({ total: 0, checked: 0, available: 0 });
-    clearScanCursor();
-    showToast("info", "🔄 已重置查重逻辑（断点已清除）");
+    setAvailableDomainsList([]); setScanLogs([]); setScanProgress({ total: 0, checked: 0, available: 0, failed: 0 });
+    if (clearScanCursor()) showToast("info", "已取消旧扫描并清除本轮断点");
   };
-
   const pauseScan = () => {
-    const c = scanCursorRef.current;
-    saveScanCursor(c.lastCandidate, c.taskIndex, c.checked);
     updateScanStatus("paused");
-    showToast("info", `⏸️ 已暂停并保存断点（当前位置：${c.lastCandidate || "起点"}）`);
+    active.current?.publish(true);
+    showToast("info", "已暂停；保存的是连续完成位置，进行中的请求不会造成跳项");
   };
-
-  return {
-    updateScanStatus,
-    handleStartBatchScan,
-    handleExportAvailableTxt,
-    saveScanCursor,
-    clearScanCursor,
-    resetScan,
-    pauseScan,
+  const handleExportAvailableTxt = () => {
+    if (!options.availableDomainsList.length) { showToast("info", "暂无可用域名"); return; }
+    const url = URL.createObjectURL(new Blob([options.availableDomainsList.map(item => item.fullDomain).join("\n")], { type: "text/plain;charset=utf-8" }));
+    const link = document.createElement("a");
+    link.href = url; link.download = `available_domains_${Date.now()}.txt`; link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
   };
+  return { updateScanStatus, handleStartBatchScan, handleExportAvailableTxt, saveScanCursor, clearScanCursor, resetScan, pauseScan };
 }

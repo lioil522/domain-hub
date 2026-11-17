@@ -296,7 +296,7 @@ export class DigitalPlatClient {
    */
   async listDomains(): Promise<DpDomainInfo[]> {
     const data = await this.request<DpDomainInfo[]>("GET", "/domains");
-    if (!Array.isArray(data)) return [];
+    if (!Array.isArray(data)) throw new Error("DigitalPlat 域名列表响应格式无效，未取得权威全量");
     return data.filter((d) => String(d.domain || d.name || "").trim() !== "");
   }
 

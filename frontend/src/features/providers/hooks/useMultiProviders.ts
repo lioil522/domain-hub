@@ -3,6 +3,7 @@ import { useAppData } from "../../../state/AppDataContext";
 import type { Account } from "../../../types/account";
 import type { Domain } from "../../../types/domain";
 import type { MultiProviderKey } from "../../../types/provider";
+import { observeSyncAction, type WaitForAccountSync } from "../../domains/utils/sync-action";
 import { MULTI_PROVIDER_META, MULTI_PROVIDER_ORDER, MULTI_PROVIDER_COLLAPSED_STORAGE } from "../providerMeta";
 
 /** `useMultiProviders` 的外部依赖 —— 由 `App.tsx` 注入 */
@@ -10,12 +11,7 @@ export interface UseMultiProvidersOptions {
   /** 动作级 loading 标记（App 的 `actionLoading` setter） */
   setActionLoading: (v: string | null) => void;
   /** 等待账号域名在后端落库后再刷新（App 的 `waitForAccountDomainSync`） */
-  waitForAccountDomainSync: (
-    accountIds: number[],
-    label: string,
-    baseline?: Map<number, string>,
-    providerLookup?: (id: number) => string | undefined
-  ) => Promise<void>;
+  waitForAccountDomainSync: WaitForAccountSync;
   /**
    * 同步单个账号（App 的 `handleSyncAccount`，来自 useDomainSync）。
    *
@@ -178,11 +174,12 @@ export function useMultiProviders({
     setActionLoading(loadingKey);
     try {
       for (const acc of list) {
-        await apiFetch(`/api/accounts/${acc.id}/sync`, { method: "POST" });
+        const response = await apiFetch(`/api/accounts/${acc.id}/sync`, { method: "POST" });
+        const data = await response.json();
+        if (!response.ok || data.success !== true) throw new Error(data.message || "启动同步失败");
+        await observeSyncAction(apiFetch, data.action_id, showToast);
       }
-      showToast("success", `已发起 ${list.length} 个 ${MULTI_PROVIDER_META[key].label} 账号的同步`);
-      // 等待后端后台同步落库后再刷新列表
-      setTimeout(() => fetchMultiProviderDomains(key), 3000);
+      await fetchMultiProviderDomains(key);
     } catch (e) {
       showToast("error", `${MULTI_PROVIDER_META[key].label} 同步请求失败`);
     } finally {
@@ -248,7 +245,7 @@ export function useMultiProviders({
         await fetchAccounts();
         if (primary || secondary) {
           // 换了凭据：等后台重新同步完成后刷新
-          await waitForAccountDomainSync([accountId], "凭据已更新", undefined, () => key);
+          await waitForAccountDomainSync([accountId], "凭据已更新", undefined, () => key, data.action_id);
         } else {
           await fetchMultiProviderDomains(key);
         }

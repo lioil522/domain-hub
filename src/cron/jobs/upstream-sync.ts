@@ -8,6 +8,7 @@ import { DnspodClient, mapDnspodDomainToUpstream } from "../../dnspod";
 import { AlidnsClient, mapAlidnsDomainToUpstream } from "../../alidns";
 import { HuaweiCloudClient, mapHuaweiZoneToUpstream } from "../../huaweicloud";
 import { VercelClient, mapVercelDomainToUpstream } from "../../vercel";
+import { UpstreamError } from "../../errors";
 
 /** 无需续期与到期提醒的 provider —— 它们只托管解析，域名注册有效期不在其 API 范围内 */
 export const PARSE_ONLY_PROVIDERS: readonly AccountProvider[] = [
@@ -51,21 +52,31 @@ export interface SubdomainClient {
 /**
  * 分页拉取某个账号下的全部子域名 (DNSHE)
  */
-export async function fetchAllSubdomainsFromClient(client: SubdomainClient): Promise<SubdomainInfo[]> {
+export async function fetchAllSubdomainsFromClient(client: SubdomainClient, options: { maxPages?: number; perPage?: number } = {}): Promise<SubdomainInfo[]> {
   const allSubdomains: SubdomainInfo[] = [];
-  const perPage = 500;
+  const perPage = options.perPage ?? 500;
+  const maxPages = options.maxPages ?? 50;
+  if (!Number.isSafeInteger(perPage) || perPage < 1 || perPage > 500 || !Number.isSafeInteger(maxPages) || maxPages < 1 || maxPages > 50) throw new Error("Invalid pagination budget");
+  const seen = new Set<number>();
   let page = 1;
   let hasMore = true;
 
   while (hasMore) {
     const res = await client.listSubdomains(page, perPage);
     if (!res || !res.success || !Array.isArray(res.subdomains)) {
-      throw new Error(res?.message || "响应数据格式错误");
+      throw new UpstreamError(res?.message || "响应数据格式错误");
     }
-
+    if (res.total !== undefined && (!Number.isSafeInteger(res.total) || res.total < 0)) throw new UpstreamError("上游分页总数无效");
+    for (const subdomain of res.subdomains) {
+      if (!subdomain || !Number.isSafeInteger(subdomain.id) || !subdomain.full_domain || seen.has(subdomain.id)) {
+        throw new UpstreamError("上游分页包含无效或重复域名，已停止同步");
+      }
+      seen.add(subdomain.id);
+    }
     allSubdomains.push(...res.subdomains);
 
     if (res.subdomains.length < perPage) {
+      if (res.total !== undefined && allSubdomains.length < res.total) throw new UpstreamError("上游分页响应不完整，已停止同步");
       hasMore = false;
     } else if (res.total !== undefined && allSubdomains.length >= res.total) {
       hasMore = false;
@@ -73,9 +84,8 @@ export async function fetchAllSubdomainsFromClient(client: SubdomainClient): Pro
       page++;
     }
 
-    if (page > 50) {
-      console.error("Pagination safety limit reached (50 pages), stopping.");
-      break;
+    if (hasMore && page > maxPages) {
+      throw new UpstreamError("上游分页超过单次预算，未取得权威全量；已停止同步，未执行差集删除");
     }
   }
 

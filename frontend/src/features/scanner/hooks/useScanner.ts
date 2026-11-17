@@ -27,8 +27,8 @@ export interface UseScannerOptions {
 export function useScanner({
   fetchDomains, setActiveTab, dnsheAccounts, actionLoading, setActionLoading
 }: UseScannerOptions) {
-  const { apiFetch, showToast } = useAppData();
-  const state = useScannerState();
+  const { apiFetch, showToast, backendUrl, sessionToken } = useAppData();
+  const state = useScannerState(backendUrl);
 
   const {
     DEFAULT_ROOT_DOMAINS, DEFAULT_RESERVED_PREFIXES,
@@ -165,6 +165,8 @@ export function useScanner({
     pauseScan
   } = useScannerBatchScan({
     apiFetch,
+    backendUrl,
+    sessionToken,
     showToast,
     dnsheAccounts,
     batchRules,

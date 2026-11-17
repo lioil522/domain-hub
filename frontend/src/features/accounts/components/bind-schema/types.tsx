@@ -1,6 +1,7 @@
 import type { LucideIcon } from "lucide-react";
 import type { ReactNode } from "react";
 import type { MultiProviderKey } from "../../../../types/provider";
+import type { WaitForAccountSync } from "../../../domains/utils/sync-action";
 
 export interface BindFieldSpec {
   /** 该字段在表单值袋里的键（alias 之外） */
@@ -30,12 +31,7 @@ export type BindFooterKind = "duo" | "solo";
  */
 export interface BindSyncDeps {
   fetchAccounts: () => Promise<void> | void;
-  waitForAccountDomainSync: (
-    accountIds: number[],
-    label: string,
-    baseline?: Map<number, string>,
-    providerLookup?: (id: number) => string | undefined
-  ) => Promise<void>;
+  waitForAccountDomainSync: WaitForAccountSync;
   fetchCfZones: (accountIdFilter?: string) => Promise<void> | void;
   fetchDpDomains: (accountIdFilter?: string) => Promise<void> | void;
   fetchMultiProviderDomains: (key: MultiProviderKey, accountIdFilter?: string) => Promise<void> | void;
@@ -50,6 +46,7 @@ export interface BindApiData extends Record<string, unknown> {
   success_count?: number;
   account?: { id?: number | string; alias?: string };
   account_ids?: Array<number | string>;
+  action_id?: string;
 }
 
 export interface BindSingleSpec {

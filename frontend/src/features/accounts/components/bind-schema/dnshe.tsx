@@ -28,7 +28,7 @@ export const DNSHE_SCHEMA: BindProviderSchema = {
     // 原实现：fetchAccounts() 与 waitForAccountDomainSync(...) 均不 await（fire-and-forget）
     onSuccess: (data, v, deps) => {
       deps.fetchAccounts();
-      deps.waitForAccountDomainSync([Number(data.account?.id)], `账号 [${data.account?.alias || v.apiKey}] 绑定成功`);
+      void deps.waitForAccountDomainSync([Number(data.account?.id)], `账号 [${data.account?.alias || v.apiKey}] 绑定成功`, undefined, undefined, data.action_id);
     },
     errorFallback: "账号绑定失败，请检查密钥是否正确",
     catchToast: "绑定请求发送失败，请检查网络",
@@ -76,7 +76,7 @@ export const DNSHE_SCHEMA: BindProviderSchema = {
     successToast: (data) => ({ level: "success", msg: data.message || "批量绑定完成" }),
     onSuccess: (data, deps) => {
       deps.fetchAccounts();
-      deps.waitForAccountDomainSync((data.account_ids || []).map(Number), `${(data.account_ids || []).length} 个账号绑定成功`);
+      void deps.waitForAccountDomainSync((data.account_ids || []).map(Number), `${(data.account_ids || []).length} 个账号绑定成功`, undefined, undefined, data.action_id);
     },
     errorFallback: "批量绑定失败",
     catchToast: "批量绑定请求发送失败，请检查网络",

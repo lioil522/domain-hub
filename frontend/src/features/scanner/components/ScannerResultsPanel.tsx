@@ -20,7 +20,7 @@ export function ScannerResultsPanel({ scanner }: ScannerResultsPanelProps) {
   return (
                   <div className="bg-surface border border-border-base rounded-2xl p-6 shadow-xl space-y-4">
                     <div className="flex items-center justify-between text-xs font-semibold text-content-secondary">
-                      <span>查重进度: {scanProgress.checked} / {scanProgress.total} ({Math.round((scanProgress.checked / scanProgress.total) * 100)}%)</span>
+                       <span>已确定: {scanProgress.checked} / {scanProgress.total} ({Math.round((scanProgress.checked / scanProgress.total) * 100)}%) · 未确定待重试: {scanProgress.failed || 0}</span>
                       <span className="text-emerald-400 font-bold">🎉 发现可用免费域名: {availableDomainsList.length} 个</span>
                     </div>
 
@@ -45,9 +45,9 @@ export function ScannerResultsPanel({ scanner }: ScannerResultsPanelProps) {
                         </div>
                       ) : (
                         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
-                          {availableDomainsList.map((item, idx) => (
+                           {availableDomainsList.map(item => (
                             <div
-                              key={idx}
+                               key={item.fullDomain}
                               className="bg-emerald-50 border border-emerald-200 dark:bg-emerald-950/30 dark:border-emerald-500/30 rounded-xl p-3 flex items-center justify-between gap-2 hover:border-emerald-500 transition-all"
                             >
                               <div className="min-w-0">

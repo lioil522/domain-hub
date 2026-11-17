@@ -32,6 +32,15 @@ export class ActionRepository {
     `, [next.status, next.progress, next.started_at || null, next.finished_at || null, next.error || null, JSON.stringify(next.metadata ?? null), id]);
   }
 
+  /** Terminal/cancelled actions cannot be overwritten by a late background callback. */
+  async updateActive(id: string, patch: { status: ActionStatus; progress: number; error?: string | null; metadata: unknown; finished_at?: string | null }): Promise<boolean> {
+    const result = await this.db.firstRaw<{ id: string }>(`
+      UPDATE actions SET status=?, progress=?, error=?, metadata=?, finished_at=?, updated_at=CURRENT_TIMESTAMP
+      WHERE id=? AND status IN ('queued','running') RETURNING id
+    `, [patch.status, patch.progress, patch.error ?? null, JSON.stringify(patch.metadata), patch.finished_at ?? null, id]);
+    return !!result;
+  }
+
   async get(id: string): Promise<StoredAction | null> {
     const row = await this.db.firstRaw<StoredAction>("SELECT * FROM actions WHERE id = ?", [id]);
     if (!row) return null;

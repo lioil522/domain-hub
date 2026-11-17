@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { useAppData } from "../../../state/AppDataContext";
-import { sleep } from "../../../lib/utils";
+import { observeSyncAction, type WaitForAccountSync } from "../../domains/utils/sync-action";
 import type { Account } from "../../../types/account";
 import type { Domain } from "../../../types/domain";
 
@@ -8,22 +8,15 @@ import type { Domain } from "../../../types/domain";
 export interface UseDpDomainsOptions {
   /** 动作级 loading 标记（App 的 `actionLoading` setter） */
   setActionLoading: (v: string | null) => void;
-  /** 账号域名指纹查询（App 的 `readAccountDomainFingerprint`，供同步等待比对用） */
-  readAccountDomainFingerprint: (accountId: number, provider?: string) => Promise<string | null>;
-  /** 等待账号域名在后端落库后再刷新（App 的 `waitForAccountDomainSync`，换 Key 时用） */
-  waitForAccountDomainSync: (
-    accountIds: number[],
-    label: string,
-    baseline?: Map<number, string>,
-    providerLookup?: (id: number) => string | undefined
-  ) => Promise<void>;
+  /** 等待同步任务的真实结果，换 Key 时也使用 action_id */
+  waitForAccountDomainSync: WaitForAccountSync;
 }
 
 /**
  * DigitalPlat 域名的列表状态、账号筛选、折叠、分组与同步动作
  *
- * 从 `App.tsx` 抽出（Phase 6-2），结构与 `useCfZones` 同构。**纯搬运**：
- * 请求路径、loading 键、本地存储键、指纹比对逻辑与全部注释逐字保留。
+ * 从 App 抽出（Phase 6-2），结构与 useCfZones 同构。
+ * 同步结果以 action_id 为准，不能用域名数量变化证明完成。
  *
  * 内容：
  *   - `dpDomains` / `loadingDpDomains` / `dpAccountFilter` 状态
@@ -32,11 +25,8 @@ export interface UseDpDomainsOptions {
  *   - `fetchDpDomains` / `handleDpSyncDomains`
  *   - `dpToggleAccountCollapse` / `dpToggleAllAccounts`
  *
- * NOTE: 与 `useCfZones` 不同，`readAccountDomainFingerprint` 由 App 注入而非私有复制，
- * 避免出现第三份拷贝（遵守「禁止重复实现」）。DP 账号的删/改（handleDpDeleteAccount /
- * handleDpUpdateAccount）仍留在 App（账号管理域，Phase 6-3 再收）。
  */
-export function useDpDomains({ setActionLoading, readAccountDomainFingerprint, waitForAccountDomainSync }: UseDpDomainsOptions) {
+export function useDpDomains({ setActionLoading, waitForAccountDomainSync }: UseDpDomainsOptions) {
   const { apiFetch, showToast, accounts, fetchAccounts } = useAppData();
 
   // 域名列表与账号筛选
@@ -121,37 +111,8 @@ export function useDpDomains({ setActionLoading, readAccountDomainFingerprint, w
         return;
       }
 
-      showToast("info", "同步任务已启动，域名落库后自动刷新…");
-
-      // 以当前各账号的域名指纹为基线，落库后自动刷新（与 Cloudflare 页的等待逻辑同构）
-      const accStats = new Map<number, { count: number; newest: string }>();
-      dpDomains.forEach((d) => {
-        const cur = accStats.get(d.account_id) || { count: 0, newest: "" };
-        cur.count += 1;
-        const updated = String((d as unknown as { updated_at?: string }).updated_at || "");
-        if (updated > cur.newest) cur.newest = updated;
-        accStats.set(d.account_id, cur);
-      });
-      const baseline = new Map<number, string>();
-      accStats.forEach((v, k) => baseline.set(k, `${v.count}:${v.newest}`));
-      const accountIds = (dpAccountList.length > 0
-        ? dpAccountList.map((a) => a.id)
-        : Array.from(baseline.keys()));
-      const deadline = Date.now() + 10_000 + accountIds.length * 5_000;
-      const pending = new Set(accountIds);
-
-      while (pending.size > 0 && Date.now() < deadline) {
-        await sleep(1500);
-        for (const id of [...pending]) {
-          const fingerprint = await readAccountDomainFingerprint(id, "digitalplat");
-          if (fingerprint !== null && fingerprint !== (baseline.get(id) ?? "0:")) {
-            pending.delete(id);
-          }
-        }
-      }
-
+      await observeSyncAction(apiFetch, data.action_id, showToast);
       await fetchDpDomains();
-      showToast("success", pending.size === 0 ? "域名同步完成" : "同步仍在后台进行，稍后可再次点击刷新");
     } catch (e) {
       showToast("error", "同步请求失败");
     } finally {
@@ -217,7 +178,7 @@ export function useDpDomains({ setActionLoading, readAccountDomainFingerprint, w
         await fetchAccounts();
         if (dpEditKey.trim()) {
           // 换了 Key：等后台重新同步完成后刷新
-          await waitForAccountDomainSync([accountId], "Key 已更新", undefined, () => "digitalplat");
+          await waitForAccountDomainSync([accountId], "Key 已更新", undefined, () => "digitalplat", data.action_id);
         } else {
           await fetchDpDomains();
         }

@@ -24,6 +24,7 @@ import { useAppData } from "../../../state/AppDataContext";
 import { BIND_FORM_SCHEMA, type BindBatchResult, type BindSyncDeps } from "./BIND_FORM_SCHEMA";
 import { GenericCredentialForm } from "./GenericCredentialForm";
 import { BindBatchForm } from "./BindBatchForm";
+import type { WaitForAccountSync } from "../../domains/utils/sync-action";
 
 export interface BindAccountModalProps {
   /** 是否打开 */
@@ -34,12 +35,7 @@ export interface BindAccountModalProps {
   actionLoading: string | null;
   setActionLoading: (v: string | null) => void;
   /** 等待账号域名在后端落库后再刷新列表（依赖较多，仍留在 App） */
-  waitForAccountDomainSync: (
-    accountIds: number[],
-    label: string,
-    baseline?: Map<number, string>,
-    providerLookup?: (id: number) => string | undefined
-  ) => Promise<void>;
+  waitForAccountDomainSync: WaitForAccountSync;
   /** 各 provider 域名列表刷新（仍在 App / 后续 Phase 迁移） */
   fetchCfZones: (accountIdFilter?: string) => Promise<void> | void;
   fetchDpDomains: (accountIdFilter?: string) => Promise<void> | void;

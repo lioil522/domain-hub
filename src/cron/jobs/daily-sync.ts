@@ -27,6 +27,7 @@ import {
 } from "../account-batch";
 import { collectExpiryReminders } from "./expiry-check";
 import { listUpstreamDomains, fetchAllSubdomainsFromClient } from "./upstream-sync";
+import { summarizeAccountSync, type AccountSyncResult, type AccountSyncSummary } from "../../services/sync-results";
 
 /**
  * 核心定时任务：全量同步所有账号的域名并自动续期即将到期的域名
@@ -37,8 +38,8 @@ export async function runDailySyncAndRenewal(
   webhookType: WebhookType = "custom",
   // 是否为定时触发（true=每日 Cron 任务，false=手动「同步域名」/账号绑定后的后台同步）
   isScheduled = false
-): Promise<void> {
-  await dbManager.ensureTables();
+): Promise<AccountSyncSummary> {
+  if (!await dbManager.ensureTables()) throw new Error("数据库初始化失败，未开始同步");
   await dbManager.writeLog("info", "system", "自动定时任务启动：开始执行域名同步与到期检测续期任务");
 
   // 读取数据库应用配置（优先级高于环境变量）
@@ -62,7 +63,7 @@ export async function runDailySyncAndRenewal(
   } catch (e: unknown) {
     const message = e instanceof Error ? e.message : "未知错误";
     await dbManager.writeLog("error", "system", "同步任务失败：无法获取绑定的账户列表", message);
-    return;
+    throw e;
   }
 
   let totalSynced = 0;
@@ -70,6 +71,7 @@ export async function runDailySyncAndRenewal(
   let totalRenewFail = 0;
   const renewLogs: string[] = [];
   const expiryReminderLogs: string[] = [];
+  const syncResults: AccountSyncResult[] = [];
 
   // 到期提醒统一前置（与账号分批解耦）
   await collectExpiryReminders(dbManager, renewThresholdDays, expiryReminderLogs);
@@ -107,6 +109,7 @@ export async function runDailySyncAndRenewal(
         }
 
         const result = await syncCloudflareSlice(dbManager, acc.id, client);
+        syncResults.push({ accountId: acc.id, alias, status: result.completed ? "completed" : "paused", domainCount: result.totalSynced, nextPage: result.nextPage });
         if (result.completed) totalSynced += result.totalSynced;
         await dbManager.writeLog("info", "sync", result.completed
           ? `Cloudflare 账号 [${alias}] zone 列表同步完成，本账号共 ${result.totalSynced} 个 zone`
@@ -120,6 +123,7 @@ export async function runDailySyncAndRenewal(
           throw new Error("DigitalPlat 账号客户端异常");
         }
         if (isScheduled) {
+          syncResults.push({ accountId: acc.id, alias, status: "skipped" });
           continue;
         }
         const dpDomains = await client.listDomains();
@@ -132,11 +136,13 @@ export async function runDailySyncAndRenewal(
         }
         await dbManager.syncAccountDomains(acc.id, dpDomains.map(mapDomainToUpstream));
         totalSynced += dpDomains.length;
+        syncResults.push({ accountId: acc.id, alias, status: "completed", domainCount: dpDomains.length });
         continue;
       }
 
       // 3. 自定义服务商分组
       if (provider === "custom") {
+        syncResults.push({ accountId: acc.id, alias, status: "skipped" });
         continue;
       }
 
@@ -148,11 +154,13 @@ export async function runDailySyncAndRenewal(
         provider === "vercel"
       ) {
         if (isScheduled) {
+          syncResults.push({ accountId: acc.id, alias, status: "skipped" });
           continue;
         }
         const list = await listUpstreamDomains(client);
         await dbManager.syncAccountDomains(acc.id, list);
         totalSynced += list.length;
+        syncResults.push({ accountId: acc.id, alias, status: "completed", domainCount: list.length });
         continue;
       }
 
@@ -162,6 +170,7 @@ export async function runDailySyncAndRenewal(
 
       // 5. DNSHE 系统全量域名拉取
       const subdomains = await fetchAllSubdomainsFromClient(client);
+      let failedRecords = 0;
 
       const cfZones = await collectManagedCfZones(dbManager);
       const cfFastPath = new Map<number, { alias: string; zoneId: string }>();
@@ -188,11 +197,13 @@ export async function runDailySyncAndRenewal(
         async (sub): Promise<UpstreamSubdomain> => {
           try {
             const recordsRes = await client.listDnsRecords(sub.id);
-            const records = recordsRes.records || [];
+            if (recordsRes.success !== true || !Array.isArray(recordsRes.records)) throw new Error(recordsRes.message || "解析记录响应无效");
+            const records = recordsRes.records;
             await dbManager.setCache(`api_cache:dns:${sub.id}`, JSON.stringify(records));
             return { ...sub, ...computeDnsState(records) };
           } catch (e) {
             if (isSubrequestLimitError(e)) throw e;
+            failedRecords++;
             return { ...sub };
           }
         },
@@ -278,10 +289,13 @@ export async function runDailySyncAndRenewal(
           }
         }
       }
+      syncResults.push({ accountId: acc.id, alias, status: failedRecords ? "failed" : "completed", domainCount: subdomains.length,
+        error: failedRecords ? `${failedRecords} 个解析状态未知，需重试` : undefined });
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : "未知错误";
       const stack = e instanceof Error ? e.stack || message : message;
       await dbManager.writeLog("error", "sync", `同步账号 [${acc.alias}] 的域名数据失败：${message}`, stack);
+      syncResults.push({ accountId: acc.id, alias: acc.alias, status: "failed", error: message });
       if (isSubrequestLimitError(e)) {
         await dbManager.writeLog(
           "warning",
@@ -289,8 +303,16 @@ export async function runDailySyncAndRenewal(
           "检测到 Worker 子请求配额已耗尽（免费计划单次调用硬限 50 次），已跳过本批次剩余账号。下一轮定时任务会从本轮中断处继续，不会漏掉账号。可尝试：把域名较多的账号拆分成多个 API Token 绑定，或升级到 Workers 付费计划"
         );
         quotaExhausted = true;
+        const index = accountsThisRun.findIndex(item => item.id === acc.id);
+        lastProcessedId = accountsThisRun[index - 1]?.id ?? cursorBefore.lastId;
         break;
       }
+    }
+  }
+
+  for (const account of accountsThisRun) {
+    if (!syncResults.some(result => result.accountId === account.id)) {
+      syncResults.push({ accountId: account.id, alias: account.alias, status: "paused", error: "本轮预算耗尽，尚未处理" });
     }
   }
 
@@ -354,4 +376,5 @@ export async function runDailySyncAndRenewal(
       await sendTelegramNotification(tgToken, tgChatId, reminderBody);
     }
   }
+  return { ...summarizeAccountSync(syncResults), error: totalRenewFail ? `${totalRenewFail} 个域名续期失败` : undefined };
 }

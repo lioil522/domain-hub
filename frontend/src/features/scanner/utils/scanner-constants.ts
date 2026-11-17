@@ -1,4 +1,5 @@
 export const MAX_PREFIXES = 300000;
+export const MAX_SCANNER_TASKS = 300000;
 
 export const DEFAULT_ROOT_DOMAINS = [
   "us.ci", "l.cd", "cc.cd", "cn.mt", "bot.cd", "de5.net", "ccwu.cc", "ddns.ge", "bbroot.com"

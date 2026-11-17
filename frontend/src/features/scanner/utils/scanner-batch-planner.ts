@@ -1,6 +1,6 @@
 import { toASCII } from "../../../punycode";
 import { countCombos, generateCombos, parseRule } from "../../../rulegen";
-import { MAX_PREFIXES } from "./scanner-constants";
+import { MAX_PREFIXES, MAX_SCANNER_TASKS } from "./scanner-constants";
 import { generateSeqPrefixes } from "./scanner-sequence";
 
 export type ScannerRuleResolver = (name: string) => string[] | null;
@@ -31,7 +31,8 @@ export type BatchPlanIssue =
   | { kind: "invalid-sequence" }
   | { kind: "unknown-tokens"; tokens: string[] }
   | { kind: "empty-rules" }
-  | { kind: "all-reserved" };
+  | { kind: "all-reserved" }
+  | { kind: "too-many-tasks"; limit: number };
 
 export type BatchPlanResult =
   | { ok: true; plan: BatchPlan; warnings: string[] }
@@ -94,6 +95,9 @@ export function createBatchPlan(options: BatchPlanOptions): BatchPlanResult {
   }
 
   const tasks: ScannerTask[] = [];
+  if (prefixes.length * options.selectedRoots.length > MAX_SCANNER_TASKS) {
+    return { ok: false, issue: { kind: "too-many-tasks", limit: MAX_SCANNER_TASKS } };
+  }
   for (const sub of prefixes) {
     for (const root of options.selectedRoots) {
       const full = `${sub}.${root}`;

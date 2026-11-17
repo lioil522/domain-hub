@@ -5,8 +5,11 @@ import { DEFAULT_ROOT_DOMAINS, DEFAULT_RESERVED_PREFIXES } from "../utils/scanne
 import { loadWordBanks } from "../../../wordbanks";
 import type { AvailableDomain, ScanLog, ScanStatus, ScannerParams, WhoisResult } from "../utils/scanner-types";
 import { loadCustomRootDomains, loadReservedFilterEnabled, loadReservedPrefixes, loadScanCursor } from "../utils/scanner-storage";
+import { isScanCursorV2 } from "../utils/scanner-checkpoint";
 
-export function useScannerState() {
+export function useScannerState(backendUrl = "") {
+  const [scanCursor, setScanCursor] = useState(() => loadScanCursor(backendUrl));
+  const restored = isScanCursorV2(scanCursor) ? scanCursor : null;
   const [allRootDomains, setAllRootDomains] = useState<string[]>(() => loadCustomRootDomains(DEFAULT_ROOT_DOMAINS));
   const [newRootInput, setNewRootInput] = useState("");
   const [searchSubdomain, setSearchSubdomain] = useState("");
@@ -15,20 +18,19 @@ export function useScannerState() {
   const [whoisResult, setWhoisResult] = useState<WhoisResult | null>(null);
   const [registerAccountId, setRegisterAccountId] = useState<number | "">("");
   const [regMode, setRegMode] = useState<"single" | "batch">("single");
-  const [batchRules, setBatchRules] = useState("");
-  const [excludeChars, setExcludeChars] = useState("");
-  const [selectedRoots, setSelectedRoots] = useState<string[]>([]);
-  const [batchLength, setBatchLength] = useState(2);
+  const [batchRules, setBatchRules] = useState(restored?.plan.batchRules || "");
+  const [excludeChars, setExcludeChars] = useState(restored?.plan.excludeChars || "");
+  const [selectedRoots, setSelectedRoots] = useState<string[]>(restored?.plan.selectedRoots || []);
+  const [batchLength, setBatchLength] = useState(restored?.plan.batchLength || 2);
   const [scanStatus, setScanStatus] = useState<ScanStatus>("idle");
   const scanControlRef = useRef<ScanStatus>("idle");
-  const [scanProgress, setScanProgress] = useState<ScannerParams>({ total: 0, checked: 0, available: 0 });
-  const [availableDomainsList, setAvailableDomainsList] = useState<AvailableDomain[]>([]);
+  const [scanProgress, setScanProgress] = useState<ScannerParams>({ total: restored?.total || 0, checked: restored?.checked || 0, available: restored?.availableDomains.length || 0, failed: restored?.failedIndices.length || 0 });
+  const [availableDomainsList, setAvailableDomainsList] = useState<AvailableDomain[]>(restored?.availableDomains || []);
   const [scanLogs, setScanLogs] = useState<ScanLog[]>([]);
-  const [seqMode, setSeqMode] = useState(false);
-  const [seqCharset, setSeqCharset] = useState<"字母" | "数字" | "字母数字">("字母");
-  const [seqLength, setSeqLength] = useState(3);
-  const [seqStart, setSeqStart] = useState("");
-  const [scanCursor, setScanCursor] = useState(() => loadScanCursor());
+  const [seqMode, setSeqMode] = useState(restored?.plan.seqMode || false);
+  const [seqCharset, setSeqCharset] = useState<"字母" | "数字" | "字母数字">(restored?.plan.seqCharset || "字母");
+  const [seqLength, setSeqLength] = useState(restored?.plan.seqLength || 3);
+  const [seqStart, setSeqStart] = useState(restored?.plan.seqStart || "");
   const scanCursorRef = useRef({ lastCandidate: "", taskIndex: 0, checked: 0 });
   const [ignorePool, setIgnorePool] = useState(false);
   const [reservedPrefixes, setReservedPrefixes] = useState<string[]>(() => loadReservedPrefixes(DEFAULT_RESERVED_PREFIXES));

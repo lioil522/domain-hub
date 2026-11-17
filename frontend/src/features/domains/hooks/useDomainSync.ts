@@ -1,6 +1,7 @@
 import { useAppData } from "../../../state/AppDataContext";
 import { accountsApi } from "../../../api/endpoints/accounts";
 import { domainsApi } from "../../../api/endpoints/domains";
+import { observeSyncAction } from "../utils/sync-action";
 
 /** `useDomainSync` 的外部依赖 —— 均由 `App.tsx` 注入 */
 export interface UseDomainSyncOptions {
@@ -17,8 +18,8 @@ export interface UseDomainSyncOptions {
 /**
  * 域名同步动作（全量 / DNSHE / 单账号）
  *
- * 从 `App.tsx` 抽出（Phase 4-J）。**纯搬运**：接口路径、loading 键、延迟刷新
- * 时长（5000 / 5000 / 3000ms）与全部 toast 文案逐字保留。
+ * 从 App 抽出后，同步等待已改为核验 action_id 的真实结果，
+ * 不再以固定延迟刷新或“任务已启动”推断同步完成。
  *
  * 为什么 `apiFetch` / `showToast` 走 `useAppData()`：Provider 级横切能力，
  * 与 App 内调用点共用同一实例，少两个 prop。
@@ -43,11 +44,9 @@ export function useDomainSync({
     try {
       const data = await domainsApi.syncAll(apiFetch);
       if (data.success) {
-        showToast("success", data.message || "同步域名任务已成功在后台启动");
-        setTimeout(() => {
-          refreshDomains();
-          refreshAllProviderDomains();
-        }, 5000);
+        await observeSyncAction(apiFetch, data.action_id, showToast);
+        refreshDomains();
+        refreshAllProviderDomains();
       } else {
         showToast("error", data.message || "启动同步域名任务失败");
       }
@@ -69,8 +68,8 @@ export function useDomainSync({
     try {
       const data = await domainsApi.syncProvider(apiFetch, "dnshe");
       if (data.success) {
-        showToast("success", data.message || "DNSHE 账号同步已在后台启动");
-        setTimeout(() => refreshDomains(), 5000);
+        await observeSyncAction(apiFetch, data.action_id, showToast);
+        refreshDomains();
       } else {
         showToast("error", data.message || "启动 DNSHE 同步失败");
       }
@@ -93,11 +92,8 @@ export function useDomainSync({
     try {
       const data = await accountsApi.sync(apiFetch, accountId);
       if (data.success) {
-        showToast("success", data.message || "同步已在后台启动");
-        // 延迟刷新对应 provider 的域名列表，等待后台同步完成
-        setTimeout(() => {
-          refreshProviderDomains(provider);
-        }, 3000);
+        await observeSyncAction(apiFetch, data.action_id, showToast);
+        refreshProviderDomains(provider);
       } else {
         showToast("error", data.message || "同步失败");
       }

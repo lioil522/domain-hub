@@ -1,5 +1,6 @@
 import { ActionRepository, type StoredAction } from "../repositories/action-repository";
 import { isActionType, type ActionType } from "../actions/action-types";
+import type { AccountSyncSummary } from "./sync-results";
 
 export class ActionService {
   constructor(private readonly repository: ActionRepository) {}
@@ -32,5 +33,28 @@ export class ActionService {
 
   async cancel(id: string) {
     return this.update(id, { status: "cancelled", finished_at: new Date().toISOString() });
+  }
+
+  async updateSyncProgress(id: string, metadata: unknown, progress: number) {
+    return this.repository.updateActive(id, { status: "running", metadata, progress: Math.min(99, progress) });
+  }
+
+  async finishSync(id: string, summary: AccountSyncSummary, metadata: Record<string, unknown>) {
+    const total = summary.results.length || 1;
+    const failed = summary.failed > 0 || !!summary.error;
+    const status = failed ? "failed" : summary.paused > 0 ? "paused" : "completed";
+    await this.repository.updateActive(id, {
+      status, progress: status === "completed" ? 100 : Math.round(100 * (summary.completed + summary.skipped) / total),
+      error: failed ? summary.error || `${summary.failed} 个账号同步失败；请查看逐账号结果` : null,
+      metadata: { ...metadata, summary }, finished_at: new Date().toISOString(),
+    });
+    return this.get(id);
+  }
+
+  async failActive(id: string, error: string, metadata: Record<string, unknown>) {
+    const current = await this.get(id);
+    if (!current) return;
+    await this.repository.updateActive(id, { status: "failed", progress: current.progress, error,
+      metadata: { ...metadata, previous: current.metadata }, finished_at: new Date().toISOString() });
   }
 }

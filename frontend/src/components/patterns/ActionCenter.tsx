@@ -6,11 +6,21 @@ import { actionsApi } from "../../api/endpoints/actions";
 type ActionItem = {
   id: string;
   type: string;
-  status: "queued" | "running" | "completed" | "failed" | "cancelled";
+  status: "queued" | "running" | "paused" | "completed" | "failed" | "cancelled";
   progress: number;
   error?: string | null;
   metadata?: unknown;
 };
+
+function syncDetails(metadata: unknown): Array<{ accountId: number; alias: string; status: string; error?: string; nextPage?: number }> {
+  if (!metadata || typeof metadata !== "object") return [];
+  const record = metadata as Record<string, unknown>;
+  const summary = record.summary && typeof record.summary === "object" ? record.summary as Record<string, unknown> : {};
+  const rows = summary.results || record.results;
+  return Array.isArray(rows) ? rows.filter(row => row && typeof row.accountId === "number" && typeof row.alias === "string" &&
+    ["completed", "failed", "paused", "skipped"].includes(row.status) && (row.error == null || typeof row.error === "string") &&
+    (row.nextPage === undefined || (Number.isSafeInteger(row.nextPage) && row.nextPage > 0))).slice(0, 20) : [];
+}
 
 function label(type: string): string {
   const labels: Record<string, string> = {
@@ -34,6 +44,8 @@ function statusText(status: ActionItem["status"]): string {
       return "执行失败";
     case "cancelled":
       return "已取消";
+    case "paused":
+      return "分片已保存，待继续";
     case "running":
       return "执行中";
     case "queued":
@@ -46,7 +58,7 @@ function statusText(status: ActionItem["status"]): string {
 function StatusIcon({ status }: { status: ActionItem["status"] }) {
   if (status === "completed") return <CheckCircle2 className="w-4 h-4 text-accent flex-shrink-0" />;
   if (status === "failed") return <XCircle className="w-4 h-4 text-[var(--state-danger-fg)] flex-shrink-0" />;
-  if (status === "cancelled") return <PauseCircle className="w-4 h-4 text-content-muted flex-shrink-0" />;
+  if (status === "cancelled" || status === "paused") return <PauseCircle className="w-4 h-4 text-content-muted flex-shrink-0" />;
   if (status === "queued") return <Clock className="w-4 h-4 text-content-muted flex-shrink-0" />;
   return <Activity className="w-4 h-4 text-accent animate-pulse flex-shrink-0" />;
 }
@@ -253,6 +265,12 @@ export function ActionCenter({ apiFetch }: { apiFetch: ApiFetch }) {
                         {item.error}
                       </div>
                     )}
+                    {syncDetails(item.metadata).map(result => (
+                      <div key={result.accountId} className="text-[11px] text-content-muted break-all">
+                        {result.alias}：{result.status === "completed" ? "完成" : result.status === "failed" ? "失败" : result.status === "paused" ? `待继续（第 ${result.nextPage || "?"} 页）` : "跳过"}
+                        {result.error ? ` · ${result.error}` : ""}
+                      </div>
+                    ))}
                   </div>
                 );
               })

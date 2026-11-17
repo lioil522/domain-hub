@@ -5,11 +5,14 @@
  * 使所有调用方获得编译期的字段提示和类型校验。
  */
 
+import { UpstreamRateLimitError } from "./errors";
+
 /** 通用基础响应 */
 export interface BaseResponse {
   success: boolean;
   message?: string;
   error?: string;
+  error_code?: string;
 }
 
 /** 配额查询响应 */
@@ -183,6 +186,7 @@ export class DNSHEClient {
     const options: RequestInit = {
       method,
       headers,
+      signal: AbortSignal.timeout(15000),
     };
 
     if (method === "GET") {
@@ -210,9 +214,15 @@ export class DNSHEClient {
           (typeof errData.error === "string" && errData.error) ||
           (typeof errData.detail === "string" && errData.detail) ||
           `HTTP error! status: ${response.status}`;
-        throw new Error(errMsg);
+        if (response.status === 429 || ["rate_limited", "quota_exceeded"].includes(String(errData.error_code || ""))) {
+          throw new UpstreamRateLimitError(errMsg, response.headers.get("Retry-After") || undefined);
+        }
+        throw new Error(`HTTP ${response.status}: ${errMsg}`);
       }
       const data: T = await response.json();
+      if (!data.success && ["rate_limited", "quota_exceeded"].includes(String(data.error_code || ""))) {
+        throw new UpstreamRateLimitError(data.message || "DNSHE 上游限流或配额耗尽", response.headers.get("Retry-After") || undefined);
+      }
       return data;
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : "Unknown error";

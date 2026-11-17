@@ -1,4 +1,5 @@
-import type { ScanCursor } from "./scanner-types";
+import type { ScanCursor, ScanCursorV2 } from "./scanner-types";
+import { isScanCursorV2 } from "./scanner-checkpoint";
 
 export const SCANNER_STORAGE_KEYS = {
   customRootDomains: "DNSHE_CUSTOM_ROOT_DOMAINS",
@@ -44,14 +45,28 @@ export function saveReservedFilterEnabled(enabled: boolean) {
   localStorage.setItem(SCANNER_STORAGE_KEYS.reservedFilterOff, enabled ? "0" : "1");
 }
 
-export function loadScanCursor(): ScanCursor | null {
-  return readJson<ScanCursor>(SCANNER_STORAGE_KEYS.scanCursor);
+export function scannerBackendKey(backend = ""): string {
+  return backend.trim().replace(/\/+$/, "") || "/";
 }
 
-export function saveScanCursor(cursor: ScanCursor) {
-  localStorage.setItem(SCANNER_STORAGE_KEYS.scanCursor, JSON.stringify(cursor));
+function cursorKey(backend: string) {
+  return `${SCANNER_STORAGE_KEYS.scanCursor}:${encodeURIComponent(scannerBackendKey(backend))}`;
 }
 
-export function clearScanCursor() {
+export function loadScanCursor(backend = ""): ScanCursor | ScanCursorV2 | null {
+  const parsed = readJson<unknown>(cursorKey(backend));
+  if (isScanCursorV2(parsed) && parsed.backend === scannerBackendKey(backend)) return parsed;
+  // Keep old checkpoints visible, but require a fresh scan rather than guessing their missing configuration.
+  const legacy = readJson<ScanCursor>(SCANNER_STORAGE_KEYS.scanCursor);
+  return legacy && typeof legacy.lastCandidate === "string" && Number.isSafeInteger(legacy.checked) && legacy.checked >= 0 ? legacy : null;
+}
+
+export function saveScanCursor(cursor: ScanCursorV2) {
+  if (!isScanCursorV2(cursor)) throw new Error("扫描检查点无效，已拒绝保存");
+  localStorage.setItem(cursorKey(cursor.backend), JSON.stringify(cursor));
+}
+
+export function clearScanCursor(backend = "") {
+  localStorage.removeItem(cursorKey(backend));
   localStorage.removeItem(SCANNER_STORAGE_KEYS.scanCursor);
 }

@@ -58,3 +58,12 @@ export class ConflictError extends AppError {
     super(message, 409, code);
   }
 }
+
+export class UpstreamRateLimitError extends AppError {
+  readonly retryAfter?: string;
+  constructor(message: string, retryAfter?: string) {
+    super(message, 429, "rate_limited");
+    const seconds = retryAfter && /^\d+$/.test(retryAfter) ? Number(retryAfter) : retryAfter ? Math.ceil((Date.parse(retryAfter) - Date.now()) / 1000) : NaN;
+    if (Number.isFinite(seconds)) this.retryAfter = String(Math.max(0, Math.min(86400, seconds)));
+  }
+}

@@ -4,7 +4,8 @@
 
 import { DatabaseManager, UpstreamSubdomain } from "../../db";
 import { DNSHEClient } from "../../dnshe";
-import { CloudflareClient, mapZoneToUpstream, type CfZoneInfo } from "../../cloudflare";
+import { CloudflareClient } from "../../cloudflare";
+import { syncCloudflareSlice } from "../../services/cloudflare-sync-service";
 import { DigitalPlatClient, mapDomainToUpstream } from "../../digitalplat";
 import { computeDnsState } from "../../dns-provider";
 
@@ -15,12 +16,7 @@ import {
 } from "../notification";
 import { batchedPromiseAll, isSubrequestLimitError } from "../utils";
 import {
-  CF_ZONE_PROBE_PAGES,
-  CF_ZONE_ROUNDS_PER_RUN,
-  CF_ZONE_CURSOR_TTL,
   DNS_RECORDS_CACHE_MODE_KEY,
-  cfZoneCursorKey,
-  readCfZoneCursor,
   collectManagedCfZones,
 } from "../cf-helpers";
 import {
@@ -110,35 +106,11 @@ export async function runDailySyncAndRenewal(
           throw new Error("Cloudflare 账号客户端异常");
         }
 
-        const cursorKey = cfZoneCursorKey(acc.id);
-        const cursor = await readCfZoneCursor(dbManager, cursorKey);
-
-        let zones: CfZoneInfo[] = [];
-        for (let page = cursor.startPage, round = 0; round < CF_ZONE_ROUNDS_PER_RUN; round++) {
-          const res = await client.listZones({ startPage: page, maxPages: CF_ZONE_PROBE_PAGES });
-          zones = zones.concat(res.zones);
-          if (!res.hasMore) {
-            const total = cursor.syncedBefore + zones.length;
-            await dbManager.syncAccountDomains(acc.id, zones.map(mapZoneToUpstream));
-            await dbManager.setCache(cursorKey, "", 1);
-            totalSynced += total;
-            await dbManager.writeLog(
-              "info",
-              "sync",
-              `Cloudflare 账号 [${alias}] zone 列表同步完成，本账号共 ${total} 个 zone`
-            );
-            break;
-          }
-          await dbManager.upsertAccountDomains(acc.id, res.zones.map(mapZoneToUpstream));
-          cursor.syncedBefore += res.zones.length;
-          page = res.nextPage;
-          await dbManager.setCache(cursorKey, JSON.stringify(cursor), CF_ZONE_CURSOR_TTL);
-          await dbManager.writeLog(
-            "info",
-            "sync",
-            `Cloudflare 账号 [${alias}] zone 数量较多，本次已同步 ${res.zones.length} 个，剩余部分将在后续定时任务中从第 ${page} 页续拉`
-          );
-        }
+        const result = await syncCloudflareSlice(dbManager, acc.id, client);
+        if (result.completed) totalSynced += result.totalSynced;
+        await dbManager.writeLog("info", "sync", result.completed
+          ? `Cloudflare 账号 [${alias}] zone 列表同步完成，本账号共 ${result.totalSynced} 个 zone`
+          : `Cloudflare 账号 [${alias}] 本周期已同步 ${result.totalSynced} 个 zone，后续定时任务将从第 ${result.nextPage} 页续拉`);
         continue;
       }
 

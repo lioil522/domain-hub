@@ -140,3 +140,25 @@ CREATE TABLE IF NOT EXISTS scanner_jobs (
     finished_at TEXT,
     error TEXT
 );
+
+-- 10. Cloudflare 分页同步的持久游标与账号租约（不属于业务迁移快照）
+CREATE TABLE IF NOT EXISTS cf_sync_state (
+    account_id INTEGER PRIMARY KEY,
+    generation TEXT NOT NULL,
+    next_page INTEGER NOT NULL,
+    total_synced INTEGER NOT NULL,
+    lease_token TEXT NOT NULL,
+    lease_until INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+
+-- 11. 同步周期内看到的对象及初始删除候选；只有完整周期才允许清理
+CREATE TABLE IF NOT EXISTS cf_sync_seen (
+    account_id INTEGER NOT NULL,
+    generation TEXT NOT NULL,
+    domain_id INTEGER NOT NULL,
+    seen INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (account_id, generation, domain_id),
+    FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);

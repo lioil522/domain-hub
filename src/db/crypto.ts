@@ -1,3 +1,5 @@
+import { ServiceUnavailableError } from "../errors";
+
 /**
  * AES-GCM 加解密 / PBKDF2 密码哈希 / 恒定时间比较
  *
@@ -25,11 +27,11 @@ async function getCryptoKey(aesKeyStr: string): Promise<CryptoKey> {
  * AES-GCM 加密文本
  *
  * NOTE: 当 aesKeyStr 存在但加密失败时，抛出异常而非静默降级为 Base64。
- * 仅在 aesKeyStr 本身为空时允许使用 Base64 弱编码作为降级方案。
+ * 新写入必须配置密钥；历史 plain: 格式仅允许读取，不再生成。
  */
 export async function encryptText(text: string, aesKeyStr?: string): Promise<string> {
   if (!aesKeyStr) {
-    return "plain:" + btoa(text);
+    throw new ServiceUnavailableError("未配置 AES_KEY，无法安全保存密钥");
   }
 
   const encoder = new TextEncoder();

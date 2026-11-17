@@ -91,6 +91,7 @@ export function useSettings(opts: UseSettingsOptions) {
   const [twoFaSetup, setTwoFaSetup] = useState<{ secret: string; otpauth_uri: string } | null>(null);
   const [twoFaEnableToken, setTwoFaEnableToken] = useState("");
   const [twoFaDisableToken, setTwoFaDisableToken] = useState("");
+  const [twoFaPassword, setTwoFaPassword] = useState("");
 
   const fetchSettings = async () => {
     setLoadingSettings(true);
@@ -254,17 +255,22 @@ export function useSettings(opts: UseSettingsOptions) {
 
   // 第一步：生成 2FA 密钥与二维码
   const handleStart2faSetup = async () => {
+    if (!twoFaPassword) { showToast("error", "请输入登录密码以确认安全操作"); return; }
     setActionLoading("2fa-setup");
     try {
-      const data = await apiJson<SettingsApiResponse>(apiFetch, "/api/auth/2fa/setup", { method: "POST" });
+      const data = await apiJson<SettingsApiResponse>(apiFetch, "/api/auth/2fa/setup", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password: twoFaPassword }),
+      });
       if (data.success) {
         setTwoFaSetup({ secret: data.secret, otpauth_uri: data.otpauth_uri });
         setTwoFaEnableToken("");
+        setTwoFaPassword("");
       } else {
         showToast("error", data.message || "生成 2FA 密钥失败");
       }
     } catch (e) {
-      showToast("error", "生成 2FA 密钥请求失败");
+      showToast("error", e instanceof Error ? e.message : "生成 2FA 密钥请求失败");
     } finally {
       setActionLoading(null);
     }
@@ -292,7 +298,7 @@ export function useSettings(opts: UseSettingsOptions) {
         showToast("error", data.message || "开启 2FA 失败");
       }
     } catch (e) {
-      showToast("error", "开启 2FA 请求失败");
+      showToast("error", e instanceof Error ? e.message : "开启 2FA 请求失败");
     } finally {
       setActionLoading(null);
     }
@@ -300,6 +306,7 @@ export function useSettings(opts: UseSettingsOptions) {
 
   // 关闭 2FA（需输入当前动态码确认）
   const handleDisable2fa = async () => {
+    if (!twoFaPassword) { showToast("error", "请输入登录密码以确认安全操作"); return; }
     if (!twoFaDisableToken) {
       showToast("error", "请输入身份验证器上的 6 位动态码以确认关闭 2FA");
       return;
@@ -309,17 +316,18 @@ export function useSettings(opts: UseSettingsOptions) {
       const data = await apiJson<SettingsApiResponse>(apiFetch, "/api/auth/2fa/disable", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ token: twoFaDisableToken }),
+        body: JSON.stringify({ token: twoFaDisableToken, password: twoFaPassword }),
       });
       if (data.success) {
         showToast("success", data.message || "两步验证已关闭");
         setTwoFaDisableToken("");
+        setTwoFaPassword("");
         fetchAccountInfo();
       } else {
         showToast("error", data.message || "关闭 2FA 失败");
       }
     } catch (e) {
-      showToast("error", "关闭 2FA 请求失败");
+      showToast("error", e instanceof Error ? e.message : "关闭 2FA 请求失败");
     } finally {
       setActionLoading(null);
     }
@@ -349,6 +357,8 @@ export function useSettings(opts: UseSettingsOptions) {
     setTwoFaEnableToken,
     twoFaDisableToken,
     setTwoFaDisableToken,
+    twoFaPassword,
+    setTwoFaPassword,
     // actions
     fetchSettings,
     handleSaveSettings,

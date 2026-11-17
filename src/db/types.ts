@@ -42,6 +42,7 @@ export interface AuthConfig {
   passSalt: string;
   twoFaEnabled: boolean;
   twoFaSecret: string; // 已解密的 TOTP 密钥（Base32），未开启则为空
+  twoFaSecretCipher?: string; // 内部 CAS 使用，不下发给前端
   initialized: boolean; // 是否已完成首次密码设置
 }
 

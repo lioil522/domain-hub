@@ -1,10 +1,10 @@
 import type { DatabaseManager, UpstreamSubdomain } from "../db";
 import { DNSHEClient } from "../dnshe";
-import { CloudflareClient, mapZoneToUpstream } from "../cloudflare";
+import { CloudflareClient } from "../cloudflare";
 import { HuaweiCloudClient } from "../huaweicloud";
-import type { CfZoneInfo } from "../cloudflare";
 import { DigitalPlatClient, mapDomainToUpstream } from "../digitalplat";
-import { fetchAllSubdomainsFromClient, listUpstreamDomains, PARSE_ONLY_PROVIDERS, cfZoneCursorKey, readCfZoneCursor, CF_ZONE_CURSOR_TTL, CF_ZONE_ROUNDS_PER_RUN } from "../cron";
+import { fetchAllSubdomainsFromClient, listUpstreamDomains, PARSE_ONLY_PROVIDERS } from "../cron";
+import { syncCloudflareSlice } from "./cloudflare-sync-service";
 import { computeDnsState } from "../dns-provider";
 import type { DnsState } from "../dns-provider";
 import { AccountService } from "./account-service";
@@ -27,44 +27,11 @@ function cacheService(db: DatabaseManager): CacheService {
   return new CacheService(db);
 }
 export async function syncCloudflareZones(dbManager: DatabaseManager, accountId: number, client: CloudflareClient): Promise<number> {
-  const cursorKey = cfZoneCursorKey(accountId);
-  const cursor = await readCfZoneCursor(dbManager, cursorKey);
-
-  const zones: CfZoneInfo[] = [];
-  let completed = false;
-  for (let page = cursor.startPage, round = 0; round < CF_ZONE_ROUNDS_PER_RUN; round++) {
-    const res = await client.listZones({ startPage: page, maxPages: 1 });
-    zones.push(...res.zones);
-    if (!res.hasMore) {
-      completed = true;
-      break;
-    }
-    // 本页满员且预算用尽 —— 先把这半截落库（只增不删），游标记下进度
-    if (round === CF_ZONE_ROUNDS_PER_RUN - 1) {
-      await dbManager.upsertAccountDomains(accountId, zones.map(mapZoneToUpstream));
-      await cacheService(dbManager).set(
-        cursorKey,
-        JSON.stringify({ startPage: res.nextPage, syncedBefore: cursor.syncedBefore + zones.length }),
-        CF_ZONE_CURSOR_TTL
-      );
-      throw new Error(
-        `该账号 zone 数量较多，本次已同步 ${zones.length} 个（共约 ${cursor.syncedBefore + zones.length} 个以上），` +
-          `剩余部分请再次点击「同步」继续拉取`
-      );
-    }
-    page = res.nextPage;
+  const result = await syncCloudflareSlice(dbManager, accountId, client);
+  if (!result.completed) {
+    throw new Error(`该账号 zone 数量较多，本周期已同步 ${result.totalSynced} 个，剩余部分请再次点击「同步」从第 ${result.nextPage} 页继续拉取`);
   }
-
-  // 拉完最后一页才算拿到权威全量 —— 只有此时才能安全地做差集删除
-  // （清理上游已删的 zone，包括 0 个 zone 的情况）
-  await dbManager.syncAccountDomains(accountId, zones.map(mapZoneToUpstream));
-  if (completed) {
-    // 用同步前的计数 + 本次拉到的数量作为总数（游标周期内累计）
-    const total = cursor.syncedBefore + zones.length;
-    await cacheService(dbManager).set(cursorKey, "", 1); // 游标归零，下次从第 1 页重新核对
-    return total;
-  }
-  return zones.length;
+  return result.totalSynced;
 }
 
 // NOTE: 深度同步 DigitalPlat 账号的域名列表。列表自带注册商侧到期时间，无需查 RDAP；

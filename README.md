@@ -773,6 +773,8 @@ npx wrangler d1 execute domain-hub-db --remote --file=./schema.sql
 
 ### A-4. 配置加密密钥
 
+**Worker 必须配置稳定的 `AES_KEY`。新 Secret 写入不再允许在缺少密钥时降级为 Base64；已有密文请继续使用原密钥，不能随机更换。** 首批安全修复及升级注意见 [修复进度](docs/FIX_PROGRESS_2026-11-17.md)。
+
 推荐主动生成并保存：
 
 ```bash

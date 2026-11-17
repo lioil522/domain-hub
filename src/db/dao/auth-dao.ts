@@ -6,8 +6,9 @@
 
 import { getSetting, setSetting } from "./settings-dao";
 import { encryptText, decryptText, hashPassword, generateSalt, timingSafeEqual, sha256Hex } from "../crypto";
-import { toBeijingString } from "../time-utils";
+import { toBeijingString, getBeijingNow } from "../time-utils";
 import type { AuthConfig } from "../types";
+import { ConflictError, ServiceUnavailableError } from "../../errors";
 
 /** 会话有效期：7 天 */
 export const SESSION_TTL_SECONDS = 7 * 24 * 3600;
@@ -29,6 +30,7 @@ export async function getAuthConfig(db: D1Database, aesKey?: string): Promise<Au
     "auth_pass_salt",
     "auth_2fa_enabled",
     "auth_2fa_secret",
+    "auth_setup_claim",
   ];
 
   const values = new Map<string, string>();
@@ -44,26 +46,36 @@ export async function getAuthConfig(db: D1Database, aesKey?: string): Promise<Au
     }
   } catch (e) {
     console.error("getAuthConfig read error:", e);
+    throw new ServiceUnavailableError("读取鉴权配置失败，请稍后重试");
   }
 
   const passHash = values.get("auth_pass_hash") || "";
+  const passSalt = values.get("auth_pass_salt") || "";
+  if ((passHash && !passSalt) || (!passHash && (passSalt || values.get("auth_setup_claim") || values.get("auth_username")))) {
+    throw new ServiceUnavailableError("鉴权配置不完整，请恢复数据库后重试");
+  }
   const encryptedSecret = values.get("auth_2fa_secret") || "";
+  const twoFaEnabled = values.get("auth_2fa_enabled") === "1";
 
   let twoFaSecret = "";
-  if (encryptedSecret) {
+  if (twoFaEnabled) {
+    if (!encryptedSecret) throw new ServiceUnavailableError("两步验证密钥缺失，请恢复数据库后重试");
     try {
       twoFaSecret = await decryptText(encryptedSecret, aesKey);
+      if (!twoFaSecret) throw new Error("Empty 2FA secret");
     } catch (e) {
       console.error("Failed to decrypt 2FA secret:", e);
+      throw new ServiceUnavailableError("无法解密两步验证密钥，请检查 AES_KEY");
     }
   }
 
   return {
     username: values.get("auth_username") || "admin",
     passHash,
-    passSalt: values.get("auth_pass_salt") || "",
-    twoFaEnabled: values.get("auth_2fa_enabled") === "1",
+    passSalt,
+    twoFaEnabled,
     twoFaSecret,
+    twoFaSecretCipher: encryptedSecret,
     initialized: !!passHash,
   };
 }
@@ -74,9 +86,31 @@ export async function getAuthConfig(db: D1Database, aesKey?: string): Promise<Au
 export async function setPassword(db: D1Database, username: string, password: string): Promise<void> {
   const salt = generateSalt();
   const hash = await hashPassword(password, salt);
-  await setSetting(db, "auth_username", username);
-  await setSetting(db, "auth_pass_hash", hash);
-  await setSetting(db, "auth_pass_salt", salt);
+  const now = getBeijingNow();
+  await db.batch([["auth_username", username], ["auth_pass_hash", hash], ["auth_pass_salt", salt]].map(([key, value]) =>
+    db.prepare("INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at")
+      .bind(key, value, now)
+  ));
+}
+
+/** The claim and all credential fields commit together; concurrent setup losers write nothing. */
+export async function initializePassword(db: D1Database, username: string, password: string): Promise<boolean> {
+  const claim = crypto.randomUUID();
+  const salt = generateSalt();
+  const hash = await hashPassword(password, salt);
+  const now = getBeijingNow();
+  const results = await db.batch([
+    db.prepare(`INSERT INTO settings (key, value, updated_at)
+      SELECT 'auth_setup_claim', ?, ? WHERE NOT EXISTS
+        (SELECT 1 FROM settings WHERE key IN ('auth_username','auth_pass_hash','auth_pass_salt') AND value != '')
+      ON CONFLICT(key) DO NOTHING`).bind(claim, now),
+    ...[["auth_username", username], ["auth_pass_hash", hash], ["auth_pass_salt", salt]].map(([key, value]) =>
+      db.prepare(`INSERT INTO settings (key, value, updated_at)
+        SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM settings WHERE key='auth_setup_claim' AND value=?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`).bind(key, value, now, claim)
+    ),
+  ]);
+  return results[0].meta.changes === 1;
 }
 
 /**
@@ -90,22 +124,56 @@ export async function verifyPassword(db: D1Database, aesKey: string | undefined,
 }
 
 /**
- * 保存（加密）待启用的 2FA TOTP 密钥
+ * 保存独立待激活密钥（10 分钟），不能覆盖已经启用的验证器
  */
 export async function setTwoFaSecret(db: D1Database, aesKey: string | undefined, secretBase32: string): Promise<void> {
   const encrypted = await encryptText(secretBase32, aesKey);
-  await setSetting(db, "auth_2fa_secret", encrypted);
+  const pending = JSON.stringify({ encrypted, expiresAt: Math.floor(Date.now() / 1000) + 600 });
+  const result = await db.prepare(`INSERT INTO settings (key, value, updated_at)
+    SELECT 'auth_2fa_pending', ?, ? WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key='auth_2fa_enabled' AND value='1')
+    ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`)
+    .bind(pending, getBeijingNow()).run();
+  if (result.meta.changes !== 1) throw new ConflictError("两步验证已开启，请先验证并关闭旧验证器", "2fa_already_enabled");
+}
+
+export async function getPendingTwoFa(db: D1Database, aesKey?: string): Promise<{ secret: string; value: string } | null> {
+  const value = await getSetting(db, "auth_2fa_pending");
+  if (!value) return null;
+  const pending = JSON.parse(value) as { encrypted?: string; expiresAt?: number };
+  if (!pending.encrypted || !Number.isFinite(pending.expiresAt) || Number(pending.expiresAt) <= Math.floor(Date.now() / 1000)) return null;
+  return { secret: await decryptText(pending.encrypted, aesKey), value };
 }
 
 /**
  * 开启/关闭 2FA
  */
-export async function setTwoFaEnabled(db: D1Database, enabled: boolean): Promise<void> {
-  await setSetting(db, "auth_2fa_enabled", enabled ? "1" : "0");
-  if (!enabled) {
-    // 关闭时清除密钥，避免残留
-    await setSetting(db, "auth_2fa_secret", "");
-  }
+export async function setTwoFaEnabled(db: D1Database, enabled: boolean, expected: string): Promise<void> {
+  const now = getBeijingNow();
+  const claim = crypto.randomUUID();
+  const cipher = enabled ? (JSON.parse(expected) as { encrypted: string }).encrypted : "";
+  const guard = enabled
+    ? `EXISTS (SELECT 1 FROM settings WHERE key='auth_2fa_pending' AND value=? AND json_extract(value,'$.expiresAt')>?)
+       AND NOT EXISTS (SELECT 1 FROM settings WHERE key='auth_2fa_enabled' AND value='1')`
+    : `EXISTS (SELECT 1 FROM settings WHERE key='auth_2fa_secret' AND value=?)
+       AND EXISTS (SELECT 1 FROM settings WHERE key='auth_2fa_enabled' AND value='1')`;
+  const bindings = enabled ? [expected, Math.floor(Date.now() / 1000)] : [expected];
+  const results = await db.batch([
+    // A per-transition claim fences every write, including failed CAS attempts.
+    db.prepare(`INSERT INTO settings (key, value, updated_at)
+      SELECT 'auth_2fa_transition', ?, ? WHERE ${guard}
+      ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`)
+      .bind(claim, now, ...bindings),
+    ...[["auth_2fa_enabled", enabled ? "1" : "0"], ["auth_2fa_secret", cipher]].map(([key, value]) =>
+      db.prepare(`INSERT INTO settings (key, value, updated_at)
+        SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM settings WHERE key='auth_2fa_transition' AND value=?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`)
+        .bind(key, value, now, claim)
+    ),
+    db.prepare(`DELETE FROM settings WHERE key='auth_2fa_pending' AND
+      EXISTS (SELECT 1 FROM settings WHERE key='auth_2fa_transition' AND value=?)`).bind(claim),
+    db.prepare("DELETE FROM settings WHERE key='auth_2fa_transition' AND value=?").bind(claim),
+  ]);
+  if (results[0].meta.changes !== 1) throw new ConflictError("两步验证状态已变化或密钥已过期，请重新操作");
 }
 
 // ===== 会话管理 =====
@@ -138,12 +206,8 @@ export async function validateSession(db: D1Database, token: string): Promise<bo
  */
 export async function revokeSession(db: D1Database, token: string): Promise<void> {
   if (!token || !token.startsWith(SESSION_PREFIX)) return;
-  try {
-    const digest = await sha256Hex(token);
-    await db.prepare("DELETE FROM settings WHERE key = ?").bind(`sess_${digest}`).run();
-  } catch (e) {
-    console.error("revokeSession error:", e);
-  }
+  const digest = await sha256Hex(token);
+  await db.prepare("DELETE FROM settings WHERE key = ?").bind(`sess_${digest}`).run();
 }
 
 /**
@@ -184,7 +248,7 @@ export async function countLoginFailures(db: D1Database, scope: string): Promise
     return Number.isFinite(n) && n > 0 ? n : 0;
   } catch (e) {
     console.error("countLoginFailures error:", e);
-    return 0;
+    throw new ServiceUnavailableError("读取登录限流状态失败，请稍后重试");
   }
 }
 
@@ -193,15 +257,17 @@ export async function countLoginFailures(db: D1Database, scope: string): Promise
  */
 export async function recordLoginFailure(db: D1Database, scope: string, windowSeconds = 15 * 60): Promise<number> {
   try {
-    const expiresAt = Math.floor(Date.now() / 1000) + windowSeconds;
+    const now = Math.floor(Date.now() / 1000);
+    const expiresAt = now + windowSeconds;
     await db.prepare(
       `INSERT INTO cache (key, value, expires_at) VALUES (?, '1', ?)
        ON CONFLICT(key) DO UPDATE SET
-         value = CAST(CAST(value AS INTEGER) + 1 AS TEXT),
-         expires_at = excluded.expires_at`
-    ).bind(`login_fail:${scope}`, expiresAt).run();
+          value = CASE WHEN cache.expires_at <= ? THEN '1' ELSE CAST(CAST(value AS INTEGER) + 1 AS TEXT) END,
+          expires_at = excluded.expires_at`
+    ).bind(`login_fail:${scope}`, expiresAt, now).run();
   } catch (e) {
     console.error("recordLoginFailure error:", e);
+    throw new ServiceUnavailableError("保存登录限流状态失败，请稍后重试");
   }
   return countLoginFailures(db, scope);
 }

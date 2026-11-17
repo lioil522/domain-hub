@@ -46,3 +46,15 @@ export class UpstreamError extends AppError {
     super(message, 502, "upstream_error", details);
   }
 }
+
+export class ServiceUnavailableError extends AppError {
+  constructor(message = "服务暂不可用，请稍后重试") {
+    super(message, 503, "service_unavailable");
+  }
+}
+
+export class ConflictError extends AppError {
+  constructor(message = "状态已发生变化，请刷新后重试", code = "conflict") {
+    super(message, 409, code);
+  }
+}

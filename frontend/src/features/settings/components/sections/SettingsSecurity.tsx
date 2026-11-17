@@ -12,6 +12,7 @@ export interface SettingsSecurityProps {
   twoFaSetup: { secret: string; otpauth_uri: string } | null; setTwoFaSetup: (v: { secret: string; otpauth_uri: string } | null) => void;
   twoFaEnableToken: string; setTwoFaEnableToken: (v: string) => void;
   twoFaDisableToken: string; setTwoFaDisableToken: (v: string) => void;
+  twoFaPassword: string; setTwoFaPassword: (v: string) => void;
   handleChangePassword: () => void;
   handleStart2faSetup: () => void;
   handleEnable2fa: () => void;
@@ -21,6 +22,7 @@ export interface SettingsSecurityProps {
 
 export function SettingsSecurity(props: SettingsSecurityProps) {
   const { accountInfo, pwOld, setPwOld, pwNew, setPwNew, pwNew2, setPwNew2, pwNewUsername, setPwNewUsername, twoFaSetup, setTwoFaSetup, twoFaEnableToken, setTwoFaEnableToken, twoFaDisableToken, setTwoFaDisableToken, handleChangePassword, handleStart2faSetup, handleEnable2fa, handleDisable2fa, actionLoading } = props;
+  const { twoFaPassword, setTwoFaPassword } = props;
   return (
           <div className="bg-surface border border-border-base rounded-2xl p-4 sm:p-5 space-y-5">
             <h3 className="font-bold text-content-primary flex items-center gap-2">
@@ -112,6 +114,18 @@ export function SettingsSecurity(props: SettingsSecurityProps) {
                 </span>
               </div>
 
+              {(!twoFaSetup || accountInfo.two_fa_enabled) && (
+                <PasswordInput
+                  name="domain-hub-2fa-password"
+                  autoComplete="new-password"
+                  value={twoFaPassword}
+                  onChange={setTwoFaPassword}
+                  placeholder="确认登录密码（开启或关闭 2FA）"
+                  ariaLabel="确认登录密码以操作两步验证"
+                  className="form-input w-full px-3 py-2 rounded-lg text-sm"
+                />
+              )}
+
               {/* 未开启：走生成密钥 → 验证动态码 流程 */}
               {!accountInfo.two_fa_enabled && (
                 <div className="space-y-3">
@@ -126,7 +140,7 @@ export function SettingsSecurity(props: SettingsSecurityProps) {
                   ) : (
                     <div className="bg-elevated border border-border-base rounded-xl p-4 space-y-3">
                       <p className="text-xs text-content-secondary leading-relaxed">
-                        1. 用身份验证器（Google / Microsoft Authenticator）扫描下方二维码：
+                         1. 用身份验证器（Google / Microsoft Authenticator）扫描下方二维码（10 分钟内有效）：
                       </p>
                       <div className="flex justify-center py-2">
                         <div className="bg-white p-3 rounded-xl">

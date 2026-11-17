@@ -19,6 +19,7 @@ import * as accountDao from "./dao/account-dao";
 import * as domainDao from "./dao/domain-dao";
 import * as customDao from "./dao/custom-dao";
 import * as backupDao from "./dao/backup-dao";
+import * as cloudflareSyncDao from "./dao/cloudflare-sync-dao";
 import type {
   AccountProvider,
   AuthConfig,
@@ -159,6 +160,20 @@ export class DatabaseManager {
             available INTEGER NOT NULL DEFAULT 0, registered INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0,
             started_at TEXT, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP, finished_at TEXT, error TEXT
           );
+        `),
+        this.db.prepare(`
+          CREATE TABLE IF NOT EXISTS cf_sync_state (
+            account_id INTEGER PRIMARY KEY, generation TEXT NOT NULL, next_page INTEGER NOT NULL,
+            total_synced INTEGER NOT NULL, lease_token TEXT NOT NULL, lease_until INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL, FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+          )
+        `),
+        this.db.prepare(`
+          CREATE TABLE IF NOT EXISTS cf_sync_seen (
+            account_id INTEGER NOT NULL, generation TEXT NOT NULL, domain_id INTEGER NOT NULL, seen INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (account_id, generation, domain_id),
+            FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+          )
         `)
       ]);
 
@@ -319,14 +334,20 @@ export class DatabaseManager {
   async setPassword(username: string, password: string): Promise<void> {
     return authDao.setPassword(this.db, username, password);
   }
+  async initializePassword(username: string, password: string): Promise<boolean> {
+    return authDao.initializePassword(this.db, username, password);
+  }
   async verifyPassword(password: string): Promise<boolean> {
     return authDao.verifyPassword(this.db, this.aesKey, password);
   }
   async setTwoFaSecret(secretBase32: string): Promise<void> {
     return authDao.setTwoFaSecret(this.db, this.aesKey, secretBase32);
   }
-  async setTwoFaEnabled(enabled: boolean): Promise<void> {
-    return authDao.setTwoFaEnabled(this.db, enabled);
+  async getPendingTwoFa() {
+    return authDao.getPendingTwoFa(this.db, this.aesKey);
+  }
+  async setTwoFaEnabled(enabled: boolean, expected: string): Promise<void> {
+    return authDao.setTwoFaEnabled(this.db, enabled, expected);
   }
   async createSession(ttlSeconds = authDao.SESSION_TTL_SECONDS): Promise<string> {
     return authDao.createSession(this.db, ttlSeconds);
@@ -407,6 +428,15 @@ export class DatabaseManager {
   }
   async upsertAccountDomains(accountId: number, subdomains: UpstreamSubdomain[]): Promise<void> {
     return domainDao.upsertAccountDomains(this.db, accountId, subdomains);
+  }
+  async claimCloudflareSync(accountId: number) {
+    return cloudflareSyncDao.claimCloudflareSync(this.db, accountId);
+  }
+  async commitCloudflareSyncPage(accountId: number, lease: cloudflareSyncDao.CloudflareSyncLease, domains: UpstreamSubdomain[], page: { hasMore: boolean; nextPage: number }): Promise<void> {
+    return cloudflareSyncDao.commitCloudflareSyncPage(this.db, accountId, lease, domains, page);
+  }
+  async releaseCloudflareSync(accountId: number, lease: cloudflareSyncDao.CloudflareSyncLease): Promise<void> {
+    return cloudflareSyncDao.releaseCloudflareSync(this.db, accountId, lease);
   }
   async markDomainRenewed(id: number, newExpiresAt: string): Promise<void> {
     return domainDao.markDomainRenewed(this.db, id, newExpiresAt);

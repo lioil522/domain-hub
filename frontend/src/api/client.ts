@@ -19,7 +19,7 @@ export const readSessionToken = (): string | null =>
 export interface ApiFetchDeps {
   /** 组件内已解析好的后端基准地址（含设置页覆盖值与构建期烘焙值） */
   backendUrl: string;
-  /** 会话失效（401/403 且非鉴权接口自身）时回调，用于清空前端登录态 */
+  /** 明确的会话失效响应时回调，用于清空前端登录态 */
   onSessionExpired: () => void;
 }
 
@@ -44,17 +44,8 @@ export const createApiFetch = ({ backendUrl, onSessionExpired }: ApiFetchDeps): 
     if (url.startsWith("/api")) {
       if (storedBackend) {
         finalUrl = `${storedBackend.replace(/\/$/, "")}${url}`;
-      } else {
-        const host = window.location.hostname;
-        const isLocalDev = host === "localhost" || host === "127.0.0.1";
-        if (!isLocalDev) {
-          // 线上两者皆空：走相对路径只会打到 Pages 自身、被 SPA 兜底返回 HTML，
-          // 报错会变成 JSON 解析失败。这里直接给出真实原因。
-          throw new Error("未配置后端地址（部署时未能推导出 Worker 地址），请在设置页手动填写后端 Worker 地址");
-        }
-        // 本地开发走 Vite 代理的相对路径
-        finalUrl = url;
       }
+      // Workers / self-host default to same-origin; local Vite uses its proxy.
     }
 
     const headers = new Headers(options.headers || {});
@@ -65,9 +56,10 @@ export const createApiFetch = ({ backendUrl, onSessionExpired }: ApiFetchDeps): 
     try {
       const res = await fetch(finalUrl, { ...options, headers });
       if (res.status === 401 || res.status === 403) {
-        // 会话失效：清理凭据并回到登录页（登录/初始化/状态接口自身除外，避免误清）
+        // Business-level 401/403 (password / TOTP / permissions) must not log the user out.
         const isAuthEndpoint = url.startsWith("/api/auth/login") || url.startsWith("/api/auth/setup") || url.startsWith("/api/auth/status");
-        if (!isAuthEndpoint) {
+        const payload = await res.clone().json().catch(() => null) as { error_code?: string } | null;
+        if (!isAuthEndpoint && (payload?.error_code === "session_expired" || payload?.error_code === "unauthorized")) {
           sessionStorage.removeItem(SESSION_KEY);
           localStorage.removeItem(SESSION_KEY);
           onSessionExpired();

@@ -59,7 +59,7 @@ crons = [
 [vars]
 # 【强烈建议】通过 wrangler secret put 注入以下密钥（不要直接写在配置文件中）：
 #
-# AES_KEY       - AES-GCM 加密密钥，用于加密存储 API Secret 与 2FA TOTP 密钥（强烈建议配置）
+# AES_KEY       - AES-GCM 加密密钥，用于加密存储 API Secret 与 2FA TOTP 密钥（新 Secret 写入必须配置，升级保持原值）
 #
 # 鉴权模型说明（v2 起）：
 #   登录改为「用户名 + 密码」为主，密码经 PBKDF2 加盐哈希后存于 D1，永不明文。

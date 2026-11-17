@@ -82,7 +82,12 @@ export async function getDomainById(db: D1Database, id: number): Promise<DBDomai
  *
  * NOTE: 只有当调用方带上 dns_state_known 时，才允许覆盖已有行的 status / has_dns / dns_provider。
  */
-export function buildDomainUpsert(db: D1Database, accountId: number, sub: UpstreamSubdomain): D1PreparedStatement {
+export function buildDomainUpsert(
+  db: D1Database,
+  accountId: number,
+  sub: UpstreamSubdomain,
+  guard?: { sql: string; bindings: unknown[] },
+): D1PreparedStatement {
   let hasDnsVal = 1;
   if (sub.dns_state_known) {
     hasDnsVal = sub.has_dns ? 1 : 0;
@@ -115,7 +120,7 @@ export function buildDomainUpsert(db: D1Database, accountId: number, sub: Upstre
 
   return db.prepare(`
     INSERT INTO domains_cache (id, account_id, subdomain, rootdomain, full_domain, status, created_at, expires_at, has_dns, dns_provider, provider_account_id, remote_id, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ${guard ? `SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${guard.sql}` : "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"}
     ON CONFLICT(id) DO UPDATE SET
       account_id = excluded.account_id,
       provider_account_id = COALESCE(excluded.provider_account_id, domains_cache.provider_account_id),
@@ -137,7 +142,8 @@ export function buildDomainUpsert(db: D1Database, accountId: number, sub: Upstre
     dnsProvider,
     providerAccountId,
     sub.remote_id || null,
-    getBeijingNow()
+    getBeijingNow(),
+    ...(guard?.bindings || [])
   );
 }
 

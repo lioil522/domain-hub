@@ -5,7 +5,7 @@ import { sendTelegramNotification, sendWebhookNotification } from "./cron";
 import type { WebhookType } from "./cron";
 import type { Bindings, Variables } from "./routes/types";
 import { DatabaseManager, timingSafeEqual } from "./db";
-import { AppError } from "./errors";
+import { AppError, ServiceUnavailableError } from "./errors";
 // NOTE: 同一模块既要把 isRegistrableDomain 转出给外部（见下方 export ... from），
 // 又要在本文件内直接调用它 —— `export { x } from` 只做转出、不建立本地绑定，
 // 所以必须再显式导入一次，否则本文件内的调用点会报 TS2304。
@@ -139,7 +139,7 @@ function ensureSchemaOnce(dbManager: DatabaseManager): Promise<boolean> {
  */
 app.use("/api/*", async (c, next) => {
   const dbManager = new DatabaseManager(c.env.DB, c.env.AES_KEY);
-  await ensureSchemaOnce(dbManager);
+  if (!await ensureSchemaOnce(dbManager)) throw new ServiceUnavailableError("数据库初始化失败，请稍后重试");
   c.set("db", dbManager);
   return next();
 });
@@ -168,7 +168,10 @@ app.use("/api/*", async (c, next) => {
       if (await dbManager.validateSession(token)) {
         return next();
       }
-    } catch (e) {}
+    } catch (e) {
+      console.error("Session validation failed:", e);
+      throw new ServiceUnavailableError("读取会话失败，请稍后重试");
+    }
   }
 
   // 2. 应急令牌通道
@@ -187,7 +190,7 @@ app.use("/api/*", async (c, next) => {
     await dbManager.recordLoginFailure(ipScope, LOGIN_LOCK_WINDOW_SECONDS);
   }
 
-  return c.json(errorRes("认证失败：会话凭据已失效，请重新登录", "forbidden"), 403);
+  return c.json(errorRes("认证失败：会话凭据已失效，请重新登录", "session_expired"), 401);
 });
 
 registerAccountRoutes(app, {

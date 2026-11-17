@@ -326,8 +326,11 @@ export class CloudflareClient {
 
     for (let fetched = 0; fetched < maxPages; fetched++, page++) {
       const results = await this.request<CfZoneInfo[]>("GET", "/zones", { page, per_page: perPage });
-      zones.push(...(results || []));
-      if (!results || results.length < perPage) {
+      if (!Array.isArray(results) || results.some(zone => !zone || typeof zone.id !== "string" || !zone.id || typeof zone.name !== "string" || !zone.name)) {
+        throw new Error("Cloudflare zone 列表响应格式无效，已停止同步");
+      }
+      zones.push(...results);
+      if (results.length < perPage) {
         hasMore = false;
         break;
       }

@@ -111,10 +111,11 @@ await it("PBKDF2 密码哈希与校验（Node WebCrypto）", async () => {
 
 await it("AES-GCM 加密的 2FA 密钥可原文取回", async () => {
   await dbm.setTwoFaSecret("JBSWY3DPEHPK3PXP");
-  const cfg = await dbm.getAuthConfig();
-  assert.equal(cfg.twoFaSecret, "JBSWY3DPEHPK3PXP");
+  const pending = await dbm.getPendingTwoFa();
+  assert.equal(pending?.secret, "JBSWY3DPEHPK3PXP");
+  assert.equal((await dbm.getAuthConfig()).twoFaSecret, "");
   // 库里存的必须是密文
-  const stored = await dbm.getSetting("auth_2fa_secret");
+  const stored = await dbm.getSetting("auth_2fa_pending");
   assert.ok(stored && !stored.includes("JBSWY3DPEHPK3PXP"), "2FA 密钥不应以明文落库");
 });
 

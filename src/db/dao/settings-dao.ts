@@ -12,33 +12,25 @@ import { encryptText, decryptText } from "../crypto";
  * 读取 settings 表中的单个键值
  */
 export async function getSetting(db: D1Database, key: string): Promise<string | null> {
-  try {
-    const res = await db.prepare("SELECT value FROM settings WHERE key = ?").bind(key).first<{ value?: unknown }>();
-    return res ? String(res.value ?? "") : null;
-  } catch (e) {
-    return null;
-  }
+  const res = await db.prepare("SELECT value FROM settings WHERE key = ?").bind(key).first<{ value?: unknown }>();
+  return res ? String(res.value ?? "") : null;
 }
 
 /**
  * 写入 settings 表（upsert 语义）
  */
 export async function setSetting(db: D1Database, key: string, value: string): Promise<void> {
-  try {
-    const now = getBeijingNow();
-    await db.prepare(
-      "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
-    ).bind(key, value, now).run();
-  } catch (e) {
-    console.error("setSetting error:", e);
-  }
+  const now = getBeijingNow();
+  await db.prepare(
+    "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
+  ).bind(key, value, now).run();
 }
 
 /**
  * 删除 settings 表中的单个键
  */
 export async function deleteSetting(db: D1Database, key: string): Promise<void> {
-  try { await db.prepare("DELETE FROM settings WHERE key = ?").bind(key).run(); } catch (e) { console.error("deleteSetting error:", e); }
+  await db.prepare("DELETE FROM settings WHERE key = ?").bind(key).run();
 }
 
 /**
@@ -78,11 +70,7 @@ export async function getAllAppSettings(db: D1Database, aesKey?: string): Promis
 export async function setAppSetting(db: D1Database, aesKey: string | undefined, shortKey: string, value: string): Promise<void> {
   let stored = value;
   if ((shortKey === "tg_token" || shortKey === "webhook_url") && value) {
-    try {
-      stored = await encryptText(value, aesKey);
-    } catch (e) {
-      console.error("setAppSetting encrypt error:", e);
-    }
+    stored = await encryptText(value, aesKey);
   }
   await setSetting(db, `cfg_${shortKey}`, stored);
 }

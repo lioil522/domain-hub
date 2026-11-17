@@ -30,6 +30,7 @@ export function SettingsPage(props: SettingsPageProps) {
     backendUrlInput, setBackendUrlInput, backendUrlEditing, setBackendUrlEditing,
     pwOld, setPwOld, pwNew, setPwNew, pwNew2, setPwNew2, pwNewUsername, setPwNewUsername,
     twoFaSetup, setTwoFaSetup, twoFaEnableToken, setTwoFaEnableToken, twoFaDisableToken, setTwoFaDisableToken,
+    twoFaPassword, setTwoFaPassword,
     handleSaveSettings, handleTestTelegram, handleTestWebhook, handleSaveBackendUrl, handleCancelBackendUrl,
     handleChangePassword, handleStart2faSetup, handleEnable2fa, handleDisable2fa, accountInfo, actionLoading,
   } = s;
@@ -58,6 +59,7 @@ export function SettingsPage(props: SettingsPageProps) {
             pwNew2={pwNew2} setPwNew2={setPwNew2} pwNewUsername={pwNewUsername} setPwNewUsername={setPwNewUsername}
             twoFaSetup={twoFaSetup} setTwoFaSetup={setTwoFaSetup} twoFaEnableToken={twoFaEnableToken}
             setTwoFaEnableToken={setTwoFaEnableToken} twoFaDisableToken={twoFaDisableToken} setTwoFaDisableToken={setTwoFaDisableToken}
+            twoFaPassword={twoFaPassword} setTwoFaPassword={setTwoFaPassword}
             handleChangePassword={handleChangePassword} handleStart2faSetup={handleStart2faSetup}
             handleEnable2fa={handleEnable2fa} handleDisable2fa={handleDisable2fa} actionLoading={actionLoading}
           />

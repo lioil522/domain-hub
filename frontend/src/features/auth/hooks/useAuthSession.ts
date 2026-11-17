@@ -1,5 +1,6 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { readSessionToken, type ApiFetch } from "../../../api/client";
+import { ApiRequestError } from "../../../api/request";
 import type { ToastType } from "../../../hooks/useToast";
 import {
   fetchAccount,
@@ -164,6 +165,13 @@ export function useAuthSession({
       }
     } catch (err: unknown) {
       console.error("Login error:", err);
+      if (err instanceof ApiRequestError && err.status !== null) {
+        const payload = err.payload as { error_code?: string } | null;
+        if (payload?.error_code === "need_2fa") setLoginNeeds2fa(true);
+        if (payload?.error_code === "not_initialized") setAuthInitialized(false);
+        setLoginError(err.message);
+        return;
+      }
       // 网络类失败最常见的成因是后端地址不对，且本地覆盖值优先级高于构建期烘焙值，
       // 故直接把当前实际使用的地址与来源写进提示，避免只看到一句 Failed to fetch。
       const override = localStorage.getItem("DOMAIN_HUB_BACKEND_URL");

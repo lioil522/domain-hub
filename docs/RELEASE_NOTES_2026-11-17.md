@@ -18,6 +18,10 @@
 
 首次推送 `caf69fd` 后，Worker 自动部署在 TOML 解析阶段失败：新增分钟触发器前的一条 Cron 缺少分隔逗号。后续修复补齐逗号，并将 `wrangler deploy --dry-run` 加入 `verify:all`，检查配置和实际 Worker 打包但不执行云端部署。后续提交及部署结果以 Git/Actions 记录为准。
 
+`491aec3` 的 Worker 部署与 CI 已通过，但自建镜像构建暴露了遗漏：前后端 Docker 构建阶段都没有复制新增 `shared/`。后续修复补齐两处 COPY，并移除运行时默认 SCHEMA_FILE，让旧数据卷走版本迁移器。`check:docker-inputs` 重建 Docker COPY 的源码集合并验证 selfhost/后端构建，不依赖完整工作区隐式提供源码；它不等同于真实 Linux 容器构建和运行，最终镜像结果仍以 Docker workflow 为准。
+
+Docker 修复后再次通过全量验证（192 个用例），并用打包后的 Node 布局验证旧 `dnshe.db` 数据卷能升级、域名与 DNS 状态保留。本机没有 Docker，未将源码边界检查宣称为真实镜像构建成功。
+
 ## 升级重点
 
 1. 前后端一起更新，保留原 AES_KEY，升级前备份数据库和密钥。

@@ -16,6 +16,7 @@ COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 
 COPY frontend/ ./
+COPY shared/ /app/shared/
 # selfhost 模式会读 frontend/.env.selfhost，把 API 基准地址烘焙成 "/"（同源相对路径）
 RUN npm run build:selfhost
 
@@ -30,6 +31,7 @@ RUN npm ci
 COPY tsconfig.json ./
 COPY src/ ./src/
 COPY server/ ./server/
+COPY shared/ ./shared/
 # 先过一遍 tsc 再打包：类型出问题就让镜像构建直接失败，而不是等运行时才炸
 RUN npm run verify:node && npm run test:node && npm run build:node
 
@@ -41,8 +43,7 @@ WORKDIR /app
 ENV NODE_ENV=production \
     PORT=8787 \
     DATA_DIR=/data \
-    STATIC_DIR=/app/public \
-    SCHEMA_FILE=/app/schema.sql
+    STATIC_DIR=/app/public
 
 COPY --from=backend /app/dist-node/server.mjs ./server.mjs
 COPY --from=frontend /app/frontend/dist ./public

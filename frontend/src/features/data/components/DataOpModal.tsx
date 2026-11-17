@@ -8,6 +8,7 @@ import {
   Upload,
   X,
 } from "lucide-react";
+import type { BackupPreview } from "../utils/backup-transfer";
 
 export interface DataOpModalProps {
   /** 关闭时直接返回 null（与项目其余弹窗一致，DOM 上不留残留节点） */
@@ -20,6 +21,10 @@ export interface DataOpModalProps {
   onTokenChange: (v: string) => void;
   /** 已选备份文件：`name` 用于回显，非空即代表「已选」 */
   importSnapshot: { name: string } | null;
+  importPreview?: BackupPreview | null;
+  restoreId?: string | null;
+  restoreProgress?: { done: number; total: number } | null;
+  onCancelRestore?: () => void;
   onPickFile: (file: File | null) => void;
   /** 账户是否已开启 2FA —— 未开启时导出按钮置灰并给出警示条 */
   twoFaEnabled: boolean;
@@ -49,6 +54,10 @@ export const DataOpModal = ({
   token,
   onTokenChange,
   importSnapshot,
+  importPreview,
+  restoreId,
+  restoreProgress,
+  onCancelRestore,
   onPickFile,
   twoFaEnabled,
   busy,
@@ -88,6 +97,7 @@ export const DataOpModal = ({
               <input id="app-fld7"
                 type="file"
                 accept="application/json,.json"
+                disabled={busy}
                 onChange={(e) => { onPickFile(e.target.files?.[0] || null); }}
                 className="w-full text-xs text-content-muted file:mr-3 file:px-3 file:py-1.5 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-elevated file:text-content-secondary hover:file:bg-hovered cursor-pointer"
               />
@@ -98,8 +108,20 @@ export const DataOpModal = ({
                 </div>
               )}
               <p className="text-[11px] text-content-muted leading-relaxed">
-                同 ID 的行会被备份中的值<b>覆盖</b>，新 ID 追加，现有数据不受影响。
+                先核验密钥与身份冲突。仅同 ID 且业务身份一致的行会被<b>覆盖</b>；不删除现有数据，也不覆盖登录与 2FA 设置。
               </p>
+              {importPreview && (
+                <div className="text-xs text-content-secondary space-y-1 border border-border-base rounded-lg p-3">
+                  <p>新增 {importPreview.totalAdd} · 覆盖 {importPreview.totalUpdate} · 冲突 {importPreview.totalConflicts}</p>
+                  <p>共 {importPreview.rowCount} 行，当前上限 {importPreview.importLimit} 行；目标独有记录保留。</p>
+                  {importPreview.conflictDetails.map((item, index) => <p key={index} className="text-red-500">{item.table} #{item.id}：{item.reason}</p>)}
+                </div>
+              )}
+              {restoreId && <div className="text-xs text-content-muted">
+                <p>分段会话已保存。刷新后重新选择同一文件可续传；一小时后过期。</p>
+                {restoreProgress && <p>已上传 {restoreProgress.done} / {restoreProgress.total} 个分块；确认提交前不会写入业务表。</p>}
+                <button disabled={busy} onClick={onCancelRestore} className="text-red-500 underline disabled:opacity-50">取消分段会话（不回滚已提交数据）</button>
+              </div>}
             </div>
           )}
 
@@ -153,7 +175,7 @@ export const DataOpModal = ({
             disabled={
               busy ||
               (mode === "export" && !twoFaEnabled) ||
-              (mode === "import" && !importSnapshot)
+              (mode === "import" && (!importSnapshot || (importPreview != null && !importPreview.canImport)))
             }
             className="btn-primary px-4 py-2 rounded-lg text-sm font-semibold text-white flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed"
           >
@@ -164,7 +186,7 @@ export const DataOpModal = ({
             ) : (
               <Upload className="w-4 h-4" />
             )}
-            {mode === "export" ? "验证并导出" : "验证并导入"}
+            {mode === "export" ? "验证并导出" : importPreview ? "确认合并导入" : "验证并预览"}
           </button>
         </div>
       </div>

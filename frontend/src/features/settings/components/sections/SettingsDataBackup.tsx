@@ -74,7 +74,7 @@ export function SettingsDataBackup({ accountInfo, actionLoading, handleSaveSetti
             </div>
 
             <p className="text-[11px] text-content-muted leading-relaxed">
-              导入为<b>合并模式</b>：同 ID 覆盖、新 ID 新增，<b>不会删除</b>任何现有数据，可安全重复导入。
+              导入为<b>合并模式</b>：先预览身份冲突，同 ID 且身份一致才覆盖，新 ID 新增，<b>不会删除</b>现有数据。超过 500 行自动分段暂存，支持最多 10,000 行、8MB；完整校验并确认后才提交。
               跨环境迁移时目标环境需使用同一个 <span className="font-mono">AES_KEY</span>，否则加密的 API 凭据无法解密。
             </p>
           </div>

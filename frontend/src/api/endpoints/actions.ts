@@ -23,4 +23,10 @@ export const actionsApi = {
   cancel(apiFetch: ApiFetch, id: string) {
     return apiJson(apiFetch, `/api/actions/${encodeURIComponent(id)}/cancel`, { method: "POST", headers: jsonHeaders });
   },
+  pause(apiFetch: ApiFetch, id: string) {
+    return apiJson(apiFetch, `/api/actions/${encodeURIComponent(id)}/pause`, { method: "POST", headers: jsonHeaders });
+  },
+  retry(apiFetch: ApiFetch, id: string) {
+    return apiJson(apiFetch, `/api/actions/${encodeURIComponent(id)}/retry`, { method: "POST", headers: jsonHeaders });
+  },
 };

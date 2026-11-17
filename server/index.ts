@@ -21,6 +21,8 @@ import { runDailySyncAndRenewal } from "../src/cron";
 import type { WebhookType } from "../src/cron";
 import { createD1FromSqlite } from "./d1-sqlite";
 import { createStaticHandler } from "./static";
+import { initializeDatabase } from "./initialize-database";
+import { runOneSyncSlice } from "../src/services/sync-work-runner";
 
 // ===== 配置读取 =====
 
@@ -45,7 +47,6 @@ function resolveDbPath(): string {
 }
 
 const DB_PATH = resolveDbPath();
-const SCHEMA_FILE = path.resolve(process.env.SCHEMA_FILE || "./schema.sql");
 
 /**
  * 前端产物目录
@@ -125,12 +126,11 @@ sqlite.exec("PRAGMA foreign_keys = ON");
 const db = createD1FromSqlite(sqlite);
 const { key: aesKey, source: aesKeySource } = resolveAesKey();
 
-// 建表：先跑 schema.sql（含索引，与 Cloudflare 版 d1 execute 的产物一致），
-// 再走 ensureTables()（补 settings 表与历史库的字段迁移）。两者都是幂等的。
-if (existsSync(SCHEMA_FILE)) {
-  sqlite.exec(readFileSync(SCHEMA_FILE, "utf8"));
-} else {
-  console.warn(`[warn] 未找到 schema.sql（${SCHEMA_FILE}），将只建表不建索引`);
+// An explicitly configured SQL file remains an optional pre-migration extension.
+// The normal path needs no external schema file: Workers and Node share a migrator.
+if (optionalEnv("SCHEMA_FILE")) {
+  const schemaFile = path.resolve(optionalEnv("SCHEMA_FILE")!);
+  sqlite.exec(readFileSync(schemaFile, "utf8"));
 }
 
 const env = {
@@ -145,7 +145,12 @@ const env = {
   DEFAULT_API_ALIAS: optionalEnv("DEFAULT_API_ALIAS"),
 };
 
-await new DatabaseManager(db, aesKey).ensureTables();
+try {
+  await initializeDatabase(db);
+} catch (error) {
+  sqlite.close();
+  throw error; // No listener, health response or Cron on an unready database.
+}
 
 // ===== ExecutionContext 替身 =====
 
@@ -154,11 +159,16 @@ await new DatabaseManager(db, aesKey).ensureTables();
  * 直接放任 Promise 跑完即可。唯一要做的是接住异常 —— Node 会因未处理的
  * Promise 拒绝直接退出进程，一个后台同步任务报错不该把整个面板带走。
  */
+const backgroundTasks = new Set<Promise<unknown>>();
+function trackBackground(task: Promise<unknown>) {
+  const tracked = Promise.resolve(task).catch(error => console.error("[background] 任务暂未完成，检查点会保留：", error))
+    .finally(() => { backgroundTasks.delete(tracked); });
+  backgroundTasks.add(tracked);
+  return tracked;
+}
 const executionCtx = {
   waitUntil(promise: Promise<unknown>): void {
-    void Promise.resolve(promise).catch((e) => {
-      console.error("[waitUntil] 后台任务失败：", e);
-    });
+    void trackBackground(promise);
   },
   passThroughOnException(): void {
     /* Workers 专属语义，Node 下无对应行为 */
@@ -195,6 +205,16 @@ async function fetchHandler(request: Request): Promise<Response> {
 // ===== 定时任务 =====
 
 let cronTimer: NodeJS.Timeout | null = null;
+const syncController = new AbortController();
+let syncBusy = false;
+const syncTimer = setInterval(() => {
+  if (syncBusy || syncController.signal.aborted) return;
+  syncBusy = true;
+  void trackBackground(runOneSyncSlice(new DatabaseManager(db, aesKey), {
+    signal: syncController.signal, webhookUrl: env.WEBHOOK_URL, webhookType: env.WEBHOOK_TYPE as WebhookType | undefined,
+  }).finally(() => { syncBusy = false; }));
+}, 1000);
+void trackBackground(runOneSyncSlice(new DatabaseManager(db, aesKey), { signal: syncController.signal }));
 
 function msUntilNextUtc(hour: number, minute: number): number {
   const now = new Date();
@@ -291,6 +311,8 @@ function shutdown(signal: string): void {
   console.log(`\n收到 ${signal}，正在退出…`);
 
   if (cronTimer) clearTimeout(cronTimer);
+  clearInterval(syncTimer);
+  syncController.abort();
 
   // 兜底：连接迟迟不断开时也要让容器按时停下（docker stop 默认只等 10 秒）
   const force = setTimeout(() => {
@@ -304,16 +326,13 @@ function shutdown(signal: string): void {
   }, 8000);
 
   server.close(() => {
-    clearTimeout(force);
-    try {
-      // WAL 落盘后再关闭，避免容器被杀时留下未合并的 -wal 文件
-      sqlite.exec("PRAGMA wal_checkpoint(TRUNCATE)");
-      sqlite.close();
-    } catch (e) {
-      console.error("关闭数据库时出错：", e);
-    }
-    console.log("已停止");
-    process.exit(0);
+    void (async () => {
+      await Promise.allSettled([...backgroundTasks]);
+      clearTimeout(force);
+      try { sqlite.exec("PRAGMA wal_checkpoint(TRUNCATE)"); sqlite.close(); }
+      catch (error) { console.error("关闭数据库时出错：", error); }
+      console.log("已停止"); process.exit(0);
+    })();
   });
 }
 

@@ -389,8 +389,8 @@ await it("importAllData() 合并 upsert：新增 + 覆盖，且不删除现有�
     version: DATA_EXPORT_VERSION,
     data: {
       accounts: [
-        { id: 1, alias: "改过的别名", api_key: "k1", api_secret: "s1", provider: "dnshe", website: null, created_at: "2026-01-01 00:00:00" },
-        { id: 901, alias: "备份新增账号", api_key: "k901", api_secret: "s901", provider: "dnshe", website: null, created_at: "2026-01-01 00:00:00" },
+        { id: 1, alias: "改过的别名", api_key: "k1", api_secret: "plain:c2VjcmV0", provider: "dnshe", website: null, created_at: "2026-01-01 00:00:00" },
+        { id: 901, alias: "备份新增账号", api_key: "k901", api_secret: "plain:c2VjcmV0", provider: "dnshe", website: null, created_at: "2026-01-01 00:00:00" },
       ],
       domains_cache: [
         { id: 7001, account_id: 901, subdomain: "a", rootdomain: "cn.mt", full_domain: "a.cn.mt", status: "已解析", created_at: "2026-01-01 00:00:00", expires_at: "2027-01-01 00:00:00", last_renewed_at: null, has_dns: 1, dns_provider: "system", provider_account_id: null, remote_id: null, updated_at: "2026-01-01 00:00:00" },
@@ -422,7 +422,7 @@ await it("importAllData() 反复导入幂等（同 id 不会重复插入）", as
   const snapshot = {
     version: DATA_EXPORT_VERSION,
     data: {
-      accounts: [{ id: 1, alias: "A", api_key: "k1", api_secret: "s1", provider: "dnshe", website: null, created_at: "2026-01-01 00:00:00" }],
+      accounts: [{ id: 1, alias: "A", api_key: "k1", api_secret: "plain:c2VjcmV0", provider: "dnshe", website: null, created_at: "2026-01-01 00:00:00" }],
     },
   };
   await target.dbm.importAllData(snapshot);
@@ -458,7 +458,7 @@ await it("importAllData() 外键悬空时整批回滚（不留半截数据）", 
     target.dbm.importAllData({
       version: DATA_EXPORT_VERSION,
       data: {
-        accounts: [{ id: 1, alias: "A", api_key: "k1", api_secret: "s1", provider: "dnshe", website: null, created_at: "2026-01-01 00:00:00" }],
+        accounts: [{ id: 1, alias: "A", api_key: "k1", api_secret: "plain:c2VjcmV0", provider: "dnshe", website: null, created_at: "2026-01-01 00:00:00" }],
         domains_cache: [{ id: 7001, account_id: 12345, subdomain: "a", rootdomain: "cn.mt", full_domain: "a.cn.mt", status: "已解析", created_at: "2026-01-01 00:00:00", expires_at: "2027-01-01 00:00:00", last_renewed_at: null, has_dns: 1, dns_provider: "system", provider_account_id: null, remote_id: null, updated_at: "2026-01-01 00:00:00" }],
       },
     })

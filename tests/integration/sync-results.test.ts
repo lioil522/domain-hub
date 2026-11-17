@@ -14,6 +14,8 @@ import { waitForSyncAction } from "../../frontend/src/features/domains/utils/syn
 import { testDatabase, TEST_AES_KEY } from "../helpers/database";
 import { encryptText } from "../../src/db/crypto";
 import worker from "../../src/index";
+import { SyncWorkQueue } from "../../src/db/dao/sync-work-dao";
+import { runOneSyncSlice } from "../../src/services/sync-work-runner";
 
 const noWait = async () => {};
 const subdomain = (id: number) => ({ id, subdomain: `domain${id}`, rootdomain: "us.ci", full_domain: `domain${id}.us.ci`, status: "active", expires_at: "2035-01-01" });
@@ -200,6 +202,9 @@ test("manual sync API returns an action ID and its terminal result is queryable"
   const payload = await response.json() as { action_id: string };
   assert.equal(typeof payload.action_id, "string");
   await Promise.all(jobs);
+  let clock = Date.now();
+  const queue = new SyncWorkQueue(d1, () => clock);
+  for (let i = 0; i < 12; i++) { clock += 2000; await runOneSyncSlice(manager, { queue }); }
   const action = await new ActionService(new ActionRepository(manager)).get(payload.action_id);
   assert.equal(action?.status, "completed");
 });

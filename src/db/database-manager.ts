@@ -31,6 +31,11 @@ import type {
   UpstreamSubdomain,
 } from "./types";
 import { NON_QUOTA_PROVIDERS } from "./types";
+import { ensureDatabaseSchema } from "./schema-migrations";
+import { StagedRestore } from "./dao/restore-dao";
+import { SyncWorkQueue } from "./dao/sync-work-dao";
+import { sha256Hex } from "./crypto";
+import { ConflictError } from "../errors";
 
 export class DatabaseManager {
   private db: D1Database;
@@ -48,164 +53,7 @@ export class DatabaseManager {
    */
   async ensureTables(): Promise<boolean> {
     try {
-      await this.db.batch([
-        this.db.prepare(`
-          CREATE TABLE IF NOT EXISTS accounts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            alias TEXT NOT NULL,
-            api_key TEXT NOT NULL UNIQUE,
-            api_secret TEXT NOT NULL,
-            provider TEXT NOT NULL DEFAULT 'dnshe',
-            website TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-          );
-        `),
-        this.db.prepare(`
-          CREATE TABLE IF NOT EXISTS domains_cache (
-            id INTEGER PRIMARY KEY,
-            account_id INTEGER NOT NULL,
-            subdomain TEXT NOT NULL,
-            rootdomain TEXT NOT NULL,
-            full_domain TEXT NOT NULL,
-            status TEXT NOT NULL,
-            created_at TEXT,
-            expires_at TEXT NOT NULL,
-            last_renewed_at TEXT,
-            has_dns INTEGER DEFAULT 1,
-            dns_provider TEXT,
-            provider_account_id TEXT,
-            remote_id TEXT,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
-          );
-        `),
-        this.db.prepare(`
-          CREATE TABLE IF NOT EXISTS logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            type TEXT NOT NULL,
-            category TEXT NOT NULL,
-            message TEXT NOT NULL,
-            details TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-          );
-        `),
-        this.db.prepare(`
-          CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-          );
-        `),
-        this.db.prepare(`
-          CREATE TABLE IF NOT EXISTS cache (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL,
-            expires_at INTEGER NOT NULL
-          );
-        `),
-        this.db.prepare(`
-          CREATE TABLE IF NOT EXISTS domain_date_overrides (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            account_id INTEGER NOT NULL,
-            full_domain TEXT NOT NULL,
-            registered_at TEXT,
-            expires_at TEXT,
-            source TEXT,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE (account_id, full_domain),
-            FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
-          );
-        `),
-        this.db.prepare(`
-          CREATE TABLE IF NOT EXISTS custom_accounts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            group_id INTEGER NOT NULL,
-            name TEXT NOT NULL,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE (group_id, name),
-            FOREIGN KEY (group_id) REFERENCES accounts(id) ON DELETE CASCADE
-          );
-        `),
-        this.db.prepare(`
-          CREATE TABLE IF NOT EXISTS custom_domains (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            group_id INTEGER NOT NULL,
-            account_id INTEGER,
-            full_domain TEXT NOT NULL,
-            registered_at TEXT,
-            expires_at TEXT NOT NULL,
-            remark TEXT,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE (group_id, account_id, full_domain),
-            FOREIGN KEY (group_id) REFERENCES accounts(id) ON DELETE CASCADE,
-            FOREIGN KEY (account_id) REFERENCES custom_accounts(id) ON DELETE CASCADE
-          );
-        `),
-        this.db.prepare(`
-          CREATE TABLE IF NOT EXISTS actions (
-            id TEXT PRIMARY KEY, type TEXT NOT NULL, status TEXT NOT NULL, progress INTEGER NOT NULL DEFAULT 0,
-            started_at TEXT, finished_at TEXT, error TEXT, metadata TEXT, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-          );
-        `),
-        this.db.prepare(`
-          CREATE TABLE IF NOT EXISTS audit_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, actor TEXT NOT NULL, action TEXT NOT NULL,
-            resource_type TEXT NOT NULL, resource_id TEXT, provider TEXT, result TEXT NOT NULL,
-            details TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-          );
-        `),
-        this.db.prepare(`
-          CREATE TABLE IF NOT EXISTS scanner_jobs (
-            id TEXT PRIMARY KEY, status TEXT NOT NULL, cursor TEXT NOT NULL, total_checked INTEGER NOT NULL DEFAULT 0,
-            available INTEGER NOT NULL DEFAULT 0, registered INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0,
-            started_at TEXT, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP, finished_at TEXT, error TEXT
-          );
-        `),
-        this.db.prepare(`
-          CREATE TABLE IF NOT EXISTS cf_sync_state (
-            account_id INTEGER PRIMARY KEY, generation TEXT NOT NULL, next_page INTEGER NOT NULL,
-            total_synced INTEGER NOT NULL, lease_token TEXT NOT NULL, lease_until INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL, FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
-          )
-        `),
-        this.db.prepare(`
-          CREATE TABLE IF NOT EXISTS cf_sync_seen (
-            account_id INTEGER NOT NULL, generation TEXT NOT NULL, domain_id INTEGER NOT NULL, seen INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (account_id, generation, domain_id),
-            FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
-          )
-        `)
-      ]);
-
-      // 兼容已部署的旧数据库：仅在缺少字段时执行一次轻量迁移
-      const domainColumns = await this.db.prepare("PRAGMA table_info(domains_cache)").all<{ name: string }>();
-      const existingColumns = new Set((domainColumns.results || []).map((column) => column.name));
-      const migrations: string[] = [];
-      if (!existingColumns.has("dns_provider")) {
-        migrations.push("ALTER TABLE domains_cache ADD COLUMN dns_provider TEXT");
-      }
-      if (!existingColumns.has("provider_account_id")) {
-        migrations.push("ALTER TABLE domains_cache ADD COLUMN provider_account_id TEXT");
-      }
-      if (!existingColumns.has("remote_id")) {
-        migrations.push("ALTER TABLE domains_cache ADD COLUMN remote_id TEXT");
-      }
-      const accountColumns = await this.db.prepare("PRAGMA table_info(accounts)").all<{ name: string }>();
-      const accountColumnNames = new Set((accountColumns.results || []).map((column) => column.name));
-      if (!accountColumnNames.has("provider")) {
-        migrations.push("ALTER TABLE accounts ADD COLUMN provider TEXT NOT NULL DEFAULT 'dnshe'");
-      }
-      if (!accountColumnNames.has("website")) {
-        migrations.push("ALTER TABLE accounts ADD COLUMN website TEXT");
-      }
-      const customDomainColumns = await this.db.prepare("PRAGMA table_info(custom_domains)").all<{ name: string }>();
-      const customDomainColumnNames = new Set((customDomainColumns.results || []).map((column) => column.name));
-      if (!customDomainColumnNames.has("registered_at")) {
-        migrations.push("ALTER TABLE custom_domains ADD COLUMN registered_at TEXT");
-      }
-      if (migrations.length > 0) {
-        await this.db.batch(migrations.map((sql) => this.db.prepare(sql)));
-      }
+      await ensureDatabaseSchema(this.db);
       return true;
     } catch (e) {
       console.error("Auto ensureTables error:", e);
@@ -429,11 +277,20 @@ export class DatabaseManager {
   async upsertAccountDomains(accountId: number, subdomains: UpstreamSubdomain[]): Promise<void> {
     return domainDao.upsertAccountDomains(this.db, accountId, subdomains);
   }
-  async claimCloudflareSync(accountId: number) {
-    return cloudflareSyncDao.claimCloudflareSync(this.db, accountId);
+  private async checkCloudflareFingerprint(accountId: number, expected: string) {
+    const row = await this.db.prepare("SELECT provider,api_key,api_secret FROM accounts WHERE id=?").bind(accountId)
+      .first<{ provider: string; api_key: string; api_secret: string }>();
+    if (!row || await sha256Hex(JSON.stringify([row.provider, row.api_key, row.api_secret])) !== expected) {
+      throw new ConflictError("Cloudflare 凭据已改变，旧同步不可继续提交", "sync_credentials_changed");
+    }
   }
-  async commitCloudflareSyncPage(accountId: number, lease: cloudflareSyncDao.CloudflareSyncLease, domains: UpstreamSubdomain[], page: { hasMore: boolean; nextPage: number }): Promise<void> {
-    return cloudflareSyncDao.commitCloudflareSyncPage(this.db, accountId, lease, domains, page);
+  async claimCloudflareSync(accountId: number, fingerprint?: string) {
+    if (fingerprint) await this.checkCloudflareFingerprint(accountId, fingerprint);
+    return cloudflareSyncDao.claimCloudflareSync(this.db, accountId, fingerprint);
+  }
+  async commitCloudflareSyncPage(accountId: number, lease: cloudflareSyncDao.CloudflareSyncLease, domains: UpstreamSubdomain[], page: { hasMore: boolean; nextPage: number }, guard?: { sql: string; bindings: unknown[] }): Promise<void> {
+    if (lease.fingerprint) await this.checkCloudflareFingerprint(accountId, lease.fingerprint);
+    return cloudflareSyncDao.commitCloudflareSyncPage(this.db, accountId, lease, domains, page, guard);
   }
   async releaseCloudflareSync(accountId: number, lease: cloudflareSyncDao.CloudflareSyncLease): Promise<void> {
     return cloudflareSyncDao.releaseCloudflareSync(this.db, accountId, lease);
@@ -490,9 +347,14 @@ export class DatabaseManager {
   // ===== Backup DAO 委托 =====
 
   async exportAllData() {
-    return backupDao.exportAllData(this.db);
+    return backupDao.exportAllData(this.db, this.aesKey);
   }
-  async importAllData(snapshot: { version?: number; data?: Record<string, unknown[]> }) {
-    return backupDao.importAllData(this.db, snapshot);
+  async importAllData(snapshot: unknown) {
+    return backupDao.importAllData(this.db, snapshot, this.aesKey);
   }
+  async previewDataImport(snapshot: unknown) {
+    return backupDao.previewAllData(this.db, snapshot, this.aesKey);
+  }
+  stagedRestore() { return new StagedRestore(this.db, this.aesKey); }
+  syncQueue() { return new SyncWorkQueue(this.db); }
 }

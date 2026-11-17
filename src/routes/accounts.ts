@@ -5,7 +5,7 @@ import { errorRes, successRes } from "./response";
 import { AccountService } from "../services/account-service";
 import { AuditService } from "../services/audit-service";
 import { AuditRepository } from "../repositories/audit-repository";
-import { startSyncAction } from "../services/sync-action-service";
+import { enqueueSyncAction } from "../services/sync-dispatch";
 import type { resyncAccountsInBackground } from "../services/account-sync-service";
 
 export interface AccountRouteDeps {
@@ -20,8 +20,8 @@ export interface AccountRouteDeps {
 // Keep the public route surface stable while moving account-specific business branching out of index.ts.
 export function registerAccountRoutes(app: Hono<AppEnv>, deps: AccountRouteDeps) {
   const auditService = (db: DatabaseManager) => new AuditService(new AuditRepository(db));
-  const queueResync = async (db: DatabaseManager, accountIds: number[], label: string, waitUntil: (promise: Promise<unknown>) => void) => {
-    return startSyncAction(db, { accountIds, label }, context => deps.resyncAccountsInBackground(db, accountIds, "auto", context), waitUntil);
+  const queueResync = async (db: DatabaseManager, accountIds: number[], label: string, c: Context<AppEnv>) => {
+    return enqueueSyncAction(db, { accountIds, label }, promise => c.executionCtx.waitUntil(promise), c.env);
   };
   app.get("/api/accounts", async (c) => {
     const db = c.get("db");
@@ -65,7 +65,7 @@ export function registerAccountRoutes(app: Hono<AppEnv>, deps: AccountRouteDeps)
       let actionId: string | undefined;
       if (account?.id) {
         await auditService(db).write({ actor: "session", action: "create", resourceType: "account", resourceId: String(account.id), provider, result: "success", details: { alias: account.alias } });
-        actionId = await queueResync(db, [account.id], `账号 [${account.alias}] 同步`, (promise) => c.executionCtx.waitUntil(promise));
+        actionId = await queueResync(db, [account.id], `账号 [${account.alias}] 同步`, c);
       }
       return c.json(successRes({ account, action_id: actionId }));
     } catch (e: unknown) {
@@ -138,7 +138,7 @@ export function registerAccountRoutes(app: Hono<AppEnv>, deps: AccountRouteDeps)
       let actionId: string | undefined;
       if (newAccountIds.length) {
         await auditService(db).write({ actor: "session", action: "batch_create", resourceType: "account", result: failCount === 0 ? "success" : "failure", details: { provider, accountIds: newAccountIds, successCount, failCount } });
-        actionId = await queueResync(db, newAccountIds, `批量账号同步 ${newAccountIds.length} 个`, (promise) => c.executionCtx.waitUntil(promise));
+        actionId = await queueResync(db, newAccountIds, `批量账号同步 ${newAccountIds.length} 个`, c);
       }
       return c.json(successRes({
         success_count: successCount,
@@ -165,7 +165,7 @@ export function registerAccountRoutes(app: Hono<AppEnv>, deps: AccountRouteDeps)
       const account = await deps.accountService(db).update(id, alias, apiKey, apiToken ?? apiSecret);
       const credentialsChanged = Boolean(apiToken) || Boolean(apiKey && apiSecret);
       let actionId: string | undefined;
-      if (credentialsChanged) actionId = await queueResync(db, [account.id], `账号 [${account.alias}] 凭据同步`, (promise) => c.executionCtx.waitUntil(promise));
+      if (credentialsChanged) actionId = await queueResync(db, [account.id], `账号 [${account.alias}] 凭据同步`, c);
       else await db.renameAccountInQuotaCache(account.id, account.alias);
       await auditService(db).write({ actor: "session", action: "update", resourceType: "account", resourceId: String(account.id), result: "success", details: { alias: account.alias, credentialsChanged } });
       return c.json(successRes({ account, action_id: actionId, message: "账号信息已更新" }));

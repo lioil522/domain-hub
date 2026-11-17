@@ -1,10 +1,12 @@
 import type { DatabaseManager } from "../db";
+import type { BackupMetadata } from "../db/backup-snapshot";
 
 export interface BackupRecord {
   version: number;
   exported_at: string;
   counts?: Record<string, number>;
   data: Record<string, unknown[]>;
+  metadata?: BackupMetadata;
 }
 
 export class BackupRepository {
@@ -12,7 +14,8 @@ export class BackupRepository {
   exportAll(): Promise<BackupRecord> {
     return this.db.exportAllData();
   }
-  importAll(snapshot: BackupRecord): Promise<{ imported: Record<string, number> }> {
+  importAll(snapshot: unknown): Promise<{ imported: Record<string, number> }> {
     return this.db.importAllData(snapshot);
   }
+  preview(snapshot: unknown) { return this.db.previewDataImport(snapshot); }
 }

@@ -7,6 +7,12 @@ import { LogRepository } from "../repositories/log-repository";
 import { BackupService } from "../services/backup-service";
 import { AuditRepository } from "../repositories/audit-repository";
 import { AuditService } from "../services/audit-service";
+import { bodyLimit } from "hono/body-limit";
+import { BACKUP_BODY_LIMIT } from "../db/backup-snapshot";
+import { AppError, ValidationError } from "../errors";
+import type { ContentfulStatusCode } from "hono/utils/http-status";
+import { sha256Hex } from "../db/crypto";
+import { RESTORE_CHUNK_BYTES } from "../../shared/restore-wire";
 
 export interface BackupRouteDeps {
   loginMaxFailures: number;
@@ -17,6 +23,10 @@ export interface BackupRouteDeps {
 }
 
 export function registerBackupRoutes(app: Hono<AppEnv>, deps: BackupRouteDeps) {
+  app.use("/api/data/*", bodyLimit({
+    maxSize: BACKUP_BODY_LIMIT,
+    onError: c => c.json(errorRes("数据请求超过 20MB 上限", "payload_too_large"), 413),
+  }));
   const logs = (db: DatabaseManager) => new LogService(new LogRepository(db));
   const audit = (db: DatabaseManager) => new AuditService(new AuditRepository(db));
 
@@ -108,25 +118,30 @@ export function registerBackupRoutes(app: Hono<AppEnv>, deps: BackupRouteDeps) {
       }
 
       const backup = new BackupService(dbManager);
-      if (!backup.validate(snapshot)) {
-        return c.json(errorRes("备份文件格式无效或版本不受支持", "bad_request"), 400);
-      }
       const { imported } = await backup.restore(snapshot);
       const summary = Object.entries(imported)
         .filter(([, n]) => n > 0)
         .map(([t, n]) => `${t} ${n} 条`)
         .join(" / ");
-      await logs(dbManager).write("success", "operation", `已导入业务数据：${summary || "无数据"}`);
-      await audit(dbManager).write({ actor: "session", action: "restore", resourceType: "backup", result: "success", details: imported });
+      // Data is already committed. An audit/log failure must not invite a repeat import.
+      const writes = await Promise.allSettled([
+        logs(dbManager).write("success", "operation", `已导入业务数据：${summary || "无数据"}`),
+        audit(dbManager).write({ actor: "session", action: "restore", resourceType: "backup", result: "success", details: imported }),
+      ]);
+      const warnings = writes.some(result => result.status === "rejected") ? ["业务数据已提交，但部分日志或审计写入失败；请勿重复导入"] : [];
+      if (warnings.length) console.error("Backup restore committed with an incomplete audit/log record");
       return c.json(successRes({
         imported,
+        warnings,
         message: `导入完成（合并模式，未删除任何现有数据）：${summary || "备份中无数据"}`,
       }));
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : "导入失败";
-      await logs(dbManager).write("error", "operation", `数据导入失败：${message}`);
-      await audit(dbManager).write({ actor: "session", action: "restore", resourceType: "backup", result: "failure", details: { message } });
-      return c.json(errorRes(message), 400);
+      await Promise.allSettled([
+        logs(dbManager).write("error", "operation", `数据导入失败：${message}`),
+        audit(dbManager).write({ actor: "session", action: "restore", resourceType: "backup", result: "failure", details: { message } }),
+      ]);
+      return c.json(errorRes(message, e instanceof AppError ? e.code : "backup_restore_failed"), (e instanceof AppError ? e.statusCode : 400) as ContentfulStatusCode);
     }
   });
 
@@ -139,7 +154,65 @@ export function registerBackupRoutes(app: Hono<AppEnv>, deps: BackupRouteDeps) {
       const diff = await new BackupService(dbManager).preview(body?.snapshot);
       return c.json(successRes({ diff }));
     } catch (e: unknown) {
-      return c.json(errorRes(e instanceof Error ? e.message : "备份预览失败"), 400);
+      return c.json(errorRes(e instanceof Error ? e.message : "备份预览失败", e instanceof AppError ? e.code : "backup_preview_failed"), (e instanceof AppError ? e.statusCode : 400) as ContentfulStatusCode);
     }
+  });
+
+  app.use("/api/data/restore/*", async (c, next) => { c.header("Cache-Control", "no-store"); await next(); });
+  app.use("/api/data/restore/*", bodyLimit({
+    maxSize: RESTORE_CHUNK_BYTES + 65536,
+    onError: c => c.json(errorRes("分段请求超过大小上限", "payload_too_large"), 413),
+  }));
+  const owner = (c: Context<AppEnv>) => sha256Hex(c.req.header("Authorization")!.substring(7).trim());
+  const stagedBody = (c: Context<AppEnv>) => c.req.json<Record<string, unknown>>().then(body => {
+    if (!body || typeof body !== "object" || Array.isArray(body)) throw new ValidationError("分段请求体格式无效");
+    return body;
+  }).catch(error => { if (error instanceof ValidationError) throw error; throw new ValidationError("分段请求不是有效 JSON"); });
+  const stagedError = (c: Context<AppEnv>, error: unknown) => c.json(
+    errorRes(error instanceof Error ? error.message : "分段恢复失败", error instanceof AppError ? error.code : "restore_failed"),
+    (error instanceof AppError ? error.statusCode : 500) as ContentfulStatusCode,
+  );
+  app.post("/api/data/restore/create", async c => {
+    try {
+      const body = await stagedBody(c);
+      const denied = await checkDataOpTotp(c, c.get("db"), String(body.token || ""), false);
+      if (denied) return denied;
+      const session = await c.get("db").stagedRestore().create(String(body.id || ""), await owner(c), body.manifest);
+      return c.json(successRes({ session }), 201);
+    } catch (error) { return stagedError(c, error); }
+  });
+  app.get("/api/data/restore/:id", async c => {
+    try { return c.json(successRes({ session: await c.get("db").stagedRestore().get(c.req.param("id"), await owner(c)) })); }
+    catch (error) { return stagedError(c, error); }
+  });
+  app.post("/api/data/restore/:id/chunks/:index", async c => {
+    try {
+      const body = await stagedBody(c);
+      const session = await c.get("db").stagedRestore().upload(c.req.param("id"), await owner(c), Number(c.req.param("index")), body.rows);
+      return c.json(successRes({ session }));
+    } catch (error) { return stagedError(c, error); }
+  });
+  app.post("/api/data/restore/:id/validate", async c => {
+    try { return c.json(successRes({ session: await c.get("db").stagedRestore().validate(c.req.param("id"), await owner(c)) })); }
+    catch (error) { return stagedError(c, error); }
+  });
+  app.post("/api/data/restore/:id/commit", async c => {
+    try {
+      const body = await stagedBody(c);
+      const denied = await checkDataOpTotp(c, c.get("db"), String(body.token || ""), false);
+      if (denied) return denied;
+      const session = await c.get("db").stagedRestore().commit(c.req.param("id"), await owner(c));
+      const writes = await Promise.allSettled([
+        audit(c.get("db")).write({ actor: "session", action: "restore", resourceType: "backup", resourceId: session.id,
+          result: "success", details: session.result?.imported }),
+        logs(c.get("db")).write("success", "operation", `分段恢复已提交：${session.id}`),
+      ]);
+      return c.json(successRes({ session, imported: session.result?.imported,
+        warnings: writes.some(result => result.status === "rejected") ? ["数据已提交，但部分审计或日志写入失败"] : [] }));
+    } catch (error) { return stagedError(c, error); }
+  });
+  app.post("/api/data/restore/:id/cancel", async c => {
+    try { return c.json(successRes({ session: await c.get("db").stagedRestore().cancel(c.req.param("id"), await owner(c)) })); }
+    catch (error) { return stagedError(c, error); }
   });
 }

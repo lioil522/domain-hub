@@ -26,6 +26,7 @@
 import type { ActionResponse, CreateDnsRecordResponse, DnsRecordInfo, ListDnsRecordsResponse } from "./dnshe";
 import type { UpstreamSubdomain } from "./db";
 import { zoneIdToNumericId } from "./cloudflare";
+import { providerFetch } from "./providers/provider-fetch";
 
 /** DNSPod 服务端点（腾讯云 API 3.0 固定网关） */
 const DNSPOD_ENDPOINT = "dnspod.tencentcloudapi.com";
@@ -297,6 +298,7 @@ const DNSPOD_LINE_MAP: Record<string, string> = {
  * 全部请求走 POST + JSON，靠 X-TC-Action 头区分接口，响应统一包在 `Response` 字段里。
  */
 export class DnspodClient {
+  requestSignal?: AbortSignal;
   private secretId: string;
   private secretKey: string;
   private baseUrl = `https://${DNSPOD_ENDPOINT}`;
@@ -322,7 +324,7 @@ export class DnspodClient {
 
     let response: Response;
     try {
-      response = await fetch(`${this.baseUrl}/`, {
+      response = await providerFetch(`${this.baseUrl}/`, {
         method: "POST",
         headers: {
           Authorization: authorization,
@@ -334,7 +336,7 @@ export class DnspodClient {
           "X-TC-Region": DNSPOD_REGION,
         },
         body: payload,
-      });
+      }, this.requestSignal);
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : "网络请求失败";
       throw new Error(`DNSPod API 请求失败：${message}`);

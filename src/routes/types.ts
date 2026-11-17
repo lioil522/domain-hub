@@ -10,6 +10,7 @@ export type Bindings = {
   DEFAULT_API_KEY?: string;
   DEFAULT_API_SECRET?: string;
   DEFAULT_API_ALIAS?: string;
+  SYNC_QUEUE?: Queue<{ kind: "sync_tick" }>;
 };
 
 export type Variables = { db: DatabaseManager };

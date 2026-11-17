@@ -261,16 +261,43 @@ export async function runDailySyncAndRenewal(
           const fullDomain = sub.full_domain as string;
 
           try {
+            const journal = await dbManager.firstRaw<{ original_expiry: string; status: string; new_expiry: string | null }>(
+              `SELECT original_expiry,status,new_expiry FROM sync_renew_journal WHERE account_id=? AND domain_id=? AND full_domain=?
+                AND (status='attempting' OR (status='confirmed' AND julianday(original_expiry)=julianday(?))) LIMIT 1`,
+              [acc.id, subId, fullDomain, expiresAt]);
+            if (journal) {
+              const probe = journal.status === "confirmed" && journal.new_expiry ? null : await client.getSubdomain(subId);
+              const confirmed = journal.status === "confirmed" && journal.new_expiry
+                ? journal.new_expiry : probe?.success ? probe.subdomain?.expires_at : undefined;
+              if (confirmed && Date.parse(confirmed) > Date.parse(journal.original_expiry)) {
+                await dbManager.markDomainRenewed(subId, confirmed);
+                await dbManager.executeRaw(`UPDATE sync_renew_journal SET status='confirmed',new_expiry=?,updated_at=?
+                  WHERE account_id=? AND domain_id=? AND full_domain=? AND original_expiry=?`,
+                  [confirmed, Date.now(), acc.id, subId, fullDomain, journal.original_expiry]);
+              } else await dbManager.writeLog("warning", "renew", `域名 [${fullDomain}] 有未确认续期，仅核对结果，不重复提交`);
+              continue;
+            }
+            const requestToken = crypto.randomUUID();
+            const claimed = await dbManager.firstRaw<{ request_token: string }>(`INSERT INTO sync_renew_journal
+              (account_id,domain_id,full_domain,original_expiry,status,updated_at,request_token)
+              VALUES(?,?,?,?,'attempting',?,?) ON CONFLICT DO UPDATE SET status='attempting',
+                updated_at=excluded.updated_at,request_token=excluded.request_token
+                WHERE sync_renew_journal.status='failed' RETURNING request_token`,
+              [acc.id, subId, fullDomain, expiresAt, Date.now(), requestToken]);
+            if (claimed?.request_token !== requestToken) continue;
             const renewResult = await client.renewSubdomain(subId);
-            if (renewResult && renewResult.success) {
+            if (renewResult && renewResult.success && Date.parse(renewResult.new_expires_at || "") > Date.parse(expiresAt)) {
               totalRenewSuccess++;
               const newExpiresAt = renewResult.new_expires_at || "";
               await dbManager.markDomainRenewed(subId, newExpiresAt);
+              await dbManager.executeRaw("UPDATE sync_renew_journal SET status='confirmed',new_expiry=?,updated_at=? WHERE request_token=?",
+                [newExpiresAt, Date.now(), requestToken]);
               const msg = `域名 [${fullDomain}] (账户: ${alias}) 自动续期成功！新有效期至: ${newExpiresAt}`;
               await dbManager.writeLog("success", "renew", msg, renewResult);
               renewLogs.push(`✅ ${msg}`);
             } else {
-              throw new Error(renewResult.message || "未知原因导致的续期失败");
+              if (renewResult && !renewResult.success) await dbManager.executeRaw("UPDATE sync_renew_journal SET status='failed',updated_at=? WHERE request_token=?", [Date.now(), requestToken]);
+              throw new Error(renewResult.message || "续期结果未知，后续只读核对，不重复提交");
             }
           } catch (err: unknown) {
             const errMsg = err instanceof Error ? err.message : "";

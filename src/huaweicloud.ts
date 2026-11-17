@@ -29,6 +29,7 @@
 import type { ActionResponse, CreateDnsRecordResponse, DnsRecordInfo, ListDnsRecordsResponse } from "./dnshe";
 import type { UpstreamSubdomain } from "./db";
 import { zoneIdToNumericId } from "./cloudflare";
+import { providerFetch } from "./providers/provider-fetch";
 
 /**
  * 华为云 DNS 终端节点候选表（按优先级，命中即止）
@@ -329,6 +330,7 @@ export function isHuaweiLineEqual(lineA: string | undefined | null, lineB: strin
  * 华为云云解析 DNS API 请求封装类
  */
 export class HuaweiCloudClient {
+  requestSignal?: AbortSignal;
   private accessKeyId: string;
   private secretAccessKey: string;
   /** 显式固定的终端节点；为空时按候选表自动探测 */
@@ -396,7 +398,7 @@ export class HuaweiCloudClient {
 
       let response: Response;
       try {
-        response = await fetch(requestUrl, {
+        response = await providerFetch(requestUrl, {
           method,
           headers: {
             Authorization: authorization,
@@ -406,7 +408,7 @@ export class HuaweiCloudClient {
             "Content-Type": "application/json",
           },
           body: bodyText === "" ? undefined : bodyText,
-        });
+        }, this.requestSignal);
       } catch (e: unknown) {
         // 连不上 / 域名解析不了 —— 节点级失败，换下一个候选
         lastError = new HuaweiEndpointUnreachableError(

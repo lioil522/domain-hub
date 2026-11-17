@@ -147,6 +147,33 @@ export function buildDomainUpsert(
   );
 }
 
+/** Bounded statement count for an entire persisted snapshot or CF page. */
+export function buildDomainJsonUpsert(
+  db: D1Database,
+  accountId: number,
+  source: { from: string; json: string; where: string; bindings: unknown[];
+    known?: { sql: string; bindings: unknown[] } },
+  guard: { sql: string; bindings: unknown[] },
+): D1PreparedStatement {
+  const field = (name: string) => `json_extract(${source.json},'$.${name}')`;
+  const known = source.known || { sql: "1", bindings: [] };
+  return db.prepare(`INSERT INTO domains_cache
+    (id,account_id,subdomain,rootdomain,full_domain,status,created_at,expires_at,has_dns,dns_provider,provider_account_id,remote_id,updated_at)
+    SELECT ${field("id")},?,COALESCE(${field("subdomain")},''),COALESCE(${field("rootdomain")},''),${field("full_domain")},
+      CASE WHEN ${field("dns_state_known")}=1 OR ${field("status")} IN ('已解析','已委派','未解析') THEN COALESCE(${field("status")},'未解析') ELSE '未解析' END,
+      COALESCE(${field("created_at")},''),COALESCE(${field("expires_at")},''),COALESCE(${field("has_dns")},1),
+      ${field("dns_provider")},CAST(${field("provider_account_id")} AS TEXT),${field("remote_id")},CURRENT_TIMESTAMP
+    FROM ${source.from} WHERE ${source.where} AND ${guard.sql}
+    ON CONFLICT(id) DO UPDATE SET account_id=excluded.account_id,
+      status=CASE WHEN ${known.sql} THEN excluded.status ELSE domains_cache.status END,
+      has_dns=CASE WHEN ${known.sql} THEN excluded.has_dns ELSE domains_cache.has_dns END,
+      dns_provider=CASE WHEN ${known.sql} THEN COALESCE(excluded.dns_provider,domains_cache.dns_provider) ELSE domains_cache.dns_provider END,
+      created_at=COALESCE(NULLIF(excluded.created_at,''),domains_cache.created_at),
+      expires_at=excluded.expires_at,provider_account_id=COALESCE(excluded.provider_account_id,domains_cache.provider_account_id),
+      remote_id=COALESCE(excluded.remote_id,domains_cache.remote_id),updated_at=excluded.updated_at`)
+    .bind(accountId, ...source.bindings, ...guard.bindings, ...known.bindings, ...known.bindings, ...known.bindings);
+}
+
 /**
  * 写入/更新单条域名缓存（不做账号级别的清理扫描）
  */

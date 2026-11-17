@@ -1,146 +1,85 @@
-/**
- * 数据导入 / 导出（备份与迁移）
- */
-
+import { ConflictError, ValidationError } from "../../errors";
+import { BACKUP_IMPORT_LIMIT, BACKUP_PLAN, normalizeBackup, type BackupRow, type BackupSnapshot } from "../backup-snapshot";
+import { diffBackup } from "../backup-diff";
+import { backupChecksum, backupKeyId, verifyBackupIntegrity } from "../backup-integrity";
+import { SCHEMA_VERSION } from "../schema-definition";
 import { DATA_EXPORT_VERSION } from "../types";
 
-/**
- * 导出全部业务数据为可移植快照
- *
- * 范围限定在 5 张业务表。settings / logs / cache 故意不导出。
- */
-export async function exportAllData(db: D1Database): Promise<{
-  version: number;
-  exported_at: string;
-  counts: Record<string, number>;
-  data: Record<string, unknown[]>;
-}> {
-  const TABLES = [
-    "accounts",
-    "domains_cache",
-    "custom_accounts",
-    "custom_domains",
-    "domain_date_overrides",
-  ] as const;
+/** One read transaction, fixed columns only; no settings, sessions or operator-added fields. */
+export async function readBackupData(db: D1Database): Promise<BackupSnapshot & { counts: Record<string, number> }> {
+  const results = await db.batch<Record<string, unknown>>(BACKUP_PLAN.map(step =>
+    db.prepare(`SELECT ${step.columns.join(", ")} FROM ${step.table} ORDER BY id`)));
+  if (results.some(result => !result.success)) throw new Error("读取业务备份失败");
+  const data: Record<string, unknown[]> = {}, counts: Record<string, number> = {};
+  BACKUP_PLAN.forEach((step, index) => {
+    data[step.table] = results[index].results;
+    counts[step.table] = data[step.table].length;
+  });
+  return { version: DATA_EXPORT_VERSION, exported_at: new Date().toISOString(), counts, data };
+}
 
-  const data: Record<string, unknown[]> = {};
-  const counts: Record<string, number> = {};
+export async function exportAllData(db: D1Database, aesKey?: string) {
+  const raw = await readBackupData(db);
+  const snapshot = normalizeBackup(raw);
+  await verifyBackupIntegrity(raw, snapshot, aesKey);
+  snapshot.metadata = { scope: "business", schema_version: SCHEMA_VERSION, key_id: await backupKeyId(aesKey), checksum: "0".repeat(64) };
+  snapshot.metadata.checksum = await backupChecksum(snapshot);
+  return { ...snapshot, counts: raw.counts, data: snapshot.data as Record<string, unknown[]> };
+}
 
-  for (const table of TABLES) {
-    const { results } = await db
-      .prepare(`SELECT * FROM ${table}`)
-      .all<Record<string, unknown>>();
-    data[table] = results || [];
-    counts[table] = (results || []).length;
-  }
-
-  return {
-    version: DATA_EXPORT_VERSION,
-    exported_at: new Date().toISOString(),
-    counts,
-    data,
-  };
+export async function previewAllData(db: D1Database, input: unknown, aesKey?: string) {
+  const snapshot = normalizeBackup(input);
+  await verifyBackupIntegrity(input as BackupSnapshot, snapshot, aesKey);
+  return diffBackup(await readBackupData(db), snapshot);
 }
 
 /**
- * 导入业务数据快照（合并 upsert 语义）
- *
- * NOTE: 写入顺序遵循外键依赖：accounts → custom_accounts → custom_domains /
- * domains_cache / domain_date_overrides。
+ * Fence numeric and natural identities inside the write transaction. An invalid
+ * INTEGER PRIMARY KEY deliberately aborts the whole batch instead of silently
+ * skipping a conflicted row and committing its siblings.
  */
-export async function importAllData(db: D1Database, snapshot: {
-  version?: number;
-  data?: Record<string, unknown[]>;
-}): Promise<{ imported: Record<string, number> }> {
-  const version = Number(snapshot?.version);
-  if (!Number.isFinite(version) || version !== DATA_EXPORT_VERSION) {
-    throw new Error(
-      `备份文件版本不支持（期望 ${DATA_EXPORT_VERSION}，实际 ${snapshot?.version ?? "缺失"}）`
-    );
+function guardedUpsert(db: D1Database, step: (typeof BACKUP_PLAN)[number], row: BackupRow) {
+  let natural = step.identity.map(column => `${column} IS ?`).join(" AND ");
+  let guardBinds: Array<string | number | null> = step.identity.map(column => row[column]);
+  if (step.table === "accounts") {
+    // api_key is globally unique even across providers.
+    natural = "api_key IS ?";
+    guardBinds = [row.api_key];
   }
-  const src = snapshot?.data;
-  if (!src || typeof src !== "object") {
-    throw new Error("备份文件缺少 data 字段");
+  if (step.table === "domains_cache") {
+    natural = "account_id IS ? AND (full_domain IS ? OR (? IS NOT NULL AND remote_id IS ?))";
+    guardBinds = [row.account_id, row.full_domain, row.remote_id, row.remote_id];
   }
+  let guard = `EXISTS (SELECT 1 FROM ${step.table} WHERE (${natural}) AND id != ?)`;
+  guardBinds.push(row.id);
+  if (step.table === "custom_domains" && row.account_id !== null) {
+    guard += " OR EXISTS (SELECT 1 FROM custom_accounts WHERE id = ? AND group_id IS NOT ?)";
+    guardBinds.push(row.account_id, row.group_id);
+  }
+  const identity = step.identity.map(column => `${step.table}.${column} IS excluded.${column}`).join(" AND ");
+  const updates = step.columns.filter(column => column !== "id").map(column => `${column}=excluded.${column}`);
+  const sql = `INSERT INTO ${step.table} (${step.columns.join(", ")})
+    SELECT CASE WHEN ${guard} THEN 'backup_identity_conflict' ELSE ? END, ${step.columns.slice(1).map(() => "?").join(", ")}
+    WHERE 1
+    ON CONFLICT(id) DO UPDATE SET
+      id=CASE WHEN ${identity} THEN ${step.table}.id ELSE 'backup_identity_conflict' END, ${updates.join(", ")}`;
+  return db.prepare(sql).bind(...guardBinds, ...step.columns.map(column => row[column]));
+}
 
-  const imported: Record<string, number> = {};
-
-  const PLAN: Array<{ table: string; columns: string[]; conflict: string[] }> = [
-    {
-      table: "accounts",
-      columns: ["id", "alias", "api_key", "api_secret", "provider", "website", "created_at"],
-      conflict: ["id"],
-    },
-    {
-      table: "custom_accounts",
-      columns: ["id", "group_id", "name", "updated_at"],
-      conflict: ["id"],
-    },
-    {
-      table: "custom_domains",
-      columns: [
-        "id", "group_id", "account_id", "full_domain",
-        "registered_at", "expires_at", "remark", "updated_at",
-      ],
-      conflict: ["id"],
-    },
-    {
-      table: "domains_cache",
-      columns: [
-        "id", "account_id", "subdomain", "rootdomain", "full_domain", "status",
-        "created_at", "expires_at", "last_renewed_at", "has_dns", "dns_provider",
-        "provider_account_id", "remote_id", "updated_at",
-      ],
-      conflict: ["id"],
-    },
-    {
-      table: "domain_date_overrides",
-      columns: ["id", "account_id", "full_domain", "registered_at", "expires_at", "source", "updated_at"],
-      conflict: ["id"],
-    },
-  ];
-
-  const statements: Array<ReturnType<D1Database["prepare"]>> = [];
-
-  for (const step of PLAN) {
-    const rows = Array.isArray(src[step.table]) ? (src[step.table] as unknown[]) : [];
-    if (rows.length === 0) {
-      imported[step.table] = 0;
-      continue;
+export async function importAllData(db: D1Database, input: unknown, aesKey?: string): Promise<{ imported: Record<string, number> }> {
+  const snapshot = normalizeBackup(input);
+  const count = BACKUP_PLAN.reduce((n, step) => n + snapshot.data[step.table].length, 0);
+  if (count > BACKUP_IMPORT_LIMIT) throw new ValidationError(`本次导入 ${count} 行，超过直接导入上限 ${BACKUP_IMPORT_LIMIT} 行；请使用分段恢复，不要拆文件破坏引用关系`);
+  await verifyBackupIntegrity(input as BackupSnapshot, snapshot, aesKey);
+  const diff = diffBackup(await readBackupData(db), snapshot);
+  if (diff.totalConflicts) throw new ConflictError(`备份有 ${diff.totalConflicts} 项身份或引用冲突，请先查看预览并显式解决 ID 映射`, "backup_conflict");
+  const statements = BACKUP_PLAN.flatMap(step => snapshot.data[step.table].map(row => guardedUpsert(db, step, row)));
+  if (statements.length) {
+    try { await db.batch(statements); }
+    catch (error) {
+      if (error instanceof Error && /datatype mismatch/i.test(error.message)) throw new ConflictError("目标业务身份在预览后发生变化，整批已回滚，请重新预览", "backup_conflict");
+      throw error;
     }
-    const colList = step.columns.join(", ");
-    const placeholders = step.columns.map(() => "?").join(", ");
-    const updates = step.columns
-      .filter((c) => !step.conflict.includes(c))
-      .map((c) => `${c} = excluded.${c}`)
-      .join(", ");
-    const sql = `INSERT INTO ${step.table} (${colList}) VALUES (${placeholders})
-      ON CONFLICT(${step.conflict.join(", ")}) DO UPDATE SET ${updates}`;
-
-    for (const raw of rows) {
-      if (!raw || typeof raw !== "object") continue;
-      const row = raw as Record<string, unknown>;
-      const binds = step.columns.map((c) => {
-        const v = row[c];
-        if (v === undefined || v === null) return null;
-        if (typeof v === "number" || typeof v === "string") return v;
-        if (typeof v === "boolean") return v ? 1 : 0;
-        return String(v);
-      });
-      statements.push(db.prepare(sql).bind(...binds));
-    }
-    imported[step.table] = rows.length;
   }
-
-  if (statements.length > 0) {
-    const MAX_STATEMENTS = 500;
-    if (statements.length > MAX_STATEMENTS) {
-      throw new Error(
-        `本次导入需要写入 ${statements.length} 行，超过单次上限 ${MAX_STATEMENTS} 行。请分批导出/导入。`
-      );
-    }
-    await db.batch(statements);
-  }
-
-  return { imported };
+  return { imported: Object.fromEntries(BACKUP_PLAN.map(step => [step.table, snapshot.data[step.table].length])) };
 }

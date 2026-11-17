@@ -388,7 +388,9 @@ export async function getClientForAccount(
     );
   }
   if (typedAccount.provider === "cloudflare") {
-    return { client: new CloudflareClient(apiSecret), alias: typedAccount.alias, provider: "cloudflare" };
+    const client = new CloudflareClient(apiSecret);
+    client.credentialFingerprint = await sha256Hex(JSON.stringify([typedAccount.provider, typedAccount.api_key, typedAccount.api_secret]));
+    return { client, alias: typedAccount.alias, provider: "cloudflare" };
   }
   if (typedAccount.provider === "digitalplat") {
     return { client: new DigitalPlatClient(apiSecret), alias: typedAccount.alias, provider: "digitalplat" };

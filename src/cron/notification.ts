@@ -6,6 +6,7 @@
  */
 
 export type WebhookType = "dingtalk" | "feishu" | "wecom" | "serverchan" | "custom";
+import { providerFetch } from "../providers/provider-fetch";
 
 export interface WebhookSendResult {
   ok: boolean;
@@ -31,7 +32,8 @@ export function normalizeServerChanEndpoint(input: string): string {
 export async function sendWebhookNotification(
   webhookUrl: string,
   message: string,
-  webhookType: WebhookType = "custom"
+  webhookType: WebhookType = "custom",
+  signal?: AbortSignal
 ): Promise<WebhookSendResult> {
   if (!webhookUrl) return { ok: false, detail: "未配置 Webhook 地址" };
   const endpoint = webhookType === "serverchan" ? normalizeServerChanEndpoint(webhookUrl) : webhookUrl;
@@ -60,11 +62,11 @@ export async function sendWebhookNotification(
         break;
     }
 
-    const res = await fetch(endpoint, {
+    const res = await providerFetch(endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
-    });
+    }, signal);
 
     const bodyText = (await res.text().catch(() => "")).slice(0, 500);
 
@@ -98,13 +100,14 @@ export async function sendWebhookNotification(
 export async function sendTelegramNotification(
   botToken: string,
   chatId: string,
-  message: string
+  message: string,
+  signal?: AbortSignal
 ): Promise<WebhookSendResult> {
   if (!botToken || !chatId) return { ok: false, detail: "未配置 Telegram Bot Token 或 Chat ID" };
 
   try {
     const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
-    const res = await fetch(url, {
+    const res = await providerFetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -112,7 +115,7 @@ export async function sendTelegramNotification(
         text: message,
         disable_web_page_preview: true,
       }),
-    });
+    }, signal);
 
     const bodyText = (await res.text().catch(() => "")).slice(0, 500);
 

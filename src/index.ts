@@ -16,6 +16,8 @@ import { LogRepository } from "./repositories/log-repository";
 import { AccountService } from "./services/account-service";
 import { LogService } from "./services/log-service";
 import { runDailySyncAndRenewal } from "./cron/jobs/daily-sync";
+import { runOneSyncSlice } from "./services/sync-work-runner";
+import { syncRunOptions } from "./services/sync-dispatch";
 import { PROVIDER_IDS, PROVIDER_LABELS, normalizeProvider } from "./providers/registry";
 import { resyncAccountsInBackground, ensureDefaultAccount, sleep, cacheNewlyRegisteredDomain } from "./services/account-sync-service";
 import { fetchAllQuotas } from "./services/quota-service";
@@ -113,33 +115,11 @@ app.use(
 );
 
 /**
- * 表结构自举 — 每个 isolate 只执行一次
- */
-let schemaReady: Promise<boolean> | null = null;
-
-function ensureSchemaOnce(dbManager: DatabaseManager): Promise<boolean> {
-  if (!schemaReady) {
-    schemaReady = dbManager
-      .ensureTables()
-      .then((ok) => {
-        if (!ok) schemaReady = null;
-        return ok;
-      })
-      .catch((e) => {
-        schemaReady = null;
-        console.error("ensureSchemaOnce failed:", e);
-        return false;
-      });
-  }
-  return schemaReady;
-}
-
-/**
  * DatabaseManager 实例化中间件 — 注入 dbManager 到 context
  */
 app.use("/api/*", async (c, next) => {
   const dbManager = new DatabaseManager(c.env.DB, c.env.AES_KEY);
-  if (!await ensureSchemaOnce(dbManager)) throw new ServiceUnavailableError("数据库初始化失败，请稍后重试");
+  if (!await dbManager.ensureTables()) throw new ServiceUnavailableError("数据库初始化失败，请稍后重试");
   c.set("db", dbManager);
   return next();
 });
@@ -278,8 +258,22 @@ export default {
   async scheduled(event: ScheduledEvent, env: Bindings, ctx: ExecutionContext) {
     const dbManager = new DatabaseManager(env.DB, env.AES_KEY);
     const webhookType = (env.WEBHOOK_TYPE || "custom") as WebhookType;
-    ctx.waitUntil(runDailySyncAndRenewal(dbManager, env.WEBHOOK_URL, webhookType, true));
-  }
+    if (event.cron === "* * * * *") {
+      ctx.waitUntil((async () => {
+        if (!await dbManager.ensureTables()) throw new Error("数据库迁移未完成");
+        await runOneSyncSlice(dbManager, syncRunOptions(env));
+      })());
+    } else ctx.waitUntil(runDailySyncAndRenewal(dbManager, env.WEBHOOK_URL, webhookType, true));
+  },
+  async queue(batch: MessageBatch<{ kind: "sync_tick" }>, env: Bindings) {
+    const db = new DatabaseManager(env.DB, env.AES_KEY);
+    if (!await db.ensureTables()) { batch.retryAll({ delaySeconds: 60 }); return; }
+    for (const message of batch.messages) {
+      if (message.body?.kind !== "sync_tick") { message.ack(); continue; }
+      try { await runOneSyncSlice(db, syncRunOptions(env)); message.ack(); }
+      catch { message.retry({ delaySeconds: 60 }); }
+    }
+  },
 };
 
 // 下游直接 re-export 的模块（不要删除这些行）

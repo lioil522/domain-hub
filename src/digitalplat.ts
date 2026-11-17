@@ -19,6 +19,7 @@
 import type { ActionResponse, CreateDnsRecordResponse, DnsRecordInfo, ListDnsRecordsResponse } from "./dnshe";
 import type { UpstreamSubdomain } from "./db";
 import { zoneIdToNumericId } from "./cloudflare";
+import { providerFetch } from "./providers/provider-fetch";
 import { detectDnsProvider } from "./dns-provider";
 
 /** DigitalPlat API 统一响应外壳 */
@@ -189,6 +190,7 @@ export function normalizeDpName(name: string | undefined | null, domain: string)
  * DigitalPlat API 请求封装类
  */
 export class DigitalPlatClient {
+  requestSignal?: AbortSignal;
   private apiKey: string;
   private baseUrl = "https://domain-api.digitalplat.org/api/v1";
 
@@ -236,11 +238,11 @@ export class DigitalPlatClient {
       headers["If-Match"] = options.ifMatchEtag;
     }
 
-    const response = await fetch(url.toString(), {
+    const response = await providerFetch(url.toString(), {
       method,
       headers,
       body: options.body === undefined ? undefined : JSON.stringify(options.body),
-    });
+    }, this.requestSignal);
 
     let data: DpResponse<T>;
     try {

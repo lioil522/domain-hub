@@ -61,6 +61,7 @@ import { useAppControllerDataEffects } from "./controller/useAppControllerDataEf
 import { useSettings } from "../features/settings/hooks/useSettings";
 import { useDataTransfer } from "../features/data/hooks/useDataTransfer";
 import { DataOpModal } from "../features/data/components/DataOpModal";
+import { refreshRestoredData } from "../features/data/utils/backup-transfer";
 import { LoginPage, useAuthSession } from "../features/auth";
 import { observeSyncAction, type WaitForAccountSync } from "../features/domains/utils/sync-action";
 // ── Phase 2：API 客户端 / Toast ──
@@ -343,11 +344,18 @@ export function useAppControllerView() {
     dataOpToken,
     setDataOpToken,
     importSnapshot,
+    importPreview,
+    restoreId,
+    restoreProgress,
+    handleCancelRestore,
     setImportSnapshot,
     handleExportData,
     handlePickSnapshotFile,
     handleImportData,
-  } = useDataTransfer({ apiFetch, showToast, accountInfo, setActionLoading, fetchDomains, fetchAccountInfo });
+  } = useDataTransfer({ apiFetch, backendUrl, sessionToken, showToast, accountInfo, setActionLoading, onRestored: () => refreshRestoredData([
+    fetchAccounts, fetchDomains, () => refreshAllProviderDomains(), () => fetchCustomDomains(),
+    () => { invalidateQuotaTabCache(); return fetchQuotas(); },
+  ]) });
 
   // 2. 获取账号列表 —— 已上移到 AppDataProvider（Phase 2.5），由 useAppData 取得 fetchAccounts。
 
@@ -1540,6 +1548,10 @@ export function useAppControllerView() {
         token={dataOpToken}
         onTokenChange={setDataOpToken}
         importSnapshot={importSnapshot}
+        importPreview={importPreview}
+        restoreId={restoreId}
+        restoreProgress={restoreProgress}
+        onCancelRestore={handleCancelRestore}
         onPickFile={handlePickSnapshotFile}
         twoFaEnabled={accountInfo.two_fa_enabled}
         busy={actionLoading === "data-export" || actionLoading === "data-import"}

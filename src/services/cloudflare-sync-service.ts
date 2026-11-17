@@ -8,12 +8,13 @@ export async function syncCloudflareSlice(
   accountId: number,
   client: CloudflareClient,
   maxPages = CF_ZONE_ROUNDS_PER_RUN,
+  guard?: { sql: string; bindings: unknown[] },
 ): Promise<{ completed: boolean; totalSynced: number; nextPage: number }> {
-  const lease = await db.claimCloudflareSync(accountId);
+  const lease = await db.claimCloudflareSync(accountId, client.credentialFingerprint);
   try {
     for (let round = 0; round < Math.max(1, Math.min(50, Math.floor(maxPages))); round++) {
       const page = await client.listZones({ startPage: lease.nextPage, maxPages: 1 });
-      await db.commitCloudflareSyncPage(accountId, lease, page.zones.map(mapZoneToUpstream), page);
+      await db.commitCloudflareSyncPage(accountId, lease, page.zones.map(mapZoneToUpstream), page, guard);
       if (!page.hasMore) return { completed: true, totalSynced: lease.totalSynced, nextPage: lease.nextPage };
     }
     return { completed: false, totalSynced: lease.totalSynced, nextPage: lease.nextPage };

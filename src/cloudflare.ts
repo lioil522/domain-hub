@@ -13,6 +13,7 @@ import type {
   ListDnsRecordsResponse,
 } from "./dnshe";
 import type { UpstreamSubdomain } from "./db";
+import { providerFetch } from "./providers/provider-fetch";
 
 /**
  * 把 Cloudflare zone id 映射为 domains_cache 的数值主键
@@ -216,6 +217,8 @@ export function mapZoneToUpstream(zone: CfZoneInfo): UpstreamSubdomain {
  * Cloudflare API 请求封装类
  */
 export class CloudflareClient {
+  requestSignal?: AbortSignal;
+  credentialFingerprint?: string;
   private apiToken: string;
   private baseUrl = "https://api.cloudflare.com/client/v4";
 
@@ -241,14 +244,14 @@ export class CloudflareClient {
       }
     }
 
-    const response = await fetch(url.toString(), {
+    const response = await providerFetch(url.toString(), {
       method,
       headers: {
         Authorization: `Bearer ${this.apiToken}`,
         "Content-Type": "application/json",
       },
       body: body === undefined ? undefined : JSON.stringify(body),
-    });
+    }, this.requestSignal);
 
     let data: CfResponse<T>;
     try {

@@ -25,6 +25,7 @@
 import type { ActionResponse, CreateDnsRecordResponse, DnsRecordInfo, ListDnsRecordsResponse } from "./dnshe";
 import type { UpstreamSubdomain } from "./db";
 import { zoneIdToNumericId } from "./cloudflare";
+import { providerFetch } from "./providers/provider-fetch";
 
 const ALIDNS_ENDPOINT = "https://alidns.aliyuncs.com/";
 const ALIDNS_API_VERSION = "2015-01-09";
@@ -229,6 +230,7 @@ export function mapAlidnsDomainToUpstream(domain: AlidnsDomainInfo): UpstreamSub
  * 全部请求走 POST + query string 参数，响应是 XML。
  */
 export class AlidnsClient {
+  requestSignal?: AbortSignal;
   private accessKeyId: string;
   private accessKeySecret: string;
 
@@ -272,11 +274,11 @@ export class AlidnsClient {
 
     let response: Response;
     try {
-      response = await fetch(ALIDNS_ENDPOINT, {
+      response = await providerFetch(ALIDNS_ENDPOINT, {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: query,
-      });
+      }, this.requestSignal);
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : "网络请求失败";
       throw new Error(`阿里云 DNS API 请求失败：${message}`);

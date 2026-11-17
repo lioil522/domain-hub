@@ -771,6 +771,12 @@ npx wrangler d1 execute domain-hub-db --remote --file=./schema.sql
 
 生产数据库请明确使用 `--remote`，不要误把本地数据库当成线上库。
 
+`schema.sql` 是由 `src/db/schema-definition.ts` 生成的**新库快照**，不是旧库升级脚本。已有数据库升级时先备份，使用应用内的版本迁移器补字段与索引，不要清库或手工伪造迁移版本。Worker 首次访问、Node 开放端口前都会检查迁移；失败时 API 返回 503 或 Node 停止启动。Node 默认不再依赖外部 `schema.sql`。详细兼容范围及回滚注意见 [数据库迁移修复记录](docs/SCHEMA_PROGRESS_2026-11-17.md)。
+
+JSON 业务备份附带密钥指纹和校验和，导入先预览身份冲突，仍需原 AES_KEY。它不含登录配置/2FA，不是完整灾备；超过 500 行会自动使用持久 staging，支持最多 10,000 行、8MB，完整校验并确认后一次性提交。中断后需在同一后端和登录会话重新选择相同文件续传，未提交会话 1 小时过期。详见 [分段恢复说明](docs/STAGED_RESTORE_PROGRESS_2026-11-17.md) 和 [备份安全记录](docs/BACKUP_PROGRESS_2026-11-17.md)。
+
+手动/绑定后的同步已改为持久工作队列，支持中断恢复、失联任务回收、暂停与重试。Worker 必须一起更新分钟级 Cron 配置，Node 启动后自动执行；不能只更新前端来解决 `running` / 排队卡住。详见 [同步队列修复与上线说明](docs/SYNC_QUEUE_FIX_2026-11-17.md)。
+
 ### A-4. 配置加密密钥
 
 **Worker 必须配置稳定的 `AES_KEY`。新 Secret 写入不再允许在缺少密钥时降级为 Base64；已有密文请继续使用原密钥，不能随机更换。** 首批安全修复及升级注意见 [修复进度](docs/FIX_PROGRESS_2026-11-17.md)。

@@ -6,6 +6,7 @@
  */
 
 import { UpstreamRateLimitError } from "./errors";
+import { providerFetch } from "./providers/provider-fetch";
 
 /** 通用基础响应 */
 export interface BaseResponse {
@@ -155,6 +156,7 @@ export interface UpdateDnsRecordParams extends CreateDnsRecordParams {
  * DNSHE API 请求封装类
  */
 export class DNSHEClient {
+  requestSignal?: AbortSignal;
   private apiKey: string;
   private apiSecret: string;
   private baseUrl: string;
@@ -205,7 +207,7 @@ export class DNSHEClient {
     }
 
     try {
-      const response = await fetch(url, options);
+      const response = await providerFetch(url, options, this.requestSignal);
       if (!response.ok) {
         const errData = (await response.json().catch(() => ({}))) as Record<string, unknown>;
         const errMsg = 

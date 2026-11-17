@@ -12,14 +12,14 @@ type ActionItem = {
   metadata?: unknown;
 };
 
-function syncDetails(metadata: unknown): Array<{ accountId: number; alias: string; status: string; error?: string; nextPage?: number }> {
+function syncDetails(metadata: unknown): Array<{ accountId: number; alias: string; status: string; error?: string; nextPage?: number; phase?: string; retryAt?: number; domainCount?: number; checked?: number }> {
   if (!metadata || typeof metadata !== "object") return [];
   const record = metadata as Record<string, unknown>;
   const summary = record.summary && typeof record.summary === "object" ? record.summary as Record<string, unknown> : {};
   const rows = summary.results || record.results;
   return Array.isArray(rows) ? rows.filter(row => row && typeof row.accountId === "number" && typeof row.alias === "string" &&
-    ["completed", "failed", "paused", "skipped"].includes(row.status) && (row.error == null || typeof row.error === "string") &&
-    (row.nextPage === undefined || (Number.isSafeInteger(row.nextPage) && row.nextPage > 0))).slice(0, 20) : [];
+    ["queued", "running", "cancelled", "completed", "failed", "paused", "skipped"].includes(row.status) && (row.error == null || typeof row.error === "string") &&
+    (row.nextPage == null || (Number.isSafeInteger(row.nextPage) && row.nextPage > 0))).slice(0, 20) : [];
 }
 
 function label(type: string): string {
@@ -67,6 +67,13 @@ export function ActionCenter({ apiFetch }: { apiFetch: ApiFetch }) {
   const [open, setOpen] = useState(false);
   const [actions, setActions] = useState<ActionItem[]>([]);
   const [loading, setLoading] = useState(false);
+  const [controlError, setControlError] = useState<string | null>(null);
+  const control = async (id: string, operation: "pause" | "retry" | "cancel") => {
+    setLoading(true); setControlError(null);
+    try { await actionsApi[operation](apiFetch, id); await load(); }
+    catch (error) { setControlError(error instanceof Error ? error.message : "任务控制失败"); }
+    finally { setLoading(false); }
+  };
 
   const containerRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -226,6 +233,7 @@ export function ActionCenter({ apiFetch }: { apiFetch: ApiFetch }) {
           </div>
 
           {/* 任务列表 */}
+          {controlError && <p role="alert" className="text-xs text-red-500">{controlError}</p>}
           <div className="space-y-2 overflow-y-auto flex-1 pr-0.5">
             {actions.length === 0 ? (
               <div className="py-8 text-center text-xs text-content-muted">
@@ -267,10 +275,18 @@ export function ActionCenter({ apiFetch }: { apiFetch: ApiFetch }) {
                     )}
                     {syncDetails(item.metadata).map(result => (
                       <div key={result.accountId} className="text-[11px] text-content-muted break-all">
-                        {result.alias}：{result.status === "completed" ? "完成" : result.status === "failed" ? "失败" : result.status === "paused" ? `待继续（第 ${result.nextPage || "?"} 页）` : "跳过"}
+                        {result.alias}：{result.status === "completed" ? "完成" : result.status === "failed" ? "失败" : result.status === "paused" ? "已暂停" : result.status === "queued" ? "排队/等待重试" : result.status === "running" ? `执行中 · ${result.phase || ""}` : result.status === "cancelled" ? "已取消" : "跳过"}
                         {result.error ? ` · ${result.error}` : ""}
+                        {result.phase ? ` · ${result.phase}` : ""}
+                        {result.domainCount != null ? ` · 拉取 ${result.domainCount} / 已检查 ${result.checked || 0}` : ""}
+                        {result.status === "queued" && result.retryAt && result.retryAt > Date.now() ? ` · 下次 ${new Date(result.retryAt).toLocaleTimeString()}` : ""}
                       </div>
                     ))}
+                    {item.type === "sync" && <div className="flex gap-3 text-[11px]">
+                      {["queued", "running"].includes(item.status) && <button disabled={loading} onClick={() => void control(item.id, "pause")}>暂停</button>}
+                      {["failed", "paused", "cancelled"].includes(item.status) && <button disabled={loading} onClick={() => void control(item.id, "retry")}>重试/继续</button>}
+                      {["queued", "running", "paused"].includes(item.status) && <button disabled={loading} title="停止后续切片，不回滚已经完成的上游操作" onClick={() => void control(item.id, "cancel")}>取消</button>}
+                    </div>}
                   </div>
                 );
               })

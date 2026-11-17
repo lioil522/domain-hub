@@ -24,6 +24,7 @@
 import type { ActionResponse, CreateDnsRecordResponse, DnsRecordInfo, ListDnsRecordsResponse } from "./dnshe";
 import type { UpstreamSubdomain } from "./db";
 import { zoneIdToNumericId } from "./cloudflare";
+import { providerFetch } from "./providers/provider-fetch";
 
 const VERCEL_API_BASE = "https://api.vercel.com";
 
@@ -178,6 +179,7 @@ export function mapVercelDomainToUpstream(domain: VercelDomainInfo): UpstreamSub
  * Vercel API 请求封装类
  */
 export class VercelClient {
+  requestSignal?: AbortSignal;
   private token: string;
   private teamId: string;
 
@@ -218,14 +220,14 @@ export class VercelClient {
 
     let response: Response;
     try {
-      response = await fetch(url.toString(), {
+      response = await providerFetch(url.toString(), {
         method,
         headers: {
           Authorization: `Bearer ${this.token}`,
           "Content-Type": "application/json",
         },
         body: options.body === undefined ? undefined : JSON.stringify(options.body),
-      });
+      }, this.requestSignal);
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : "网络请求失败";
       throw new Error(`Vercel API 请求失败：${message}`);

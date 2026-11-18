@@ -9,8 +9,8 @@ import { lazyPage } from "../lib/lazy-page";
  *   归 app/ 层集中管理;App.tsx 只消费组件,不再关心加载细节。
  *
  * NOTE: 这里只做「声明与按需加载」,不涉及页面选择(那是 App 的 activeTab 分发)。
- *       页面组件全部保持 React.lazy —— 拆出去不改变任何一页的代码分割边界,
- *       产出的 chunk 与改造前逐一对应(见 docs/architecture/baseline.md §3)。
+ *       页面组件保持 React.lazy；Scanner 的状态与页面一起由 ScannerHost 按需加载，
+ *       不在这里单独注册一个仍依赖根控制器 eager hook 的空壳页面。
  *
  * 依赖方向:app → features / components,不反向依赖 App.tsx。
  */
@@ -18,7 +18,6 @@ import { lazyPage } from "../lib/lazy-page";
 export const AccountsPage = lazyPage(() => import("../components/AccountsPage"), "AccountsPage");
 export const MultiProviderPage = lazyPage(() => import("../features/providers/components/MultiProviderPage"), "MultiProviderPage");
 export const CustomProvidersPage = lazyPage(() => import("../features/custom/components/CustomProvidersPage"), "CustomProvidersPage");
-export const RegisterPage = lazyPage(() => import("../features/scanner/components/RegisterPage"), "RegisterPage");
 export const DashboardPage = lazyPage(() => import("../features/dashboard/components/DashboardPage"), "DashboardPage");
 export const SettingsPage = lazyPage(() => import("../features/settings/components/SettingsPage"), "SettingsPage");
 export const DomainsPage = lazyPage(() => import("../features/domains/components/DomainsPage"), "DomainsPage");

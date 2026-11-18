@@ -1,15 +1,10 @@
-import { useState, useEffect, useMemo, Suspense } from "react";
+import { useState, useEffect, useMemo } from "react";
 import {
-  RefreshCw,
   Settings,
   Pencil,
 } from "lucide-react";
 import { type BadgeTone } from "../components/Badge";
-import { DnsRecordPanel } from "../components/DnsRecordPanel";
-// DNSHE 解析记录弹窗（Phase 4-D 从 App.tsx 抽出；与 DnsRecordPanel 的差异见组件头注释）
-import { DnsheDnsModal } from "../features/dns/components/DnsheDnsModal/index";
 import { useCfDnsPanel } from "../features/dns/hooks/useCfDnsPanel";
-// 词库解析：设置页「线路解析支持名单」粘贴多个后缀时用于拆分（Phase 9 后仅此处使用）
 
 // ── 已抽出的类型 / 常量 / 工具 / 纯组件（Phase 1 迁移） ──
 import type { Domain } from "../types/domain";
@@ -30,16 +25,19 @@ import {
   CustomDeleteAccountModal,
   CustomDeleteGroupModal,
   CustomDeleteDomainModal,
-} from "../features/custom/components/CustomModals";
-import { useScanner } from "../features/scanner/hooks/useScanner";
-import { WordBankModal } from "../features/scanner/components/WordBankModal";
+  DnsRecordPanel, DnsheDnsModal, DataOpModal, BindAccountModal, EditAccountModal,
+  DeleteDomainModal, CreateDomainModal, NameserverModal, DpNameserverModal, CfEditModal,
+} from "./modals";
+import { ScannerHost } from "./ScannerHost";
+import { LazyBoundary } from "../components/LazyBoundary";
+import { DEFAULT_ROOT_DOMAINS } from "../features/scanner/utils/scanner-constants";
+import { loadCustomRootDomains } from "../features/scanner/utils/scanner-root-domains";
 import { useDashboardStats } from "../features/dashboard/hooks/useDashboardStats";
 import { AppShell } from "./AppShell";
 import {
   AccountsPage,
   MultiProviderPage,
   CustomProvidersPage,
-  RegisterPage,
   DashboardPage,
   SettingsPage,
   DomainsPage,
@@ -60,7 +58,6 @@ import { useAppControllerDataActions } from "./controller/useAppControllerDataAc
 import { useAppControllerDataEffects } from "./controller/useAppControllerDataEffects";
 import { useSettings } from "../features/settings/hooks/useSettings";
 import { useDataTransfer } from "../features/data/hooks/useDataTransfer";
-import { DataOpModal } from "../features/data/components/DataOpModal";
 import { refreshRestoredData } from "../features/data/utils/backup-transfer";
 import { LoginPage, useAuthSession } from "../features/auth";
 import { observeSyncAction, type WaitForAccountSync } from "../features/domains/utils/sync-action";
@@ -70,13 +67,7 @@ import { observeSyncAction, type WaitForAccountSync } from "../features/domains/
 import { ToastView } from "../components/feedback/ToastView";
 // ── Phase 2.5：全局数据上下文（账号域 + 横切基础设施） ──
 import { useAppData } from "../state/AppDataContext";
-import { BindAccountModal } from "../features/accounts/components/BindAccountModal";
-import { EditAccountModal } from "../features/accounts/components/EditAccountModal";
-import { DeleteDomainModal } from "../features/domains/components/DeleteDomainModal";
-import { CreateDomainModal } from "../features/domains/components/CreateDomainModal";
-import { NameserverModal } from "../features/domains/components/NameserverModal";
 import { checkHasDns, getDnsProviderLabel } from "../lib/dns-status";
-import { DpNameserverModal } from "../features/domains/components/DpNameserverModal";
 import { DpDomainCard } from "../features/domains/components/DpDomainCard";
 import { DomainCard } from "../features/domains/components/DomainCard";
 import { MultiProviderDomainCard } from "../features/providers/components/MultiProviderDomainCard";
@@ -89,7 +80,6 @@ import { useCfExpiry } from "../features/cloudflare/hooks/useCfExpiry";
 import { useCfZones } from "../features/cloudflare/hooks/useCfZones";
 import { CfZoneCard } from "../features/cloudflare/components/CfZoneCard";
 import { useCfZoneHighlight } from "../features/cloudflare/hooks/useCfZoneHighlight";
-import { CfEditModal } from "../features/cloudflare/components/CfEditModal";
 import { useDpDomains } from "../features/digitalplat/hooks/useDpDomains";
 import { useDpZoneHighlight } from "../features/digitalplat/hooks/useDpZoneHighlight";
 import { useAppUiState } from "./controller/useAppUiState";
@@ -98,6 +88,7 @@ import { useAppAlerts } from "./controller/useAppAlerts";
 import { useLineDnsSettings } from "../features/dns/hooks/useLineDnsSettings";
 export function useAppControllerView() {
   const [activeTab, setActiveTab] = useState<TabKey>(tabFromHash);
+  const [scannerRootDomains, setScannerRootDomains] = useState(() => loadCustomRootDomains(DEFAULT_ROOT_DOMAINS));
 
   // 当前处于的选项卡(通过 URL hash 持久化,刷新/前进后退保持所在页面)
   const {
@@ -193,10 +184,8 @@ export function useAppControllerView() {
   const [cfEditOpen, setCfEditOpen] = useState(false);
   const [cfEditZone, setCfEditZone] = useState<Domain | null>(null);
 
-  // ===== 注册查重（Scanner）状态 =====
-  // NOTE: 根域名 / WHOIS 查重 / 注册 / 批量扫描 / 顺序检测 / 断点续查 / 保留前缀 /
-  //       可编辑词库等状态全部抽出到 features/scanner/hooks/useScanner，调用点见上方。
-  // 后端 Worker 地址 / 会话 Token 已上移到 AppDataProvider（Phase 2.5），此处由 useAppData 取得。
+  // Scanner 状态与词库仅在首次进入 ScannerHost 时挂载。
+  // 此控制器只保留线路设置也需要的轻量根域名目录。
 
   // ===== 鉴权 / 登录 / 账户安全（实现见 features/auth） =====
   // NOTE: 鉴权状态、登录与首次初始化表单、账户安全信息原先平铺在这里（约 190 行）。
@@ -317,7 +306,7 @@ export function useAppControllerView() {
           const roots = Array.from(
             new Set([
               ...list.map((d) => String(d.rootdomain ?? "").trim().toLowerCase()),
-              ...scanner.allRootDomains.map((r) => String(r || "").trim().toLowerCase())
+              ...scannerRootDomains.map((r) => String(r || "").trim().toLowerCase())
             ])
           ).filter(Boolean);
           void fetchRootNs(roots);
@@ -698,17 +687,6 @@ export function useAppControllerView() {
     fetchAccountInfo: () => { void fetchAccountInfo(); },
   });
 
-  // ===== 注册查重（Scanner）状态 / 派生 / 动作 =====
-  // NOTE: 依赖 dnsheAccounts（useDnsheDomains 产出）与 fetchDomains / setActiveTab /
-  //       actionLoading，故调用点必须晚于这些声明。
-  const scanner = useScanner({
-    fetchDomains,
-    setActiveTab,
-    dnsheAccounts,
-    actionLoading,
-    setActionLoading,
-  });
-
   // 跨来源聚合搜索：顶部搜索框同时覆盖**所有**服务商（DNSHE / Cloudflare / DigitalPlat /
   // DNSPod / 阿里云 / 华为云 / Vercel / 自定义）。返回按来源分组的命中列表，供搜索框
   // 下方的聚合下拉展示与跳转。
@@ -956,10 +934,7 @@ export function useAppControllerView() {
 
   // 日志清理动作由 useAppControllerDataActions 统一提供。
 
-  // ===== 注册查重（Scanner）派生与处理函数 =====
-  // NOTE: handleCheckWhois / handleRegisterSubdomain / 根域名增删 / rulePreview / 顺序模式生成器 /
-  //       断点续查 / 保留前缀 / 词库增删改 / handleStartBatchScan / handleExportAvailableTxt
-  //       全部抽出到 features/scanner/hooks/useScanner（App 通过 scanner.* 调用）。
+  // 线路设置与 Scanner 共享根域名目录，不依赖扫描器、检查点或词库实现。
   const {
     lineNsSuffixes,
     newLineNsInput,
@@ -978,7 +953,7 @@ export function useAppControllerView() {
     knownRootDomains,
   } = useLineDnsSettings({
     domains,
-    scannerRootDomains: scanner.allRootDomains,
+    scannerRootDomains,
     dnsheAccountCount: dnsheAccounts.length,
     apiFetch,
     showToast,
@@ -1075,13 +1050,7 @@ export function useAppControllerView() {
       apiFetch={apiFetch}
     >
       {/* 标签页均为 React.lazy 按需加载的独立 chunk，切换时展示统一骨架 */}
-      <Suspense
-        fallback={
-          <div className="flex justify-center py-24">
-            <RefreshCw className="w-6 h-6 animate-spin text-accent" />
-          </div>
-        }
-      >
+      <LazyBoundary resetKey={activeTab} label="页面">
         {/* Tab 0: Dashboard 概览 */}
         {activeTab === "dashboard" && (
           <DashboardPage
@@ -1092,11 +1061,6 @@ export function useAppControllerView() {
             onJump={handleCrossSourceJump}
             toJumpSource={toJumpSource}
           />
-        )}
-
-        {/* Tab 5: 域名注册与查重 */}
-        {activeTab === "register" && (
-          <RegisterPage scanner={scanner} dnsheAccounts={dnsheAccounts} actionLoading={actionLoading} />
         )}
 
         {/* Tab 1: 域名列表 */}
@@ -1447,19 +1411,6 @@ export function useAppControllerView() {
             fetchMultiProviderDomains={fetchMultiProviderDomains}
           />
         )}
-        <WordBankModal
-          open={scanner.bankModalOpen}
-          editingBank={scanner.editingBank}
-          formKind={scanner.bankFormKind}
-          formName={scanner.bankFormName}
-          formWords={scanner.bankFormWords}
-          onClose={() => scanner.setBankModalOpen(false)}
-          onKindChange={scanner.setBankFormKind}
-          onNameChange={scanner.setBankFormName}
-          onWordsChange={scanner.setBankFormWords}
-          onSave={scanner.handleSaveBank}
-        />
-
         {/* Tab 3: 账户配额（DNSHE 专属，已归入侧栏 DNSHE 子菜单） */}
         {activeTab === "quota" && (
           <QuotaPage quotas={quotas} loadingQuotas={loadingQuotas} fetchQuotas={fetchQuotas} />
@@ -1510,7 +1461,18 @@ export function useAppControllerView() {
             onOpenDataOp={(mode) => { setDataOpToken(""); setDataOpMode(mode); setDataOpOpen(true); }}
           />
         )}
-      </Suspense>
+      </LazyBoundary>
+      {/* 首次访问才加载；访问后在导航间保留，身份改变或登出时卸载。 */}
+      <ScannerHost
+        key={`${backendUrl}:${sessionToken}`}
+        active={activeTab === "register"}
+        fetchDomains={fetchDomains}
+        setActiveTab={setActiveTab}
+        dnsheAccounts={dnsheAccounts}
+        actionLoading={actionLoading}
+        setActionLoading={setActionLoading}
+        onRootDomainsChange={setScannerRootDomains}
+      />
 
     </AppShell>
     {/* 全局模态框 / Toast：与外壳平级，均为 fixed 覆盖层 */}

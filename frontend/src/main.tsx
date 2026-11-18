@@ -2,6 +2,7 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App.tsx";
 import { AppProviders } from "./app/AppProviders.tsx";
+import { LazyBoundary } from "./components/LazyBoundary";
 import "./index.css";
 
 /*
@@ -19,15 +20,14 @@ const isDesignSystem =
   window.location.hash.replace(/^#\/?/, "").split("?")[0] === "design-system";
 
 // 按需加载：设计系统页不属于业务路径，拆出去避免增大首屏包体。
-// 200ms 内这个 chunk 会加载完，用户无感知。
 const DesignSystem = React.lazy(() => import("./DesignSystem.tsx"));
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     {isDesignSystem ? (
-      <React.Suspense fallback={null}>
+      <LazyBoundary label="设计系统">
         <DesignSystem />
-      </React.Suspense>
+      </LazyBoundary>
     ) : (
       <AppProviders>
         <App />

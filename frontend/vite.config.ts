@@ -1,9 +1,10 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import { bundleBudget } from "./tooling/bundle-budget";
 
 // https://vitejs.dev/config/
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), bundleBudget()],
   build: {
     rollupOptions: {
       output: {

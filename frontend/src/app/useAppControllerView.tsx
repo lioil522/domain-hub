@@ -1024,10 +1024,12 @@ export function useAppControllerView() {
     cfZones,
     dpDomains,
     customDomains,
+    multiProviderDomains: multiProviderData,
     dnsheAccounts,
     cfAccountList,
     dpAccountList,
     customGroupList,
+    multiProviderAccounts: multiProviderAccountLists,
     cfExpiryMap,
   });
 

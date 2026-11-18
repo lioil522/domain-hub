@@ -61,6 +61,7 @@ dead → queued（显式重试，沿用原快照）
 - 新表使首次 setup 原本达到 53 条准备 SQL，故合并 bootstrap 元数据读取及已有 claim fence 下的三字段初始化写入；保持事务与竞争保护。新回归要求默认配置首次 setup 不超过 50 条，bootstrap 不超过 44 条。
 - 另测试“同步解析切片 + 25 条到期检查 + 一次投递”并加上 schema 读取的子请求预算，不能仅单独测试各任务再假设组合安全。
 - runtime smoke 使用只存在于临时目录的 workerd 测试包装器，触发真实业务 scheduled 代码。隔离 D1 上确认提醒入队、模拟端点投递、sent 状态、稳定幂等键及再次触发不重复；包装器没有加入生产 bundle。
+- 远端 CI 的 Linux workerd 拒绝绝对临时路径逃逸模块根目录（`can't use ".." to break out of starting directory`），因此包装器改为内存内联模块，不再写临时脚本文件；Windows 与 Linux 走同一路径。
 - Node/SQLite 认证与接口冒烟、源代码隔离 Docker 构建、普通/selfhost 前端、Worker/Node 构建、产物 no-bundle dry-run 及全量回归仍是发布门禁。
 
 ## 升级与已知边界

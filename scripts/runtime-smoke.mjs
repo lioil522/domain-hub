@@ -31,9 +31,10 @@ async function authentication(fetcher) {
 const base = process.platform === "win32" && process.env.LOCALAPPDATA
   ? path.join(process.env.LOCALAPPDATA, "Temp/opencode") : tmpdir();
 await mkdir(base, { recursive: true });
-const harness = await mkdtemp(path.join(base, "domain-hub-workerd-smoke-"));
 // Only this isolated test wrapper exposes a tick endpoint, never the app bundle.
-await build({ stdin: { contents: `import worker from "./dist-worker/wrangler-dry-run/index.js";
+// Keep the module in memory: workerd rejects module paths that escape its
+// starting directory, which is exactly what an absolute temp path can become.
+const harnessOutput = await build({ stdin: { contents: `import worker from "./dist-worker/wrangler-dry-run/index.js";
   export default { async fetch(request, env, ctx) {
     if (new URL(request.url).pathname === "/__test_tick") {
       const pending = [];
@@ -43,14 +44,17 @@ await build({ stdin: { contents: `import worker from "./dist-worker/wrangler-dry
     }
     return worker.fetch(request,env,ctx);
   }};`, resolveDir: root }, bundle: true, platform: "neutral", target: "es2022", format: "esm",
-  outfile: path.join(harness, "worker.mjs") });
+  write: false });
+const harnessScript = harnessOutput.outputFiles[0].text;
+assert.ok(harnessScript && !/^\s*(import|export)\b.*\bfrom\s+["']\./m.test(harnessScript),
+  "Inline workerd harness must be a self-contained module");
 const config = await readFile(path.join(root, "wrangler.toml"), "utf8");
 const date = config.match(/^compatibility_date\s*=\s*"([^"]+)"/m)?.[1];
 assert.ok(date, "Runtime smoke must use the configured compatibility date");
 let workerDeliveries = 0;
 let mockError = "";
 const mf = new Miniflare(convertV4MiniflareOptions({
-  modules: true, scriptPath: path.join(harness, "worker.mjs"),
+  modules: true, script: harnessScript,
   compatibilityDate: date, d1Databases: ["DB"], bindings: { AES_KEY: key },
   outboundService: async request => {
     try {

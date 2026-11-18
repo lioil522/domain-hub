@@ -20,13 +20,16 @@
     "check:cascade": "node cascade-check.mjs",
     "check:theme": "node cascade-check.mjs && node contrast-check.mjs",
     "test": "npm run test:node && npm run test:signature && npm run test:credentials && npm run test:recordset && npm run test:digitalplat && npm run test:createdomain",
-    "verify:all": "npm run check:architecture && npm run verify:worker && npm run build:worker && npm run test:invariants && npm run verify:node && npm test && npm --prefix frontend run build && npm run check:theme && npm run check:worker-config && npm run check:docker-inputs",
+    "verify:all": "npm run check:architecture && npm run verify:worker && npm run build:worker && npm run test:invariants && npm run verify:node && npm test && npm --prefix frontend run build && npm run check:theme && npm run check:worker-config && npm run check:release-package && npm run build:node && npm run check:runtimes && npm run check:docker-inputs",
+    "check:runtimes": "node scripts/runtime-smoke.mjs",
+    "check:release-package": "node scripts/check-release-package.mjs",
     "check:docker-inputs": "node scripts/check-docker-inputs.mjs",
+    "check:release-policy": "node --test tests/integration/release-policy.test.mjs",
     "check:worker-config": "wrangler deploy --dry-run --outdir dist-worker/wrangler-dry-run",
     "check:architecture": "node architecture-check.mjs",
     "verify:worker": "tsc --noEmit -p tsconfig.json",
     "build:worker": "esbuild src/index.ts --bundle --platform=neutral --target=es2022 --format=esm --outfile=dist-worker/index.mjs",
-    "test:invariants": "npm run check:schema && npm run test:unit:state && npm run test:unit:search && npm run test:unit:provider && npm run test:unit:scanner && npm run test:unit:scanner-sequence && npm run test:unit:scanner-batch-planner && npm run test:unit:scanner-batch-executor && npm run test:unit:telegram-notification && npm run test:unit:backup && npm run test:integration:architecture && npm run test:unit:api-http && npm run test:integration:security && npm run test:integration:cf-sync && npm run test:integration:schema",
+    "test:invariants": "npm run check:schema && npm run test:unit:state && npm run test:unit:search && npm run test:unit:provider && npm run test:unit:scanner && npm run test:unit:scanner-sequence && npm run test:unit:scanner-batch-planner && npm run test:unit:scanner-batch-executor && npm run test:unit:telegram-notification && npm run test:unit:backup && npm run test:integration:architecture && npm run test:unit:api-http && npm run test:integration:security && npm run test:integration:cf-sync && npm run test:integration:schema && npm run check:release-policy",
     "schema:generate": "node scripts/generate-schema.mjs",
     "check:schema": "node scripts/generate-schema.mjs --check",
     "test:integration:schema": "esbuild tests/integration/schema-migrations.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/schema-migrations.test.mjs && node --test dist-node/schema-migrations.test.mjs",
@@ -57,6 +60,7 @@
     "@types/node": "^26.2.0",
     "esbuild": "^0.28.2",
     "typescript": "^5.4.3",
-    "wrangler": "^4.127.0"
+    "wrangler": "^4.127.0",
+    "yaml": "2.9.1"
   }
 }

@@ -1,0 +1,73 @@
+name: Reusable full verification
+
+on:
+  workflow_call:
+    inputs:
+      upload_worker_artifact:
+        type: boolean
+        default: false
+    outputs:
+      artifact_name:
+        value: ${{ jobs.verify.outputs.artifact_name }}
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Full tests, builds and packaging checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      artifact_name: ${{ steps.package.outputs.artifact_name }}
+    env:
+      WRANGLER_SEND_METRICS: 'false'
+    steps:
+      - name: Checkout exact workflow commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Validate workflow syntax and expressions
+        id: workflow-lint
+        run: |
+          set -euo pipefail
+          TOOL_DIR=$(mktemp -d "${RUNNER_TEMP}/actionlint.XXXXXX")
+          ARCHIVE="${TOOL_DIR}/actionlint.tar.gz"
+          curl -fLsS --retry 2 --max-time 90 \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \
+            -o "$ARCHIVE"
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $ARCHIVE" | sha256sum -c -
+          tar -xzf "$ARCHIVE" -C "$TOOL_DIR" actionlint
+          "$TOOL_DIR/actionlint" -shellcheck= -pyflakes= -color
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
+      - name: Install locked dependencies
+        run: npm ci && npm --prefix frontend ci
+      - name: Full verification
+        run: npm run verify:all
+      # verify:all includes isolated workerd/Node authentication and storage smoke.
+      - name: Package verified Worker and ordinary frontend
+        id: package
+        if: inputs.upload_worker_artifact
+        run: |
+          node scripts/release-artifact.mjs create release
+          node scripts/release-artifact.mjs verify release "$GITHUB_SHA"
+          echo "artifact_name=worker-release-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+      - name: Upload verified release
+        if: inputs.upload_worker_artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: release/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 7
+      - name: Verify selfhost frontend build
+        run: npm --prefix frontend run build:selfhost

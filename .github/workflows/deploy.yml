@@ -10,30 +10,76 @@ permissions:
   contents: read
 
 jobs:
+  verify:
+    uses: ./.github/workflows/verify.yml
+    with:
+      upload_worker_artifact: true
   deploy:
+    needs: verify
+    if: github.ref == 'refs/heads/main'
+    concurrency:
+      group: cloudflare-production
+      cancel-in-progress: false
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Refuse superseded main revisions
+        id: freshness
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          CURRENT_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')
+          if [ "$CURRENT_SHA" = "$GITHUB_SHA" ]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "current=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::main has advanced; this older deployment is skipped."
+          fi
 
       # wrangler 4 的 engines 要求 Node >= 22
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        if: steps.freshness.outputs.current == 'true'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '22'
           cache: 'npm'
 
       - name: Install Dependencies
+        if: steps.freshness.outputs.current == 'true'
         run: |
           npm ci
-          cd frontend && npm ci
+
+      - name: Download artifact from this verification run
+        if: steps.freshness.outputs.current == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.verify.outputs.artifact_name }}
+          path: release
+
+      - name: Validate commit identity and every artifact checksum
+        if: steps.freshness.outputs.current == 'true'
+        run: |
+          set -euo pipefail
+          node scripts/release-artifact.mjs verify release "$GITHUB_SHA"
+          cmp wrangler.toml release/config/wrangler.toml
+          mkdir -p frontend/dist
+          cp -a release/assets/. frontend/dist/
 
       - name: Setup & Bind Cloudflare D1 Database
+        if: steps.freshness.outputs.current == 'true'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
         run: |
+          set -euo pipefail
           DB_ID="${CLOUDFLARE_D1_DATABASE_ID}"
 
           if [ -n "$DB_ID" ]; then
@@ -41,33 +87,44 @@ jobs:
           else
             echo "🔍 正在通过 Cloudflare REST API 自动查询 D1 数据库 [domain-hub-db]..."
 
-            D1_LIST=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/d1/database" \
+            D1_LIST=$(curl -fsS --max-time 30 -X GET "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/d1/database" \
               -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-              -H "Content-Type: application/json" || echo "{}")
+              -H "Content-Type: application/json")
+            if ! echo "$D1_LIST" | jq -e '.success == true and (.result | type == "array")' >/dev/null; then
+              echo "::error::D1 listing failed; refusing to infer an empty database list or create a replacement."
+              exit 1
+            fi
 
-            DB_ID=$(echo "$D1_LIST" | jq -r '.result[]? | select(.name=="domain-hub-db") | .uuid' 2>/dev/null | head -n 1 || echo "")
+            DB_ID=$(echo "$D1_LIST" | jq -r '[.result[] | select(.name=="domain-hub-db")] | if length == 0 then empty elif length == 1 then .[0].uuid else error("Multiple matching D1 databases; configure an explicit database id") end')
 
             if [ -z "$DB_ID" ] || [ "$DB_ID" == "null" ]; then
               echo "⚡ 正在为您在 Cloudflare 自动一键创建 D1 数据库 [domain-hub-db]..."
-              CREATE_RES=$(curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/d1/database" \
+              CREATE_RES=$(curl -fsS --max-time 30 -X POST "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/d1/database" \
                 -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
                 -H "Content-Type: application/json" \
-                -d '{"name":"domain-hub-db"}' || echo "{}")
+                -d '{"name":"domain-hub-db"}')
+              echo "$CREATE_RES" | jq -e '.success == true' >/dev/null
 
-              DB_ID=$(echo "$CREATE_RES" | jq -r '.result.uuid // empty' 2>/dev/null || echo "")
+              DB_ID=$(echo "$CREATE_RES" | jq -r '.result.uuid // empty')
             fi
           fi
 
+          if ! [[ "$DB_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+            echo "::error::D1 database id is missing or invalid. Deployment is stopped."
+            exit 1
+          fi
           if [ -n "$DB_ID" ] && [ "$DB_ID" != "null" ]; then
             sed -i "s/change_me_to_your_d1_db_id/$DB_ID/g" wrangler.toml
             echo "🎉 成功将 D1 数据库 ID [$DB_ID] 自动绑定写入 wrangler.toml"
           else
-            echo "⚠️ 未能自动获取/创建 D1 数据库 ID，请检查 API Token 权限是否包含 [D1:编辑]"
+            echo "::error::D1 binding could not be prepared."
+            exit 1
           fi
 
       # 前端已与后端同源（由同一个 Worker 的静态资源发出），构建期不需要知道后端地址。
       # 这一步只剩两件事：绑了自定义域名就关掉 workers.dev / 预览 URL，以及把最终访问地址写进摘要。
       - name: Auto Detect Custom Domain & Configure Worker Routes
+        if: steps.freshness.outputs.current == 'true'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -130,27 +187,25 @@ jobs:
             fi
           fi
 
-      # 必须在 wrangler deploy 之前：wrangler.toml 的 assets.directory 指向 frontend/dist，
-      # 目录不存在部署会直接失败。
-      #
-      # VITE_API_BASE_URL 设成 "/"：前端与 Worker 同源，App.tsx 里会把末尾斜杠削掉，
-      # 请求最终是 /api/xxx 这样的相对路径，既不用配 CORS，也不用把域名烘焙进产物。
-      - name: Build Frontend
+      # 这里只验证注入 D1 / 路由后的配置；Worker 与静态资源来自同一次验证，不重新构建。
+      - name: Dry run the verified Worker with bound deployment config
+        if: steps.freshness.outputs.current == 'true'
         env:
-          VITE_API_BASE_URL: /
-        run: |
-          cd frontend
-          npm run build
+          WRANGLER_SEND_METRICS: 'false'
+        run: npx --no-install wrangler deploy release/worker/index.js --no-bundle --dry-run --outdir "${RUNNER_TEMP}/domain-hub-bound-config"
 
       # 一次 deploy 同时上传 Worker 脚本与 frontend/dist 里的静态资源
       - name: Deploy Worker (API + Frontend Assets)
-        uses: cloudflare/wrangler-action@v4
+        if: steps.freshness.outputs.current == 'true'
+        uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           wranglerVersion: '4.127.0'
+          command: deploy release/worker/index.js --no-bundle
 
       - name: Auto-Configure & Sync AES_KEY Secret
+        if: steps.freshness.outputs.current == 'true'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -175,6 +230,7 @@ jobs:
           fi
 
       - name: Sync Optional Secrets to Worker (if set)
+        if: steps.freshness.outputs.current == 'true'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -198,6 +254,7 @@ jobs:
           fi
 
       - name: Summarize Access URL
+        if: steps.freshness.outputs.current == 'true'
         env:
           APP_URL: ${{ env.APP_URL }}
         run: |

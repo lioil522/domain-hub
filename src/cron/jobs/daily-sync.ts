@@ -11,9 +11,10 @@ import { computeDnsState } from "../../dns-provider";
 
 import {
   type WebhookType,
-  sendWebhookNotification,
-  sendTelegramNotification,
 } from "../notification";
+import { notificationTargets } from "../../services/notification-service";
+import { sha256Hex } from "../../db/crypto";
+import { getBeijingNow } from "../../db/time-utils";
 import { batchedPromiseAll, isSubrequestLimitError } from "../utils";
 import {
   DNS_RECORDS_CACHE_MODE_KEY,
@@ -25,7 +26,7 @@ import {
   readAccountCursor,
   pickAccountBatch,
 } from "../account-batch";
-import { collectExpiryReminders } from "./expiry-check";
+import { runExpiryReminderSlice } from "./expiry-check";
 import { listUpstreamDomains, fetchAllSubdomainsFromClient } from "./upstream-sync";
 import { summarizeAccountSync, type AccountSyncResult, type AccountSyncSummary } from "../../services/sync-results";
 
@@ -49,10 +50,24 @@ export async function runDailySyncAndRenewal(
     return isNaN(v) || v <= 0 ? 90 : v;
   })();
   const autoRenewEnabled = appCfg["auto_renew"] !== "0"; // 默认开启
-  const effectiveWebhookUrl = appCfg["webhook_url"] || webhookUrl || "";
-  const effectiveWebhookType = (appCfg["webhook_type"] as WebhookType) || webhookType;
-  const tgToken = appCfg["tg_token"] || "";
-  const tgChatId = appCfg["tg_chat_id"] || "";
+  const targets = notificationTargets(appCfg, { webhookUrl, webhookType });
+  const outbox = dbManager.notificationOutbox();
+  async function confirmRenewal(accountId: number, domainId: number, fullDomain: string, alias: string,
+    originalExpiry: string, nextExpiry: string, requestToken?: string) {
+    const msg = `域名 [${fullDomain}] (账户: ${alias}) 自动续期成功！新有效期至: ${nextExpiry}`;
+    const key = await sha256Hex(JSON.stringify([accountId, domainId, fullDomain, originalExpiry]));
+    const identity = [accountId, domainId, fullDomain, originalExpiry, ...(requestToken ? [requestToken] : [])];
+    const match = `account_id=? AND domain_id=? AND full_domain=? AND original_expiry=?${requestToken ? " AND request_token=?" : ""}`;
+    const timestamp = getBeijingNow();
+    await outbox.enqueue([{ key: `daily-renew:${key}`, message: `【DNSHE 域名自动续期报告】\n✅ ${msg}` }], targets, [
+      outbox.statement(`UPDATE domains_cache SET expires_at=?,last_renewed_at=?,updated_at=? WHERE id=? AND account_id=?
+        AND EXISTS(SELECT 1 FROM sync_renew_journal WHERE ${match})`, [nextExpiry, timestamp, timestamp, domainId, accountId, ...identity]),
+      outbox.statement(`UPDATE sync_renew_journal SET status='confirmed',new_expiry=?,updated_at=? WHERE ${match}`,
+        [nextExpiry, Date.now(), ...identity]),
+    ], { sql: `EXISTS(SELECT 1 FROM sync_renew_journal WHERE ${match} AND status='confirmed' AND new_expiry=?)`,
+      bindings: [...identity, nextExpiry] });
+    return msg;
+  }
 
   // 定时任务是否只读解析记录缓存（默认开启；手动同步永远全额回源）
   const dnsCacheOnlyOnScheduled = isScheduled && appCfg[DNS_RECORDS_CACHE_MODE_KEY] !== "always";
@@ -69,12 +84,10 @@ export async function runDailySyncAndRenewal(
   let totalSynced = 0;
   let totalRenewSuccess = 0;
   let totalRenewFail = 0;
-  const renewLogs: string[] = [];
-  const expiryReminderLogs: string[] = [];
   const syncResults: AccountSyncResult[] = [];
 
   // 到期提醒统一前置（与账号分批解耦）
-  await collectExpiryReminders(dbManager, renewThresholdDays, expiryReminderLogs);
+  await runExpiryReminderSlice(dbManager, { webhookUrl, webhookType, config: appCfg });
 
   // 账号分批轮转：本轮只处理 SYNC_ACCOUNT_BATCH_SIZE 个账号，从游标处继续，环状推进
   const cursorBefore = isScheduled
@@ -270,10 +283,7 @@ export async function runDailySyncAndRenewal(
               const confirmed = journal.status === "confirmed" && journal.new_expiry
                 ? journal.new_expiry : probe?.success ? probe.subdomain?.expires_at : undefined;
               if (confirmed && Date.parse(confirmed) > Date.parse(journal.original_expiry)) {
-                await dbManager.markDomainRenewed(subId, confirmed);
-                await dbManager.executeRaw(`UPDATE sync_renew_journal SET status='confirmed',new_expiry=?,updated_at=?
-                  WHERE account_id=? AND domain_id=? AND full_domain=? AND original_expiry=?`,
-                  [confirmed, Date.now(), acc.id, subId, fullDomain, journal.original_expiry]);
+                await confirmRenewal(acc.id, subId, fullDomain, alias, journal.original_expiry, confirmed);
               } else await dbManager.writeLog("warning", "renew", `域名 [${fullDomain}] 有未确认续期，仅核对结果，不重复提交`);
               continue;
             }
@@ -287,14 +297,10 @@ export async function runDailySyncAndRenewal(
             if (claimed?.request_token !== requestToken) continue;
             const renewResult = await client.renewSubdomain(subId);
             if (renewResult && renewResult.success && Date.parse(renewResult.new_expires_at || "") > Date.parse(expiresAt)) {
-              totalRenewSuccess++;
               const newExpiresAt = renewResult.new_expires_at || "";
-              await dbManager.markDomainRenewed(subId, newExpiresAt);
-              await dbManager.executeRaw("UPDATE sync_renew_journal SET status='confirmed',new_expiry=?,updated_at=? WHERE request_token=?",
-                [newExpiresAt, Date.now(), requestToken]);
-              const msg = `域名 [${fullDomain}] (账户: ${alias}) 自动续期成功！新有效期至: ${newExpiresAt}`;
+              const msg = await confirmRenewal(acc.id, subId, fullDomain, alias, expiresAt, newExpiresAt, requestToken);
+              totalRenewSuccess++;
               await dbManager.writeLog("success", "renew", msg, renewResult);
-              renewLogs.push(`✅ ${msg}`);
             } else {
               if (renewResult && !renewResult.success) await dbManager.executeRaw("UPDATE sync_renew_journal SET status='failed',updated_at=? WHERE request_token=?", [Date.now(), requestToken]);
               throw new Error(renewResult.message || "续期结果未知，后续只读核对，不重复提交");
@@ -311,7 +317,10 @@ export async function runDailySyncAndRenewal(
               totalRenewFail++;
               const msg = `域名 [${fullDomain}] (账户: ${alias}) 自动续期失败：${errMsg}`;
               await dbManager.writeLog("error", "renew", msg, err instanceof Error ? err.stack || errMsg : errMsg);
-              renewLogs.push(`❌ ${msg}`);
+              await outbox.enqueue([{
+                key: `daily-renew-failure:${new Date().toISOString().slice(0, 10)}:${await sha256Hex(JSON.stringify([acc.id, subId, fullDomain, expiresAt]))}`,
+                message: `【DNSHE 域名自动续期报告】\n❌ 域名 [${fullDomain}]（账户: ${alias}）续期失败或结果未确认，请查看操作日志。`,
+              }], targets);
             }
           }
         }
@@ -366,42 +375,6 @@ export async function runDailySyncAndRenewal(
     await dbManager.writeLog("info", "system", `已清理 ${purgedSessions} 条过期登录会话`);
   }
 
-  // 发送续期通知
-  if (renewLogs.length > 0) {
-    const notifyBody = `【DNSHE 域名自动续期报告】\n${summaryMsg}\n\n详细明细：\n${renewLogs.join("\n")}`;
-    if (effectiveWebhookUrl) {
-      const result = await sendWebhookNotification(effectiveWebhookUrl, notifyBody, effectiveWebhookType);
-      if (!result.ok) {
-        await dbManager.writeLog(
-          "warning",
-          "system",
-          `续期报告 Webhook 推送失败（${effectiveWebhookType}）`,
-          result.detail || `HTTP ${result.status ?? "?"}`
-        );
-      }
-    }
-    if (tgToken && tgChatId) {
-      await sendTelegramNotification(tgToken, tgChatId, notifyBody);
-    }
-  }
-
-  // 发送到期提醒通知
-  if (expiryReminderLogs.length > 0) {
-    const reminderBody = `【域名到期提醒】\n以下域名即将到期或已过期（不支持自动续期，请前往对应服务商处理）：\n\n${expiryReminderLogs.join("\n")}`;
-    if (effectiveWebhookUrl) {
-      const result = await sendWebhookNotification(effectiveWebhookUrl, reminderBody, effectiveWebhookType);
-      if (!result.ok) {
-        await dbManager.writeLog(
-          "warning",
-          "system",
-          `到期提醒 Webhook 推送失败（${effectiveWebhookType}）`,
-          result.detail || `HTTP ${result.status ?? "?"}`
-        );
-      }
-    }
-    if (tgToken && tgChatId) {
-      await sendTelegramNotification(tgToken, tgChatId, reminderBody);
-    }
-  }
+  // Network delivery is independent; reports were persisted at business commit.
   return { ...summarizeAccountSync(syncResults), error: totalRenewFail ? `${totalRenewFail} 个域名续期失败` : undefined };
 }

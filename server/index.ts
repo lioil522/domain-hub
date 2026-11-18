@@ -22,7 +22,7 @@ import type { WebhookType } from "../src/cron";
 import { createD1FromSqlite } from "./d1-sqlite";
 import { createStaticHandler } from "./static";
 import { initializeDatabase } from "./initialize-database";
-import { runOneSyncSlice } from "../src/services/sync-work-runner";
+import { runBackgroundMaintenance } from "../src/services/background-maintenance";
 
 // ===== 配置读取 =====
 
@@ -210,11 +210,15 @@ let syncBusy = false;
 const syncTimer = setInterval(() => {
   if (syncBusy || syncController.signal.aborted) return;
   syncBusy = true;
-  void trackBackground(runOneSyncSlice(new DatabaseManager(db, aesKey), {
+  void trackBackground(runBackgroundMaintenance(new DatabaseManager(db, aesKey), {
     signal: syncController.signal, webhookUrl: env.WEBHOOK_URL, webhookType: env.WEBHOOK_TYPE as WebhookType | undefined,
+    scanExpiry: !CRON_DISABLED,
   }).finally(() => { syncBusy = false; }));
 }, 1000);
-void trackBackground(runOneSyncSlice(new DatabaseManager(db, aesKey), { signal: syncController.signal }));
+void trackBackground(runBackgroundMaintenance(new DatabaseManager(db, aesKey), {
+  signal: syncController.signal, webhookUrl: env.WEBHOOK_URL, webhookType: env.WEBHOOK_TYPE as WebhookType | undefined,
+  scanExpiry: !CRON_DISABLED,
+}));
 
 function msUntilNextUtc(hour: number, minute: number): number {
   const now = new Date();

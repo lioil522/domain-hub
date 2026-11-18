@@ -38,3 +38,4 @@ Docker 修复后再次通过全量验证（192 个用例），并用打包后的
 - [分段恢复](./STAGED_RESTORE_PROGRESS_2026-11-17.md)
 - [同步队列与解卡](./SYNC_QUEUE_FIX_2026-11-17.md)
 - [CI 发布门禁（2026-11-18）](./CI_RELEASE_GATE_PROGRESS_2026-11-18.md)
+- [通知 outbox（2026-11-18，本地验证阶段）](./NOTIFICATION_OUTBOX_PROGRESS_2026-11-18.md)

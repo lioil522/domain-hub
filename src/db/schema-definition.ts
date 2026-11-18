@@ -123,10 +123,26 @@ export const SCHEMA_TABLES = [
     "new_expiry TEXT",
     "request_token TEXT",
   ], ["PRIMARY KEY (account_id, domain_id, full_domain, original_expiry)"]),
+  table("notification_outbox", [
+    "id TEXT PRIMARY KEY", "event_key TEXT NOT NULL", "channel TEXT NOT NULL",
+    "target_id TEXT NOT NULL", "payload_cipher TEXT NOT NULL",
+    "status TEXT NOT NULL CHECK (status IN ('queued','running','sent','dead','cancelled'))",
+    "attempts INTEGER NOT NULL DEFAULT 0", "uncertain INTEGER NOT NULL DEFAULT 0",
+    "lease_token TEXT", "lease_until INTEGER NOT NULL DEFAULT 0", "not_before INTEGER NOT NULL",
+    "deadline_at INTEGER NOT NULL", "last_error TEXT", "created_at INTEGER NOT NULL",
+    "updated_at INTEGER NOT NULL", "sent_at INTEGER",
+  ]),
+  table("notification_scans", [
+    "id TEXT PRIMARY KEY", "scan_day TEXT NOT NULL", "target_set TEXT NOT NULL",
+    "last_kind TEXT NOT NULL DEFAULT ''", "last_id INTEGER NOT NULL DEFAULT 0",
+    "completed INTEGER NOT NULL DEFAULT 0", "lease_token TEXT NOT NULL", "lease_until INTEGER NOT NULL",
+    "updated_at INTEGER NOT NULL",
+  ]),
 ] as const;
-export const BASELINE_TABLES = SCHEMA_TABLES.filter(table => !/^(restore_|sync_)/.test(table.name));
+export const BASELINE_TABLES = SCHEMA_TABLES.filter(table => !/^(restore_|sync_|notification_)/.test(table.name));
 export const RESTORE_SCHEMA_TABLES = SCHEMA_TABLES.filter(table => table.name.startsWith("restore_"));
 export const SYNC_SCHEMA_TABLES = SCHEMA_TABLES.filter(table => table.name.startsWith("sync_"));
+export const NOTIFICATION_SCHEMA_TABLES = SCHEMA_TABLES.filter(table => table.name.startsWith("notification_"));
 
 /** Only these missing legacy fields can be added automatically. */
 export const LEGACY_COLUMNS: Record<string, Record<string, string>> = {
@@ -152,14 +168,17 @@ export const SCHEMA_INDEXES = [
   ["idx_sync_work_action", "sync_work(action_id)"],
   ["idx_sync_active_account", "sync_work(account_id) WHERE status IN ('queued','running','paused')"],
   ["idx_actions_type_status", "actions(type, status)"],
+  ["idx_notification_due", "notification_outbox(status, not_before, created_at)"],
+  ["idx_notification_retention", "notification_outbox(status, updated_at)"],
 ].map(([name, target]) => ({ name, sql: `CREATE INDEX IF NOT EXISTS ${name} ON ${target}` }));
 const activeAccountIndex = SCHEMA_INDEXES.find(index => index.name === "idx_sync_active_account")!;
 activeAccountIndex.sql = activeAccountIndex.sql.replace("CREATE INDEX", "CREATE UNIQUE INDEX");
 
 export const BASELINE_INDEXES = SCHEMA_INDEXES.slice(0, 8);
 export const RESTORE_SCHEMA_INDEXES = SCHEMA_INDEXES.slice(8, 11);
-export const SYNC_SCHEMA_INDEXES = SCHEMA_INDEXES.slice(11);
-export const MIGRATION_NAMES = ["baseline_and_legacy_columns", "required_query_indexes", "staged_business_restore", "persistent_sync_queue"] as const;
+export const SYNC_SCHEMA_INDEXES = SCHEMA_INDEXES.slice(11, 15);
+export const NOTIFICATION_SCHEMA_INDEXES = SCHEMA_INDEXES.slice(15);
+export const MIGRATION_NAMES = ["baseline_and_legacy_columns", "required_query_indexes", "staged_business_restore", "persistent_sync_queue", "notification_outbox"] as const;
 export const SCHEMA_VERSION = MIGRATION_NAMES.length;
 export const MIGRATION_TABLE = "domain_hub_schema_migrations";
 export const MIGRATION_TABLE_SQL = `CREATE TABLE IF NOT EXISTS ${MIGRATION_TABLE} (

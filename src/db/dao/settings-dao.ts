@@ -41,25 +41,20 @@ export async function deleteSetting(db: D1Database, key: string): Promise<void> 
  */
 export async function getAllAppSettings(db: D1Database, aesKey?: string): Promise<Record<string, string>> {
   const out: Record<string, string> = {};
-  try {
-    const { results } = await db.prepare(
-      "SELECT key, value FROM settings WHERE key LIKE 'cfg_%'"
-    ).all<{ key: string; value: string }>();
-    for (const row of results || []) {
-      const shortKey = row.key.replace(/^cfg_/, "");
-      let val = row.value;
-      // 敏感字段解密
-      if ((shortKey === "tg_token" || shortKey === "webhook_url") && val) {
-        try {
-          val = await decryptText(val, aesKey);
-        } catch (e) {
-          // 解密失败保持原值（可能是历史明文）
-        }
+  const { results } = await db.prepare(
+    "SELECT key, value FROM settings WHERE key LIKE 'cfg_%'"
+  ).all<{ key: string; value: string }>();
+  for (const row of results || []) {
+    const shortKey = row.key.replace(/^cfg_/, "");
+    let val = row.value;
+    // Only actual legacy clear text may bypass decryption. An unreadable
+    // cipher is not a usable webhook URL/token or an absent configuration.
+    if ((shortKey === "tg_token" || shortKey === "webhook_url") && val) {
+      if (val.startsWith("plain:") || /^[a-f0-9]{24}:/i.test(val)) {
+        val = await decryptText(val, aesKey);
       }
-      out[shortKey] = val;
     }
-  } catch (e) {
-    console.error("getAllAppSettings error:", e);
+    out[shortKey] = val;
   }
   return out;
 }

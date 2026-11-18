@@ -1,138 +1,90 @@
-/**
- * 域名到期预警检查任务
- *
- * NOTE: 针对 Cloudflare (RDAP+覆盖)、DigitalPlat、自定义分组域名检查即将到期情况并产出告警日志。
- */
-
 import type { DatabaseManager } from "../../db";
 import { isRegistrableDomain } from "../../punycode";
-import { CF_EXPIRY_BUDGET } from "../cf-helpers";
+import { sha256Hex } from "../../db/crypto";
+import { ConflictError } from "../../errors";
+import { NotificationOutbox, NOTIFICATION_LEASE_MS, notificationTargetId, type NotificationEvent } from "../../db/dao/notification-dao";
+import { notificationTargets, type NotificationOptions } from "../../services/notification-service";
 
+// Leave room for the sync slice + one delivery in the shared Worker invocation.
+export const EXPIRY_SCAN_BATCH = 25;
+interface ScanState { scan_day: string; target_set: string; last_kind: string; last_id: number; lease_token: string }
+interface Candidate {
+  kind: string; id: number; account_id: number; full_domain: string; expires_at: string | null;
+  alias: string; account_name: string | null;
+}
 /**
- * 每日到期提醒去重缓存 key
- *
- * NOTE: cron 每天会触发两轮（见 wrangler.toml triggers），
- * 但到期提醒只需发送一次。利用此 key 记录当天已发送的日期，
- * 第二轮检测到标记后直接跳过，避免重复推送。
+ * Durable, bounded daily scan. Enqueue and cursor advancement share one atomic
+ * transaction. "completed" means scan complete, NEVER notification delivered.
  */
-const EXPIRY_REMINDER_SENT_KEY = "expiry_reminder_sent";
-
-/** 缓存 TTL：25 小时，确保跨天后自动失效 */
-const EXPIRY_REMINDER_TTL = 25 * 60 * 60;
-
-export async function collectExpiryReminders(
-  dbManager: DatabaseManager,
-  renewThresholdDays: number,
-  out: string[]
-): Promise<void> {
-  // 当天去重：如果本日已执行过到期提醒，直接跳过
-  const todayStr = new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
-  const lastSentDate = await dbManager.getCache(EXPIRY_REMINDER_SENT_KEY);
-  if (lastSentDate === todayStr) {
-    return;
-  }
-  // ── ① Cloudflare ────────────────────────────────────────────────
+export async function runExpiryReminderSlice(db: DatabaseManager, options: NotificationOptions & {
+  outbox?: NotificationOutbox; now?: () => number; config?: Record<string, string>;
+} = {}): Promise<number> {
+  if (options.signal?.aborted) return 0;
+  const config = options.config || await db.getAllAppSettings();
+  const targets = notificationTargets(config, options);
+  if (!targets.length) return 0; // Enabling notifications later today must still scan.
+  const clock = options.now || Date.now, now = clock(), day = new Date(now).toISOString().slice(0, 10);
+  const targetSet = await sha256Hex(JSON.stringify((await Promise.all(targets.map(notificationTargetId))).sort()));
+  const outbox = options.outbox || db.notificationOutbox();
+  const token = crypto.randomUUID();
+  const state = await outbox.statement(`INSERT INTO notification_scans(id,scan_day,target_set,lease_token,lease_until,updated_at)
+    VALUES('expiry',?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+      last_kind=CASE WHEN notification_scans.scan_day<>excluded.scan_day OR notification_scans.target_set<>excluded.target_set THEN '' ELSE notification_scans.last_kind END,
+      last_id=CASE WHEN notification_scans.scan_day<>excluded.scan_day OR notification_scans.target_set<>excluded.target_set THEN 0 ELSE notification_scans.last_id END,
+      scan_day=excluded.scan_day,target_set=excluded.target_set,completed=0,lease_token=excluded.lease_token,
+      lease_until=excluded.lease_until,updated_at=excluded.updated_at
+    WHERE notification_scans.lease_until<=? AND
+      (notification_scans.scan_day<>excluded.scan_day OR notification_scans.target_set<>excluded.target_set OR notification_scans.completed=0)
+    RETURNING *`, [day, targetSet, token, now + NOTIFICATION_LEASE_MS, now, now]).first<ScanState>();
+  if (!state) return 0;
   try {
-    const cfZones = await dbManager.getDomains("", "", undefined, "cloudflare");
-    if (cfZones.length > 0) {
-      const accountIds = Array.from(new Set(cfZones.map((z) => z.account_id)));
-      const manualByAccount = await dbManager.getDateOverridesByAccountIds(accountIds);
-      const registrableHosts: string[] = [];
-      const seenHost = new Set<string>();
-      for (const z of cfZones) {
-        const host = String(z.full_domain || "").trim().toLowerCase();
-        if (!host || seenHost.has(host)) continue;
-        seenHost.add(host);
-        if (isRegistrableDomain(host)) registrableHosts.push(host);
-      }
-      const inBudget = registrableHosts.slice(0, CF_EXPIRY_BUDGET);
-      const rdapCache = await dbManager.getRdapExpiryCacheBatch(inBudget);
-      if (registrableHosts.length > inBudget.length) {
-        await dbManager.writeLog(
-          "info",
-          "renew",
-          `Cloudflare 域名到期检查：待查缓存的注册域 ${registrableHosts.length} 个超出单轮预算 ${CF_EXPIRY_BUDGET}，本轮只检查前 ${inBudget.length} 个，其余下一轮继续`
-        );
-      }
-
-      for (const z of cfZones) {
-        const fullDomain = String(z.full_domain || "").trim();
-        if (!fullDomain) continue;
-        const host = fullDomain.toLowerCase();
-        const manualHit = manualByAccount.get(z.account_id)?.get(host);
-        const expiresAt = manualHit || rdapCache.get(host) || "";
-        if (!expiresAt || expiresAt.startsWith("0000")) continue;
-        const expiresTime = new Date(expiresAt).getTime();
-        if (Number.isNaN(expiresTime)) continue;
-        const remainingDays = (expiresTime - Date.now()) / (1000 * 60 * 60 * 24);
-        if (remainingDays <= renewThresholdDays) {
-          const alias = z.account_alias || `账号 ${z.account_id}`;
-          const src = manualHit ? "手动录入" : "RDAP";
-          const msg =
-            remainingDays < 0
-              ? `域名 [${fullDomain}]（Cloudflare / ${alias}）已过期 ${Math.ceil(-remainingDays)} 天，请及时续费`
-              : `域名 [${fullDomain}]（Cloudflare / ${alias}）将于 ${Math.ceil(remainingDays)} 天后到期`;
-          await dbManager.writeLog("warning", "renew", `${msg}（到期时间来源：${src}）`);
-          out.push(`⚠️ ${msg}`);
-        }
-      }
+    const candidates = await db.allRaw<Candidate>(`WITH candidates AS (
+      SELECT a.provider kind,d.id,d.account_id,d.full_domain,a.alias,NULL account_name,
+        CASE WHEN a.provider='cloudflare' THEN (SELECT o.expires_at FROM domain_date_overrides o
+          WHERE o.account_id=d.account_id AND lower(o.full_domain)=lower(d.full_domain)
+          ORDER BY o.updated_at DESC,o.id DESC LIMIT 1) ELSE d.expires_at END expires_at
+        FROM domains_cache d JOIN accounts a ON a.id=d.account_id WHERE a.provider IN ('cloudflare','digitalplat')
+      UNION ALL
+      SELECT 'custom',d.id,d.group_id,d.full_domain,g.alias,a.name,d.expires_at
+        FROM custom_domains d JOIN accounts g ON g.id=d.group_id LEFT JOIN custom_accounts a ON a.id=d.account_id)
+      SELECT * FROM candidates WHERE kind>? OR (kind=? AND id>?) ORDER BY kind,id LIMIT ?`,
+      [state.last_kind, state.last_kind, state.last_id, EXPIRY_SCAN_BATCH + 1]);
+    const batch = candidates.slice(0, EXPIRY_SCAN_BATCH);
+    const rdap = await db.getRdapExpiryCacheBatch([...new Set(batch.filter(row => row.kind === "cloudflare" &&
+      isRegistrableDomain(row.full_domain.toLowerCase())).map(row => row.full_domain.toLowerCase()))]);
+    const threshold = Math.max(1, Number(config.renew_threshold_days) || 90);
+    const events: NotificationEvent[] = [];
+    for (const row of batch) {
+      const manual = row.expires_at && !row.expires_at.startsWith("0000") ? row.expires_at : "";
+      const expiry = manual || (row.kind === "cloudflare" ? rdap.get(row.full_domain.toLowerCase()) : "");
+      const time = Date.parse(expiry || "");
+      if (!Number.isFinite(time) || expiry?.startsWith("0000")) continue;
+      const days = (time - now) / 86400000;
+      if (days > threshold) continue;
+      const provider = row.kind === "cloudflare" ? "Cloudflare" : row.kind === "digitalplat" ? "DigitalPlat" : "自定义分组";
+      const suffix = days < 0 ? `已过期 ${Math.ceil(-days)} 天` : `将于 ${Math.ceil(days)} 天后到期`;
+      const source = row.kind === "cloudflare" ? `（到期来源：${manual ? "手动录入" : "RDAP"}）` : "";
+      events.push({
+        key: `expiry:${day}:${await sha256Hex(JSON.stringify([row.kind, row.account_id, row.full_domain.toLowerCase()]))}`,
+        message: `【域名到期提醒】\n⚠️ 域名 [${row.full_domain}]（${provider} / ${row.alias}${row.account_name ? ` / ${row.account_name}` : ""}）${suffix}，请前往对应服务商处理。${source}`,
+        deadlineAt: now + 2 * 86400000,
+      });
     }
-  } catch (e: unknown) {
-    const message = e instanceof Error ? e.message : "未知错误";
-    await dbManager.writeLog("error", "renew", `Cloudflare 域名到期检查失败：${message}`);
+    if (options.signal?.aborted) throw new Error("到期检查已中断");
+    const fence = () => ({ sql: "EXISTS(SELECT 1 FROM notification_scans WHERE id='expiry' AND lease_token=? AND lease_until>?)",
+      bindings: [token, clock()] });
+    const last = batch.at(-1), complete = candidates.length <= EXPIRY_SCAN_BATCH;
+    const results = await outbox.commit([
+      ...await outbox.prepare(events, targets, fence),
+      outbox.statement(`UPDATE notification_scans SET last_kind=?,last_id=?,completed=?,lease_until=0,updated_at=?
+        WHERE id='expiry' AND lease_token=? AND lease_until>?`,
+        [last?.kind || state.last_kind, last?.id || state.last_id, complete ? 1 : 0, clock(), token, clock()]),
+    ]);
+    if (results.at(-1)?.meta.changes !== 1) throw new ConflictError("到期扫描租约失效，未推进检查点");
+    if (events.length) await db.writeLog("info", "renew", `到期检查已持久化 ${events.length} 条提醒事件（通道独立去重与投递），本轮检查 ${batch.length} 条`);
+    return batch.length;
+  } catch (error) {
+    await outbox.statement("UPDATE notification_scans SET lease_until=0 WHERE id='expiry' AND lease_token=?", [token]).run();
+    throw error;
   }
-
-  // ── ② DigitalPlat ───────────────────────────────────────────────
-  try {
-    const dpCachedDomains = await dbManager.getDomains("", "", undefined, "digitalplat");
-    for (const dom of dpCachedDomains) {
-      const expiresRaw = String(dom.expires_at || "");
-      if (!expiresRaw || expiresRaw.startsWith("0000")) continue;
-      const expiresTime = new Date(expiresRaw).getTime();
-      if (Number.isNaN(expiresTime)) continue;
-      const remainingDays = (expiresTime - Date.now()) / (1000 * 60 * 60 * 24);
-      if (remainingDays <= renewThresholdDays) {
-        const fullDomain = dom.full_domain;
-        const alias = dom.account_alias || `账号 ${dom.account_id}`;
-        const msg =
-          remainingDays < 0
-            ? `域名 [${fullDomain}]（DigitalPlat / ${alias}）已过期 ${Math.ceil(-remainingDays)} 天，请及时续费`
-            : `域名 [${fullDomain}]（DigitalPlat / ${alias}）将于 ${Math.ceil(remainingDays)} 天后到期`;
-        await dbManager.writeLog("warning", "renew", msg);
-        out.push(`⚠️ ${msg}`);
-      }
-    }
-  } catch (e: unknown) {
-    const message = e instanceof Error ? e.message : "未知错误";
-    await dbManager.writeLog("error", "renew", `DigitalPlat 域名到期检查失败：${message}`);
-  }
-
-  // ── ③ 自定义服务商分组 ──────────────────────────────────────────
-  try {
-    const allCustomDomains = await dbManager.listAllCustomDomains();
-    for (const dom of allCustomDomains) {
-      if (!dom.expires_at || dom.expires_at.startsWith("0000")) continue;
-      const expiresTime = new Date(dom.expires_at).getTime();
-      if (Number.isNaN(expiresTime)) continue;
-      const remainingDays = (expiresTime - Date.now()) / (1000 * 60 * 60 * 24);
-      if (remainingDays <= renewThresholdDays) {
-        const fullDomain = dom.full_domain;
-        const label = dom.account_name
-          ? `分组: ${dom.group_alias} / 账号: ${dom.account_name}`
-          : `分组: ${dom.group_alias}`;
-        const msg =
-          remainingDays < 0
-            ? `域名 [${fullDomain}]（${label}）已过期 ${Math.ceil(-remainingDays)} 天，请及时处理`
-            : `域名 [${fullDomain}]（${label}）将于 ${Math.ceil(remainingDays)} 天后到期`;
-        await dbManager.writeLog("warning", "renew", msg);
-        out.push(`⚠️ ${msg}`);
-      }
-    }
-  } catch (e: unknown) {
-    const message = e instanceof Error ? e.message : "未知错误";
-    await dbManager.writeLog("error", "renew", `自定义分组域名到期检查失败：${message}`);
-  }
-
-  // 标记当天已完成到期提醒，后续 cron 轮次不再重复推送
-  await dbManager.setCache(EXPIRY_REMINDER_SENT_KEY, todayStr, EXPIRY_REMINDER_TTL);
 }

@@ -7,7 +7,8 @@ import { computeDnsState } from "../dns-provider";
 import { syncCloudflareSlice } from "./cloudflare-sync-service";
 import { SyncWorkQueue, credentialFingerprint, type SyncWork, type SyncCursor } from "../db/dao/sync-work-dao";
 import { ConflictError, NotFoundError, UpstreamRateLimitError, ValidationError } from "../errors";
-import { sendTelegramNotification, sendWebhookNotification, type WebhookType } from "../cron/notification";
+import type { WebhookType } from "../cron/notification";
+import { notificationTargets } from "./notification-service";
 
 function normalizeDomains(rows: UpstreamSubdomain[]): UpstreamSubdomain[] {
   return rows.map(row => {
@@ -210,16 +211,16 @@ async function executeSlice(db: DatabaseManager, queue: SyncWorkQueue, work: Syn
   if (cursor.phase === "notify") {
     const renewals = await db.firstRaw<{ failed: number; count: number }>(
       "SELECT SUM(renew_state='failed') failed,COUNT(*) count FROM sync_rows WHERE job_id=? AND renew_state IN ('done','failed','deferred')", [work.id]);
-    // Durable at-most-once notification attempt. Reliable delivery outbox is separate work.
-    await queue.checkpoint(work, { phase: "done", total: cursor.total });
-    active();
+    const statements: D1PreparedStatement[] = [];
     if (renewals?.count) {
       const cfg = await db.getAllAppSettings();
       const text = `【域名同步与续期报告】账号 [${work.alias}]：同步 ${cursor.total || 0} 个域名；续期失败 ${renewals.failed || 0} 个。`;
-      const url = cfg.webhook_url || options.webhookUrl;
-      if (url) await sendWebhookNotification(url, text, (cfg.webhook_type as WebhookType) || options.webhookType, signal);
-      if (cfg.tg_token && cfg.tg_chat_id) await sendTelegramNotification(cfg.tg_token, cfg.tg_chat_id, text, signal);
+      statements.push(...await db.notificationOutbox().prepare([{ key: `sync-renew:${work.id}`, message: text }],
+        notificationTargets(cfg, options), guard));
     }
+    active();
+    // A cancelled/expired sync executor cannot enqueue or advance the checkpoint.
+    await queue.checkpoint(work, { phase: "done", total: cursor.total }, statements);
     return "queued" as const;
   }
   if (cursor.phase === "done") {

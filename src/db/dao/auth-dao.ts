@@ -104,11 +104,12 @@ export async function initializePassword(db: D1Database, username: string, passw
       SELECT 'auth_setup_claim', ?, ? WHERE NOT EXISTS
         (SELECT 1 FROM settings WHERE key IN ('auth_username','auth_pass_hash','auth_pass_salt') AND value != '')
       ON CONFLICT(key) DO NOTHING`).bind(claim, now),
-    ...[["auth_username", username], ["auth_pass_hash", hash], ["auth_pass_salt", salt]].map(([key, value]) =>
-      db.prepare(`INSERT INTO settings (key, value, updated_at)
-        SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM settings WHERE key='auth_setup_claim' AND value=?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`).bind(key, value, now, claim)
-    ),
+    // The same claim fence and batch transaction, but one JSON insert for all
+    // credential fields leaves room for versioned bootstrap on free Workers.
+    db.prepare(`INSERT INTO settings (key, value, updated_at)
+      SELECT key,value,? FROM json_each(?) WHERE EXISTS (SELECT 1 FROM settings WHERE key='auth_setup_claim' AND value=?)
+      ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`)
+      .bind(now, JSON.stringify({ auth_username: username, auth_pass_hash: hash, auth_pass_salt: salt }), claim),
   ]);
   return results[0].meta.changes === 1;
 }

@@ -237,6 +237,37 @@ CREATE TABLE IF NOT EXISTS sync_renew_journal (
     PRIMARY KEY (account_id, domain_id, full_domain, original_expiry)
 );
 
+CREATE TABLE IF NOT EXISTS notification_outbox (
+    id TEXT PRIMARY KEY,
+    event_key TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    payload_cipher TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('queued','running','sent','dead','cancelled')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    uncertain INTEGER NOT NULL DEFAULT 0,
+    lease_token TEXT,
+    lease_until INTEGER NOT NULL DEFAULT 0,
+    not_before INTEGER NOT NULL,
+    deadline_at INTEGER NOT NULL,
+    last_error TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    sent_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS notification_scans (
+    id TEXT PRIMARY KEY,
+    scan_day TEXT NOT NULL,
+    target_set TEXT NOT NULL,
+    last_kind TEXT NOT NULL DEFAULT '',
+    last_id INTEGER NOT NULL DEFAULT 0,
+    completed INTEGER NOT NULL DEFAULT 0,
+    lease_token TEXT NOT NULL,
+    lease_until INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_domains_account ON domains_cache(account_id);
 
 CREATE INDEX IF NOT EXISTS idx_domains_expires ON domains_cache(expires_at);
@@ -266,6 +297,10 @@ CREATE INDEX IF NOT EXISTS idx_sync_work_action ON sync_work(action_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_active_account ON sync_work(account_id) WHERE status IN ('queued','running','paused');
 
 CREATE INDEX IF NOT EXISTS idx_actions_type_status ON actions(type, status);
+
+CREATE INDEX IF NOT EXISTS idx_notification_due ON notification_outbox(status, not_before, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_notification_retention ON notification_outbox(status, updated_at);
 
 CREATE TABLE IF NOT EXISTS domain_hub_schema_migrations (
     version INTEGER PRIMARY KEY,

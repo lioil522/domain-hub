@@ -8,7 +8,8 @@ import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const require = createRequire(path.join(root, "package.json"));
-const { Miniflare, convertV4MiniflareOptions } = require("miniflare");
+const { Miniflare, convertV4MiniflareOptions, Response: MiniflareResponse } = require("miniflare");
+const { build } = require("esbuild");
 const key = "isolated-runtime-smoke-test-key";
 const request = (url, init = {}) => fetch(url, { ...init, signal: AbortSignal.timeout(15000) });
 async function authentication(fetcher) {
@@ -23,21 +24,65 @@ async function authentication(fetcher) {
   const domains = await fetcher("/api/domains", { headers });
   assert.equal(domains.status, 200);
   assert.deepEqual((await domains.json()).domains, []);
+  assert.equal((await fetcher("/api/notifications", { headers })).status, 200);
+  return headers;
 }
-
-const config = await readFile(path.join(root, "wrangler.toml"), "utf8");
-const date = config.match(/^compatibility_date\s*=\s*"([^"]+)"/m)?.[1];
-assert.ok(date, "Runtime smoke must use the configured compatibility date");
-const mf = new Miniflare(convertV4MiniflareOptions({
-  modules: true, scriptPath: path.join(root, "dist-worker/wrangler-dry-run/index.js"),
-  compatibilityDate: date, d1Databases: ["DB"], bindings: { AES_KEY: key },
-}));
-try { await authentication((url, init) => mf.dispatchFetch(`http://localhost${url}`, init)); }
-finally { await mf.dispose(); }
 
 const base = process.platform === "win32" && process.env.LOCALAPPDATA
   ? path.join(process.env.LOCALAPPDATA, "Temp/opencode") : tmpdir();
 await mkdir(base, { recursive: true });
+const harness = await mkdtemp(path.join(base, "domain-hub-workerd-smoke-"));
+// Only this isolated test wrapper exposes a tick endpoint, never the app bundle.
+await build({ stdin: { contents: `import worker from "./dist-worker/wrangler-dry-run/index.js";
+  export default { async fetch(request, env, ctx) {
+    if (new URL(request.url).pathname === "/__test_tick") {
+      const pending = [];
+      await worker.scheduled({cron:"* * * * *"}, env, {waitUntil(job){pending.push(job)}});
+      await Promise.all(pending);
+      return new Response("tick complete");
+    }
+    return worker.fetch(request,env,ctx);
+  }};`, resolveDir: root }, bundle: true, platform: "neutral", target: "es2022", format: "esm",
+  outfile: path.join(harness, "worker.mjs") });
+const config = await readFile(path.join(root, "wrangler.toml"), "utf8");
+const date = config.match(/^compatibility_date\s*=\s*"([^"]+)"/m)?.[1];
+assert.ok(date, "Runtime smoke must use the configured compatibility date");
+let workerDeliveries = 0;
+let mockError = "";
+const mf = new Miniflare(convertV4MiniflareOptions({
+  modules: true, scriptPath: path.join(harness, "worker.mjs"),
+  compatibilityDate: date, d1Databases: ["DB"], bindings: { AES_KEY: key },
+  outboundService: async request => {
+    try {
+      assert.equal(new URL(request.url).hostname, "notification-smoke.invalid", "Runtime smoke must never contact a real provider");
+      assert.match(request.headers.get("Idempotency-Key") || "", /^[a-f0-9]{64}$/);
+      assert.ok((await request.json()).text.includes("域名到期提醒"));
+      workerDeliveries++;
+      return new MiniflareResponse("OK");
+    } catch (error) { mockError = error.message; throw error; }
+  },
+}));
+try {
+  const fetcher = (url, init) => mf.dispatchFetch(`http://localhost${url}`, init);
+  const headers = await authentication(fetcher);
+  assert.equal((await fetcher("/api/settings", { method: "POST", headers: { ...headers, "Content-Type": "application/json" },
+    body: JSON.stringify({ webhook_url: "https://notification-smoke.invalid/hook", webhook_type: "custom" }) })).status, 200);
+  const sqlite = await mf.getD1Database("DB");
+  await sqlite.prepare("INSERT INTO accounts(id,alias,api_key,api_secret,provider) VALUES(1,'runtime','isolated','legacy','custom')").run();
+  await sqlite.prepare("INSERT INTO custom_domains(group_id,full_domain,expires_at) VALUES(1,'isolated.example.com',?)")
+    .bind(new Date(Date.now() + 86400000).toISOString()).run();
+  assert.equal((await fetcher("/__test_tick")).status, 200);
+  assert.equal((await fetcher("/__test_tick")).status, 200);
+  const deliveries = await (await fetcher("/api/notifications", { headers })).json();
+  assert.equal(deliveries.notifications.length, 1);
+  assert.equal(deliveries.notifications[0].status, "sent", JSON.stringify({ deliveries, workerDeliveries, mockError }));
+  assert.equal(workerDeliveries, 1);
+  assert.equal((await fetcher("/__test_tick")).status, 200);
+  assert.equal(workerDeliveries, 1, "Confirmed delivery cannot be repeated on another tick");
+  console.log("[runtime-smoke] workerd expiry/outbox production, delivery and dedupe passed");
+}
+finally { await mf.dispose(); }
+
 const data = await mkdtemp(path.join(base, "domain-hub-runtime-smoke-"));
 const env = { ...process.env, DATA_DIR: data, AES_KEY: key, HOST: "127.0.0.1", PORT: "0",
   STATIC_DIR: path.join(root, "frontend/dist"), DISABLE_CRON: "1" };

@@ -34,6 +34,7 @@ import { NON_QUOTA_PROVIDERS } from "./types";
 import { ensureDatabaseSchema } from "./schema-migrations";
 import { StagedRestore } from "./dao/restore-dao";
 import { SyncWorkQueue } from "./dao/sync-work-dao";
+import { NotificationOutbox } from "./dao/notification-dao";
 import { sha256Hex } from "./crypto";
 import { ConflictError } from "../errors";
 
@@ -182,6 +183,7 @@ export class DatabaseManager {
   async setPassword(username: string, password: string): Promise<void> {
     return authDao.setPassword(this.db, username, password);
   }
+  notificationOutbox() { return new NotificationOutbox(this.db, this.aesKey); }
   async initializePassword(username: string, password: string): Promise<boolean> {
     return authDao.initializePassword(this.db, username, password);
   }

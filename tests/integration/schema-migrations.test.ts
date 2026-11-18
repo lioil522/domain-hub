@@ -113,8 +113,19 @@ test("first-request bootstrap uses combined metadata reads and leaves a bounded 
   const queries: string[] = [];
   const observed = proxyDatabase(db, sql => { queries.push(sql); return db.prepare(sql); });
   await ensureDatabaseSchema(observed);
-  assert.ok(queries.length <= 43, `Bootstrap prepared ${queries.length} queries`);
+  assert.ok(queries.length <= 44, `Bootstrap prepared ${queries.length} queries`);
   assert.ok(!queries.some(sql => sql.startsWith("PRAGMA")), queries.join("\n"));
+});
+test("first setup request including schema bootstrap stays within the 50-query budget", async t => {
+  const { db } = fixture(t);
+  const queries: string[] = [];
+  const observed = proxyDatabase(db, sql => { queries.push(sql); return db.prepare(sql); });
+  const response = await worker.fetch(new Request("http://localhost/api/auth/setup", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: "fresh-budget", password: "isolated-budget-password" }),
+  }), { DB: observed }, { waitUntil() {}, props: {} } as unknown as ExecutionContext);
+  assert.equal(response.status, 200);
+  assert.ok(queries.length <= 50, `First setup prepared ${queries.length} queries`);
 });
 
 test("parallel managers sharing one binding coalesce migration without duplicate records", async t => {
@@ -189,10 +200,10 @@ test("outages reading migration history fail closed and cannot trigger a new boo
 test("a future schema or a history gap is rejected without rewriting its records", async t => {
   const { sqlite, db } = fixture(t);
   await ensureDatabaseSchema(db);
-  sqlite.prepare(`INSERT INTO ${MIGRATION_TABLE}(version,name) VALUES(5,'future-version')`).run();
+  sqlite.prepare(`INSERT INTO ${MIGRATION_TABLE}(version,name) VALUES(?,'future-version')`).run(SCHEMA_VERSION + 1);
   await assert.rejects(() => ensureDatabaseSchema(db), /Unsupported or inconsistent/);
-  assert.equal(sqlite.prepare(`SELECT COUNT(*) AS count FROM ${MIGRATION_TABLE}`).get()?.count, 5);
-  sqlite.exec(`DELETE FROM ${MIGRATION_TABLE} WHERE version IN (1,5)`);
+  assert.equal(sqlite.prepare(`SELECT COUNT(*) AS count FROM ${MIGRATION_TABLE}`).get()?.count, SCHEMA_VERSION + 1);
+  sqlite.exec(`DELETE FROM ${MIGRATION_TABLE} WHERE version IN (1,${SCHEMA_VERSION + 1})`);
   await assert.rejects(() => ensureDatabaseSchema(db), /Unsupported or inconsistent/);
 });
 
@@ -263,7 +274,7 @@ test("account-expiry, cache cleanup and action-list query plans use the required
     assert.ok(plan.includes(expected), plan);
     assert.ok(!plan.includes("USE TEMP B-TREE"), plan);
   }
-  assert.equal(SCHEMA_INDEXES.length, 15);
+  assert.equal(SCHEMA_INDEXES.length, 17);
 });
 
 test("an existing v2 database appends v3 without changing its previous migration history", async t => {

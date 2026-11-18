@@ -3,6 +3,7 @@ import {
   SCHEMA_INDEXES, SCHEMA_TABLES, SCHEMA_VERSION,
   BASELINE_TABLES, BASELINE_INDEXES, RESTORE_SCHEMA_TABLES, RESTORE_SCHEMA_INDEXES,
   SYNC_SCHEMA_TABLES, SYNC_SCHEMA_INDEXES,
+  NOTIFICATION_SCHEMA_TABLES, NOTIFICATION_SCHEMA_INDEXES,
 } from "./schema-definition";
 
 const inFlight = new WeakMap<D1Database, Promise<number>>();
@@ -24,15 +25,18 @@ async function readVersion(db: D1Database): Promise<number> {
   return rows.length;
 }
 
-async function tableStatements(db: D1Database, tables: readonly (typeof SCHEMA_TABLES)[number][], allowLegacy = false): Promise<string[]> {
+async function tableStatements(db: D1Database, tables: readonly (typeof SCHEMA_TABLES)[number][], allowLegacy = false,
+  indexDefinitions?: Map<string, string>): Promise<string[]> {
   // Table-valued PRAGMA functions inspect all required fields in one read.
   // Existing tables need no redundant CREATE, preserving a cold-request budget.
   const result = await db.prepare(`WITH required(table_name) AS (VALUES ${tables.map(table => `('${table.name}')`).join(",")})
-    SELECT required.table_name,fields.name FROM required,pragma_table_info(required.table_name) fields`)
-    .all<{ table_name: string; name: string }>();
+    SELECT required.table_name,fields.name,NULL sql FROM required,pragma_table_info(required.table_name) fields
+    ${indexDefinitions ? "UNION ALL SELECT '',name,sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL" : ""}`)
+    .all<{ table_name: string; name: string; sql: string | null }>();
   requireSuccess([result]);
   const columnsByTable = new Map<string, Set<string>>();
   for (const column of result.results) {
+    if (column.sql) { indexDefinitions?.set(column.name, column.sql); continue; }
     const bucket = columnsByTable.get(column.table_name) || new Set<string>();
     bucket.add(column.name); columnsByTable.set(column.table_name, bucket);
   }
@@ -52,11 +56,7 @@ async function tableStatements(db: D1Database, tables: readonly (typeof SCHEMA_T
 
 const normalizedSql = (sql: string) => sql.toLowerCase().replace(/\bif not exists\b/g, "").replace(/[\s;"`[\]]/g, "");
 
-async function checkExistingIndexes(db: D1Database, requireAll: boolean, indexes = SCHEMA_INDEXES) {
-  const result = await db.prepare("SELECT name, sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL")
-    .all<{ name: string; sql: string }>();
-  requireSuccess([result]);
-  const existing = new Map(result.results.map(row => [row.name, row.sql]));
+function checkIndexDefinitions(existing: Map<string, string>, requireAll: boolean, indexes = SCHEMA_INDEXES) {
   for (const index of indexes) {
     const sql = existing.get(index.name);
     if (sql && normalizedSql(sql) !== normalizedSql(index.sql)) {
@@ -64,6 +64,13 @@ async function checkExistingIndexes(db: D1Database, requireAll: boolean, indexes
     }
     if (!sql && requireAll) throw new Error(`Required schema index ${index.name} is missing`);
   }
+}
+async function checkExistingIndexes(db: D1Database, requireAll: boolean, indexes = SCHEMA_INDEXES) {
+  const result = await db.prepare("SELECT name, sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL")
+    .all<{ name: string; sql: string }>();
+  requireSuccess([result]);
+  const existing = new Map(result.results.map(row => [row.name, row.sql]));
+  checkIndexDefinitions(existing, requireAll, indexes);
 }
 
 async function migrate(db: D1Database): Promise<number> {
@@ -82,11 +89,12 @@ async function migrate(db: D1Database): Promise<number> {
     const name = MIGRATION_NAMES[version];
     let statements: string[];
     if (nextVersion === 1) {
-      const all = await tableStatements(db, SCHEMA_TABLES, true);
+      const definitions = new Map<string, string>();
+      const all = await tableStatements(db, SCHEMA_TABLES, true, definitions);
       if (all.length === SCHEMA_TABLES.length && all.every(sql => sql.startsWith("CREATE TABLE"))) {
         // Fresh databases commit the complete schema and all version records in
         // one transaction, leaving enough first-request budget for login/setup.
-        await checkExistingIndexes(db, false);
+        checkIndexDefinitions(definitions, false);
         try {
           await db.batch([
             ...all.map(sql => db.prepare(sql)), ...SCHEMA_INDEXES.map(index => db.prepare(index.sql)),
@@ -110,6 +118,9 @@ async function migrate(db: D1Database): Promise<number> {
       await checkExistingIndexes(db, false, SYNC_SCHEMA_INDEXES);
       statements = [...await tableStatements(db, [...SYNC_SCHEMA_TABLES, SCHEMA_TABLES.find(table => table.name === "cf_sync_state")!], true),
         ...SYNC_SCHEMA_INDEXES.map(index => index.sql)];
+    } else if (nextVersion === 5) {
+      await checkExistingIndexes(db, false, NOTIFICATION_SCHEMA_INDEXES);
+      statements = [...await tableStatements(db, NOTIFICATION_SCHEMA_TABLES), ...NOTIFICATION_SCHEMA_INDEXES.map(index => index.sql)];
     } else throw new Error(`No migration implementation for schema version ${nextVersion}`);
     try {
       const results = await db.batch([

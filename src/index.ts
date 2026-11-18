@@ -17,6 +17,7 @@ import { AccountService } from "./services/account-service";
 import { LogService } from "./services/log-service";
 import { runDailySyncAndRenewal } from "./cron/jobs/daily-sync";
 import { runOneSyncSlice } from "./services/sync-work-runner";
+import { runBackgroundMaintenance } from "./services/background-maintenance";
 import { syncRunOptions } from "./services/sync-dispatch";
 import { PROVIDER_IDS, PROVIDER_LABELS, normalizeProvider } from "./providers/registry";
 import { resyncAccountsInBackground, ensureDefaultAccount, sleep, cacheNewlyRegisteredDomain } from "./services/account-sync-service";
@@ -24,6 +25,7 @@ import { fetchAllQuotas } from "./services/quota-service";
 import { registerQuotaRoutes } from "./routes/quota";
 
 import { registerSettingsRoutes } from "./routes/settings";
+import { registerNotificationRoutes } from "./routes/notifications";
 
 import { registerLogRoutes } from "./routes/logs";
 import { registerAuthRoutes } from "./routes/auth";
@@ -224,6 +226,7 @@ registerAuthRoutes(app, {
 });
 registerLogRoutes(app);
 registerSettingsRoutes(app, { sendTelegramNotification, sendWebhookNotification });
+registerNotificationRoutes(app);
 registerQuotaRoutes(app, { fetchAllQuotas });
 registerActionRoutes(app);
 registerAuditRoutes(app);
@@ -261,7 +264,7 @@ export default {
     if (event.cron === "* * * * *") {
       ctx.waitUntil((async () => {
         if (!await dbManager.ensureTables()) throw new Error("数据库迁移未完成");
-        await runOneSyncSlice(dbManager, syncRunOptions(env));
+        await runBackgroundMaintenance(dbManager, syncRunOptions(env));
       })());
     } else ctx.waitUntil(runDailySyncAndRenewal(dbManager, env.WEBHOOK_URL, webhookType, true));
   },

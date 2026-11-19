@@ -3,9 +3,11 @@ import { useAppData } from "../../../state/AppDataContext";
 import { observeSyncAction, type WaitForAccountSync } from "../../domains/utils/sync-action";
 import type { Account } from "../../../types/account";
 import type { Domain } from "../../../types/domain";
+import type { DomainPageSource } from "../../domains/hooks/useDomainCatalog";
 
 /** `useDpDomains` 的外部依赖 —— 由 `App.tsx` 注入 */
 export interface UseDpDomainsOptions {
+  page: DomainPageSource;
   /** 动作级 loading 标记（App 的 `actionLoading` setter） */
   setActionLoading: (v: string | null) => void;
   /** 等待同步任务的真实结果，换 Key 时也使用 action_id */
@@ -26,12 +28,12 @@ export interface UseDpDomainsOptions {
  *   - `dpToggleAccountCollapse` / `dpToggleAllAccounts`
  *
  */
-export function useDpDomains({ setActionLoading, waitForAccountDomainSync }: UseDpDomainsOptions) {
+export function useDpDomains({ setActionLoading, waitForAccountDomainSync, page }: UseDpDomainsOptions) {
   const { apiFetch, showToast, accounts, fetchAccounts } = useAppData();
 
   // 域名列表与账号筛选
-  const [dpDomains, setDpDomains] = useState<Domain[]>([]);
-  const [loadingDpDomains, setLoadingDpDomains] = useState(false);
+  const dpDomains = page.domains;
+  const loadingDpDomains = page.loading;
   const [dpAccountFilter, setDpAccountFilter] = useState<string>("all");
   // 域名分组的收起状态（独立持久化键，刷新 / 重开浏览器后保持上次布局）
   const [dpCollapsedAccounts, setDpCollapsedAccounts] = useState<Set<number>>(() => {
@@ -70,27 +72,12 @@ export function useDpDomains({ setActionLoading, waitForAccountDomainSync }: Use
       const group = byId.get(d.account_id);
       if (group) group.domains.push(d);
     });
-    return groups;
-  }, [dpAccountList, dpDomains, dpAccountFilter]);
+    return groups.filter(group => group.domains.length || dpAccountFilter !== "all" || page.total === 0);
+  }, [dpAccountList, dpDomains, dpAccountFilter, page.total]);
 
   // 2.4.1 获取 DigitalPlat 账号的域名列表（后端默认排除这些行，需显式传 provider）
   const fetchDpDomains = async (accountIdFilter?: string) => {
-    setLoadingDpDomains(true);
-    try {
-      const targetAcc = accountIdFilter ?? dpAccountFilter;
-      const accParam = targetAcc && targetAcc !== "all" ? `&account_id=${targetAcc}` : "";
-      const res = await apiFetch(`/api/domains?provider=digitalplat${accParam}`);
-      const data = await res.json();
-      if (data.success) {
-        setDpDomains(data.domains || []);
-      } else {
-        showToast("error", data.message || "拉取 DigitalPlat 域名失败");
-      }
-    } catch (e) {
-      showToast("error", "网络连接异常，无法获取 DigitalPlat 域名");
-    } finally {
-      setLoadingDpDomains(false);
-    }
+    await page.refresh(accountIdFilter ?? dpAccountFilter);
   };
 
   // 手动同步 DigitalPlat 账号的域名列表

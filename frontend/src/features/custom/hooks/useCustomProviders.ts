@@ -2,31 +2,46 @@ import { useAppData } from "../../../state/AppDataContext";
 import { useCustomProvidersState } from "./custom-providers/useCustomProvidersState";
 import { useCustomProvidersData } from "./custom-providers/useCustomProvidersData";
 import { useCustomProvidersActions } from "./custom-providers/useCustomProvidersActions";
+import type { DomainPageSource } from "../../domains/hooks/useDomainCatalog";
+import { useEffect } from "react";
 export type { DomainWithDays, AccountWithDomains, CustomGroup } from "./custom-providers/types";
 
 export interface UseCustomProvidersOptions {
+  page: DomainPageSource;
   isPermanentExpiry: (v?: string | null) => boolean;
 }
 
-export function useCustomProviders({ isPermanentExpiry }: UseCustomProvidersOptions) {
-  const { apiFetch, showToast, accounts, fetchAccounts } = useAppData();
-  const state = useCustomProvidersState();
+export function useCustomProviders({ isPermanentExpiry, page }: UseCustomProvidersOptions) {
+  const { apiFetch, showToast, accounts, fetchAccounts, sessionToken, backendUrl } = useAppData();
+  const base = useCustomProvidersState();
+  const state = { ...base, customDomains: page.custom_domains };
+  useEffect(() => {
+    base.setCustomAccounts([]); base.setLoadingCustomDomains(false);
+    base.setCustomMetadataError(null);
+    base.setCustomAccountModalOpen(false); base.setCustomDomainModalOpen(false); base.setCustomNewGroupOpen(false);
+    base.setCustomDeleteAccount(null); base.setCustomDeleteGroup(null); base.setCustomDeleteDomain(null);
+  }, [sessionToken, backendUrl]);
   const { customGroupList, groupedCustomDomains } = useCustomProvidersData({
     accounts,
     customAccounts: state.customAccounts,
     customDomains: state.customDomains,
     customGroupFilter: state.customGroupFilter,
+    counts: page.account_counts,
   });
   const actions = useCustomProvidersActions({
     state, groupedCustomDomains, apiFetch, showToast, fetchAccounts, isPermanentExpiry,
+    refreshPage: () => page.refresh(state.customGroupFilter),
+    identity: `${backendUrl}:${sessionToken}`,
   });
 
   return {
+    customMetadataError: state.customMetadataError,
     customGroupFilter: state.customGroupFilter,
-    setCustomGroupFilter: state.setCustomGroupFilter,
+    setCustomGroupFilter: (filter: string) => { state.setCustomGroupFilter(filter); void page.refresh(filter); },
     customGroupList, customAccounts: state.customAccounts, customDomains: state.customDomains,
-    loadingCustomDomains: state.loadingCustomDomains, groupedCustomDomains,
+    loadingCustomDomains: state.loadingCustomDomains || page.loading, groupedCustomDomains,
     customCollapsedGroups: state.customCollapsedGroups,
+    persistCustomCollapsed: state.persistCustomCollapsed,
     fetchCustomDomains: actions.fetchCustomDomains,
     customToggleGroupCollapse: actions.customToggleGroupCollapse,
     customToggleAllGroups: actions.customToggleAllGroups,

@@ -40,7 +40,8 @@ export interface CustomProvidersPageProps {
   /** 分组列表（provider === "custom" 的账号） */
   customGroupList: Account[];
   /** 账号总数（用于顶部计数） */
-  customAccountCount: number;
+  customAccountCount?: number;
+  metadataError?: string | null;
   /** 域名总数（用于顶部计数） */
   customDomainCount: number;
   loadingCustomDomains: boolean;
@@ -100,6 +101,7 @@ export function CustomProvidersPage(props: CustomProvidersPageProps) {
 
   return (
     <div className="space-y-8 pt-5 md:pt-6">
+      {props.metadataError && <p role="alert" className="text-sm text-content-muted">{props.metadataError}</p>}
       {/* 顶部：分组筛选与操作按钮 */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 md:gap-4 bg-surface border border-border-base p-3 sm:p-4 rounded-xl">
         <div className="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-3 sm:gap-4 w-full md:w-auto">
@@ -120,7 +122,7 @@ export function CustomProvidersPage(props: CustomProvidersPageProps) {
           </div>
           <div className="text-xs text-content-muted font-mono whitespace-nowrap">
             分组: <span className="text-emerald-400 font-bold">{customGroupList.length}</span> |
-            账号: <span className="text-sky-400 font-bold">{customAccountCount}</span> |
+            账号: <span className="text-sky-400 font-bold">{customAccountCount ?? "—"}</span> |
             域名: <span className="text-accent font-bold">{customDomainCount}</span> 个
           </div>
         </div>
@@ -282,7 +284,7 @@ export function CustomProvidersPage(props: CustomProvidersPageProps) {
                             <UserCheck className="w-4 h-4 text-sky-400 shrink-0" />
                             <span className="text-sm font-semibold text-content-primary truncate">{acc.name}</span>
                             <span className="text-[11px] bg-sky-50 text-sky-700 border border-sky-200 dark:bg-sky-950/80 dark:text-sky-300 dark:border-sky-900/60 px-2 py-0.5 rounded-full font-normal flex-shrink-0">
-                              {acc.domains.length} 个域名
+                              本页 {acc.domains.length} 个域名
                             </span>
                           </div>
                           <div className="flex items-center gap-1 flex-shrink-0">
@@ -305,7 +307,7 @@ export function CustomProvidersPage(props: CustomProvidersPageProps) {
 
                         {acc.domains.length === 0 ? (
                           <div className="text-center py-4 text-content-muted text-xs">
-                            该账号下还没有域名，点击「+」添加。
+                            本页未包含该账号的域名，可搜索定位或点击「+」添加。
                           </div>
                         ) : (
                           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">

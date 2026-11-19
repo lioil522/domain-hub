@@ -49,7 +49,7 @@ export function SearchResultGroups(props: {
       items: result.customHits.map((d) => ({ id: d.id, full_domain: d.full_domain }))
     }
   ];
-  const total = groups.reduce((n, g) => n + g.items.length, 0);
+  const total = groups.reduce((n, g) => n + (result.totals?.[g.key] ?? g.items.length), 0);
 
   if (total === 0) {
     return (
@@ -67,7 +67,7 @@ export function SearchResultGroups(props: {
           <div key={g.key}>
             <div className="px-3 pt-2 pb-1 text-[11px] font-semibold uppercase tracking-wide text-content-muted flex items-center gap-1.5">
               <span className={`font-bold ${g.color}`}>{g.label}</span>
-              <span className="text-content-muted">({g.items.length})</span>
+               <span className="text-content-muted">({result.totals?.[g.key] ?? g.items.length})</span>
             </div>
             {g.items.slice(0, 8).map((item) => (
               <button
@@ -78,9 +78,9 @@ export function SearchResultGroups(props: {
                 <span className="font-mono truncate">{displayDomainSmart(item.full_domain)}</span>
               </button>
             ))}
-            {g.items.length > 8 && (
+             {(result.totals?.[g.key] ?? g.items.length) > 8 && (
               <div className="px-4 pb-1 text-[11px] text-content-muted">
-                还有 {g.items.length - 8} 个，请输入更精确关键词
+                 还有 {(result.totals?.[g.key] ?? g.items.length) - 8} 个，请输入更精确关键词
               </div>
             )}
           </div>

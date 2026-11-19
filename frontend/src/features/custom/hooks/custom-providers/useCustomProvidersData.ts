@@ -2,15 +2,17 @@ import { useMemo } from "react";
 import type { AccountWithDomains, CustomGroup, DomainWithDays } from "./types";
 import type { Account } from "../../../../types/account";
 import type { CustomAccount, CustomDomain } from "../../../../types/custom";
+import type { CatalogCount } from "../../../../../../shared/domain-catalog";
 
 export interface UseCustomProvidersDataOptions {
   accounts: Account[];
   customAccounts: CustomAccount[];
   customDomains: CustomDomain[];
   customGroupFilter: string;
+  counts?: Record<string, CatalogCount>;
 }
 
-export function useCustomProvidersData({ accounts, customAccounts, customDomains, customGroupFilter }: UseCustomProvidersDataOptions) {
+export function useCustomProvidersData({ accounts, customAccounts, customDomains, customGroupFilter, counts }: UseCustomProvidersDataOptions) {
   const customGroupList = useMemo(() => accounts.filter((a) => a.provider === "custom"), [accounts]);
   const groupedCustomDomains = useMemo(() => {
     const groups: CustomGroup[] = [];
@@ -35,10 +37,17 @@ export function useCustomProvidersData({ accounts, customAccounts, customDomains
         const group = groupById.get(d.group_id); if (!group) return;
         group.unassignedDomains.push(toDaysLeft(d)); group.domainCount++; return;
       }
-      const acc = accountById.get(d.account_id); if (!acc) return;
+      let acc = accountById.get(d.account_id);
+      if (!acc) {
+        const group = groupById.get(d.group_id); if (!group) return;
+        acc = { id: d.account_id, group_id: d.group_id, name: d.account_name || `账号 ${d.account_id}`, updated_at: d.updated_at, domains: [] };
+        accountById.set(acc.id, acc); group.accounts.push(acc);
+      }
       acc.domains.push(toDaysLeft(d)); const group = groupById.get(acc.group_id); if (group) group.domainCount++;
     });
-    return groups;
-  }, [customGroupList, customAccounts, customDomains, customGroupFilter]);
+    const visible = groups.filter(group => group.domainCount || customGroupFilter !== "all" || !customDomains.length);
+    visible.forEach(group => { group.domainCount = counts?.[group.groupId]?.total ?? group.domainCount; });
+    return visible;
+  }, [customGroupList, customAccounts, customDomains, customGroupFilter, counts]);
   return { customGroupList, groupedCustomDomains };
 }

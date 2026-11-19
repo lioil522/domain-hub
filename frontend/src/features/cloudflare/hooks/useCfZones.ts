@@ -3,9 +3,11 @@ import { useAppData } from "../../../state/AppDataContext";
 import { observeSyncAction, type WaitForAccountSync } from "../../domains/utils/sync-action";
 import type { Account } from "../../../types/account";
 import type { Domain } from "../../../types/domain";
+import type { DomainPageSource } from "../../domains/hooks/useDomainCatalog";
 
 /** `useCfZones` 的外部依赖 —— 由 `App.tsx` 注入 */
 export interface UseCfZonesOptions {
+  page: DomainPageSource;
   /** 动作级 loading 标记（App 的 `actionLoading` setter） */
   setActionLoading: (v: string | null) => void;
   /** 等待账号域名在后端落库后再刷新（App 的 `waitForAccountDomainSync`） */
@@ -29,12 +31,12 @@ export interface UseCfZonesOptions {
  * NOTE: 必须在 `accounts`（AppDataProvider）之后调用；App 侧对 `cfZones` 的
  * 只读消费点很多，均通过解构取得，故调用点需尽量靠前（放在账号域初始化之后）。
  */
-export function useCfZones({ setActionLoading, waitForAccountDomainSync }: UseCfZonesOptions) {
+export function useCfZones({ setActionLoading, waitForAccountDomainSync, page }: UseCfZonesOptions) {
   const { apiFetch, showToast, accounts, fetchAccounts } = useAppData();
 
   // zones 列表与账号筛选
-  const [cfZones, setCfZones] = useState<Domain[]>([]);
-  const [loadingCfZones, setLoadingCfZones] = useState(false);
+  const cfZones = page.domains;
+  const loadingCfZones = page.loading;
   const [cfAccountFilter, setCfAccountFilter] = useState<string>("all");
 
   // zones 分组的收起状态（独立于 DNSHE 域名页的 collapsedAccounts，持久化于本地，
@@ -79,27 +81,12 @@ export function useCfZones({ setActionLoading, waitForAccountDomainSync }: UseCf
       const group = byId.get(z.account_id);
       if (group) group.zones.push(z);
     });
-    return groups;
-  }, [cfAccountList, cfZones, cfAccountFilter]);
+    return groups.filter(group => group.zones.length || cfAccountFilter !== "all" || page.total === 0);
+  }, [cfAccountList, cfZones, cfAccountFilter, page.total]);
 
   // 2.4 获取 Cloudflare 账号的 zone 列表（后端默认排除这些行，需显式传 provider）
   const fetchCfZones = async (accountIdFilter?: string) => {
-    setLoadingCfZones(true);
-    try {
-      const targetAcc = accountIdFilter ?? cfAccountFilter;
-      const accParam = targetAcc && targetAcc !== "all" ? `&account_id=${targetAcc}` : "";
-      const res = await apiFetch(`/api/domains?provider=cloudflare${accParam}`);
-      const data = await res.json();
-      if (data.success) {
-        setCfZones(data.domains || []);
-      } else {
-        showToast("error", data.message || "拉取 Cloudflare zones 失败");
-      }
-    } catch (e) {
-      showToast("error", "网络连接异常，无法获取 Cloudflare zones");
-    } finally {
-      setLoadingCfZones(false);
-    }
+    await page.refresh(accountIdFilter ?? cfAccountFilter);
   };
 
   // 解绑 Cloudflare 账号（后端级联清理该账号的 zones 缓存）

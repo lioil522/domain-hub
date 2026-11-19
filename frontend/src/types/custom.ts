@@ -8,6 +8,7 @@ export interface CustomAccount {
 
 /** 自定义服务商（无 API）手动录入的域名（归属某个账号，或直接挂在分组下） */
 export interface CustomDomain {
+  account_name?: string | null;
   id: number;
   group_id: number;
   account_id: number | null;

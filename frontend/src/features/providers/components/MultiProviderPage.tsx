@@ -15,6 +15,7 @@ import type { Account } from "../../../types/account";
 import type { Domain } from "../../../types/domain";
 import type { MultiProviderKey } from "../../../types/provider";
 import { MULTI_PROVIDER_META } from "../providerMeta";
+import type { CatalogCount } from "../../../../../shared/domain-catalog";
 
 /**
  * 新托管商标签页（DNSPod / 阿里云 / 华为云 / Vercel 四家共用）
@@ -33,6 +34,8 @@ import { MULTI_PROVIDER_META } from "../providerMeta";
  * 页面三态：加载中 → 未绑定账号 → 按账号分组的域名卡片网格。
  */
 export interface MultiProviderPageProps {
+  totalCount?: number;
+  counts?: Record<string, CatalogCount>;
   /** 当前托管商 key（决定 label 与数据槽位） */
   providerKey: MultiProviderKey;
   /** 账号筛选（"all" 或账号 id 字符串） */
@@ -115,7 +118,7 @@ export function MultiProviderPage(props: MultiProviderPageProps) {
           </div>
           <div className="text-xs text-content-muted font-mono whitespace-nowrap">
             已绑定账号: <span className="text-accent font-bold">{accountList.length}</span> |
-            域名: <span className="text-emerald-400 font-bold">{domains.length}</span> 个
+            域名: <span className="text-emerald-400 font-bold">{props.totalCount ?? domains.length}</span> 个
           </div>
         </div>
 
@@ -204,7 +207,7 @@ export function MultiProviderPage(props: MultiProviderPageProps) {
                       <Globe className="w-4 h-4 text-accent shrink-0" />
                       <span className="text-accent-strong dark:text-accent truncate max-w-full">{group.alias}</span>
                       <span className="text-[11px] md:text-xs bg-accent-soft text-accent border border-accent/20 px-2 md:px-2.5 py-0.5 rounded-full font-normal">
-                        {group.domains.length} 个域名
+                        {props.counts?.[group.accountId]?.total ?? group.domains.length} 个域名 · 本页 {group.domains.length}
                       </span>
                     </h3>
                   </button>

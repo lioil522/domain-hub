@@ -13,6 +13,7 @@ import {
 import { CustomSelect } from "../../../components/form/CustomSelect";
 import type { Domain } from "../../../types/domain";
 import type { Account } from "../../../types/account";
+import type { CatalogCount } from "../../../../../shared/domain-catalog";
 
 /**
  * DomainsPage —— DNSHE 域名列表标签页
@@ -30,6 +31,7 @@ export interface DomainsPageGroup {
 }
 
 export interface DomainsPageProps {
+  counts?: Record<string, CatalogCount>;
   // 账号筛选
   selectedAccountFilter: string;
   onSelectAccountFilter: (v: string) => void;
@@ -222,7 +224,8 @@ export function DomainsPage(props: DomainsPageProps) {
                       )}
                       <span className="text-accent-strong dark:text-accent truncate max-w-full">{group.alias}</span>
                       <span className="text-[11px] md:text-xs bg-accent-soft text-accent border border-accent/20 px-2 md:px-2.5 py-0.5 rounded-full font-normal">
-                        共 {group.domains.length} 个域名（系统默认: {defaultDomains.length} | 外部DNS: {externalDomains.length}）
+                        共 {props.counts?.[group.accountId]?.total ?? group.domains.length} 个域名 · 本页 {group.domains.length}
+                        （本页系统默认: {defaultDomains.length} | 外部DNS: {externalDomains.length}）
                       </span>
                     </h3>
                   </button>

@@ -4,8 +4,11 @@ import type { ApiFetch } from "../../../../api/client";
 import { apiJson } from "../../../../api/request";
 import type { UseCustomProvidersStateReturn } from "./useCustomProvidersState";
 import type { CustomGroup } from "./types";
+import { useEffect, useRef } from "react";
 
 export interface UseCustomProvidersActionsOptions {
+  identity: string;
+  refreshPage: () => Promise<void>;
   state: UseCustomProvidersStateReturn;
   groupedCustomDomains: CustomGroup[];
   apiFetch: ApiFetch;
@@ -14,31 +17,37 @@ export interface UseCustomProvidersActionsOptions {
   isPermanentExpiry: (v?: string | null) => boolean;
 }
 
-export function useCustomProvidersActions({ state, groupedCustomDomains, apiFetch, showToast, fetchAccounts, isPermanentExpiry }: UseCustomProvidersActionsOptions) {
+export function useCustomProvidersActions({ state, groupedCustomDomains, apiFetch, showToast, fetchAccounts, isPermanentExpiry, refreshPage, identity }: UseCustomProvidersActionsOptions) {
+  const metadataController = useRef<AbortController | null>(null);
+  useEffect(() => () => metadataController.current?.abort(), [identity]);
   const {
-    setCustomAccounts, setCustomDomains, setLoadingCustomDomains, customNewGroupAlias, customNewGroupWebsite, setCustomNewGroupOpen, setCustomNewGroupAlias, setCustomNewGroupWebsite,
+    setCustomAccounts, setLoadingCustomDomains, customNewGroupAlias, customNewGroupWebsite, setCustomNewGroupOpen, setCustomNewGroupAlias, setCustomNewGroupWebsite,
+    setCustomMetadataError,
     setCustomNewGroupSaving, customBatchRows, setCustomBatchResults, setCustomAccountModalGroup, setCustomAccountName, setCustomAccountModalOpen,
     customAccountModalGroup, customAccountName, setCustomAccountSaving, setCustomDeleteAccount, customDeleteAccount,
     setCustomDomainModalGroup, setCustomDomainModalAccount, setCustomDomainModalEditing, setCustomDomainFull, setCustomDomainRegistered, setCustomDomainExpiry,
     setCustomDomainRemark, setCustomDomainModalOpen, customDomainModalGroup, customDomainModalAccount, customDomainModalEditing, customDomainFull, customDomainExpiry,
     customDomainRegistered, customDomainRemark, setCustomDomainSaving, setCustomDeleteDomain, customDeleteDomain, setCustomDeleteGroup, customDeleteGroup,
-    customCollapsedGroups, persistCustomCollapsed, persistCustomCache,
+    customCollapsedGroups, persistCustomCollapsed,
   } = state;
 
-  const fetchCustomDomains = async () => {
+  const fetchCustomDomains = async (refreshRows = true) => {
+    metadataController.current?.abort();
+    const controller = new AbortController();
+    metadataController.current = controller;
     setLoadingCustomDomains(true);
+    setCustomMetadataError(null);
     try {
-      const data = await apiJson<{ accounts?: CustomAccount[]; domains?: CustomDomain[] }>(apiFetch, "/api/custom-groups/overview");
-      if (!data.success) return;
+      const data = await apiJson<{ accounts?: CustomAccount[] }>(apiFetch, "/api/custom-groups/overview?include_domains=0", { signal: controller.signal });
+      if (controller.signal.aborted) return;
+      if (data.success !== true || !Array.isArray(data.accounts)) throw new Error("账号元数据响应格式不正确");
       const accountsData = Array.isArray(data.accounts) ? data.accounts : [];
-      const domainsData = Array.isArray(data.domains) ? data.domains : [];
       setCustomAccounts(accountsData);
-      setCustomDomains(domainsData);
-      persistCustomCache(accountsData, domainsData);
+      if (refreshRows) await refreshPage();
     } catch {
-      // 网络异常：保留当前（可能来自缓存的）数据，不清空列表。
+      if (!controller.signal.aborted) setCustomMetadataError("账号元数据读取失败，域名仍可分页查看；请刷新重试。");
     } finally {
-      setLoadingCustomDomains(false);
+      if (!controller.signal.aborted) setLoadingCustomDomains(false);
     }
   };
 

@@ -9,7 +9,7 @@ import { useCfDnsPanel } from "../features/dns/hooks/useCfDnsPanel";
 // ── 已抽出的类型 / 常量 / 工具 / 纯组件（Phase 1 迁移） ──
 import type { Domain } from "../types/domain";
 import type { Account } from "../types/account";
-import type { MultiProviderKey } from "../types/provider";
+import type { MultiProviderKey, JumpSource } from "../types/provider";
 import type { CustomAccount, CustomDomain } from "../types/custom";
 import {
   MULTI_PROVIDER_META,
@@ -32,7 +32,9 @@ import { ScannerHost } from "./ScannerHost";
 import { LazyBoundary } from "../components/LazyBoundary";
 import { DEFAULT_ROOT_DOMAINS } from "../features/scanner/utils/scanner-constants";
 import { loadCustomRootDomains } from "../features/scanner/utils/scanner-root-domains";
-import { useDashboardStats } from "../features/dashboard/hooks/useDashboardStats";
+import { useDomainCatalog, catalogProviderForTab } from "../features/domains/hooks/useDomainCatalog";
+import { DomainPagination } from "../features/domains/components/DomainPagination";
+import type { CatalogProvider } from "../../../shared/domain-catalog";
 import { AppShell } from "./AppShell";
 import {
   AccountsPage,
@@ -75,7 +77,7 @@ import { useDnsheDomains } from "../features/domains/hooks/useDnsheDomains";
 import { useDomainActions } from "../features/domains/hooks/useDomainActions";
 import { useDomainSync } from "../features/domains/hooks/useDomainSync";
 import { useNameservers } from "../features/domains/hooks/useNameservers";
-import { domainKeyCandidates } from "../lib/domain-keys";
+import { domainKeyCandidates, normalizeDomainKey } from "../lib/domain-keys";
 import { useCfExpiry } from "../features/cloudflare/hooks/useCfExpiry";
 import { useCfZones } from "../features/cloudflare/hooks/useCfZones";
 import { CfZoneCard } from "../features/cloudflare/components/CfZoneCard";
@@ -112,27 +114,49 @@ export function useAppControllerView() {
     toast,
     showToast,
 } = useAppData();
+  const catalog = useDomainCatalog(activeTab, globalSearch);
+  const dnshePage = catalog.source("dnshe");
+  const customPage = catalog.source("custom");
+  const currentProvider = catalogProviderForTab(activeTab);
+  const currentPage = currentProvider ? catalog.source(currentProvider) : null;
+  const focusedDomain = currentPage?.focus ? normalizeDomainKey(currentPage.focus) : "";
+  const catalogCard = (domain: { full_domain: string; id?: number }, card: React.ReactNode) => (
+    <div key={domain.id ?? normalizeDomainKey(domain.full_domain)} data-catalog-domain={normalizeDomainKey(domain.full_domain)}
+      className={normalizeDomainKey(domain.full_domain) === focusedDomain ? "rounded-xl ring-2 ring-accent" : undefined}>{card}</div>
+  );
+  useEffect(() => {
+    if (!focusedDomain || currentPage?.loading || currentPage?.error) return;
+    const find = () => {
+      const element = document.querySelector(`[data-catalog-domain="${CSS.escape(focusedDomain)}"]`);
+      if (!element) return false;
+      element.scrollIntoView({ behavior: "smooth", block: "center" }); return true;
+    };
+    if (find()) return;
+    const observer = new MutationObserver(() => { if (find()) observer.disconnect(); });
+    observer.observe(document.body, { childList: true, subtree: true });
+    return () => observer.disconnect();
+  }, [focusedDomain, activeTab, currentPage?.loading, currentPage?.error]);
 
   // 侧栏 / 抽屉 / 断点状态已随外壳(useAppLayout)下沉到 app/AppShell,
   // App 不再持有这些量 —— 它们在外壳之外没有任何消费点。
 
   const {
-    domains, setDomains, quotas, setQuotas, logs, setLogs,
-    loadingDomains, setLoadingDomains, loadingQuotas, setLoadingQuotas,
+    quotas, setQuotas, logs, setLogs,
+    loadingQuotas, setLoadingQuotas,
     loadingLogs, setLoadingLogs, actionLoading, setActionLoading,
     selectedAccountFilter, setSelectedAccountFilter, openActionMenuId, setOpenActionMenuId,
     bindModalOpen, setBindModalOpen, editingAccount, setEditingAccount,
   } = useAppDataState();
+  const domains = dnshePage.domains;
+  const loadingDomains = dnshePage.loading;
 
   // DNSHE 域名页的分组 / 搜索 / 折叠状态（实现见 features/domains/hooks/useDnsheDomains）
   // NOTE: 必须在 domains 声明之后调用；accounts 已在 AppDataProvider 解构、globalSearch 在其上方，均可见。
   const {
     collapsedAccounts,
     persistCollapsed,
-    domainMatchesKeyword,
     dnsheAccounts,
     groupedDomains,
-    searchHitCount,
     toggleAccountCollapse,
     toggleAllAccounts,
   } = useDnsheDomains(domains, accounts, globalSearch);
@@ -290,35 +314,7 @@ export function useAppControllerView() {
 
   // 1. 获取所有域名列表（支持按账号筛选）
   const fetchDomains = async (accountIdFilter?: string) => {
-    setLoadingDomains(true);
-    try {
-      const targetAcc = accountIdFilter ?? selectedAccountFilter;
-      const accParam = targetAcc && targetAcc !== "all" ? `&account_id=${targetAcc}` : "";
-      const res = await apiFetch(`/api/domains?${accParam}`);
-      const data = await res.json();
-      if (data.success) {
-        const list: Domain[] = data.domains || [];
-        setDomains(list);
-        // 没有 DNSHE 账号时不做根域 NS 查询：
-        // 该结论只用于 DNSHE 线路支持判定，提前对公共根域做 DoH 查询没有业务价值，
-        // 反而会在大陆网络环境下产生大量预期内的 Cloudflare/Google DoH 超时日志。
-        if (dnsheAccounts.length > 0) {
-          const roots = Array.from(
-            new Set([
-              ...list.map((d) => String(d.rootdomain ?? "").trim().toLowerCase()),
-              ...scannerRootDomains.map((r) => String(r || "").trim().toLowerCase())
-            ])
-          ).filter(Boolean);
-          void fetchRootNs(roots);
-        }
-      } else {
-        showToast("error", data.message || "拉取域名列表失败");
-      }
-    } catch (e) {
-      showToast("error", "网络连接异常，无法获取域名列表");
-    } finally {
-      setLoadingDomains(false);
-    }
+    await dnshePage.refresh(accountIdFilter ?? selectedAccountFilter);
   };
 
   // ===== 数据导入 / 导出（实现见 features/data/hooks/useDataTransfer） =====
@@ -369,9 +365,7 @@ export function useAppControllerView() {
 
   /** 刷新全部托管商的域名列表（会话初始化 / 全量同步后用） */
   const refreshAllProviderDomains = () => {
-    fetchCfZones();
-    fetchDpDomains();
-    MULTI_PROVIDER_ORDER.forEach((key) => fetchMultiProviderDomains(key));
+    catalog.invalidateAll();
   };
 
   // Job status is authoritative; cache fingerprints and arbitrary delays cannot prove completion.
@@ -411,15 +405,16 @@ export function useAppControllerView() {
     handleCfUpdateAccount,
     cfToggleAccountCollapse,
     cfToggleAllAccounts,
-  } = useCfZones({ setActionLoading, waitForAccountDomainSync });
+  } = useCfZones({ setActionLoading, waitForAccountDomainSync, page: catalog.source("cloudflare") });
   // CF「跨来源跳转 + 跳转后定位高亮」（实现见 features/cloudflare/hooks/useCfZoneHighlight）
-  const { cfHighlightZoneId, gotoCfZone } = useCfZoneHighlight({
+  const { cfHighlightZoneId, gotoCfZone: gotoLoadedCfZone } = useCfZoneHighlight({
     activeTab,
     cfZones,
     cfCollapsedAccounts,
     persistCfCollapsed,
     setActiveTab,
   });
+  const gotoCfZone = (name: string) => { catalog.locate("cloudflare", name); setCfAccountFilter("all"); persistCfCollapsed(new Set()); setGlobalSearch(""); gotoLoadedCfZone(name); };
 
   // ===== DigitalPlat 标签页状态（域名列表 / 筛选 / 折叠 / 分组 / 同步）=====
   // 实现见 features/digitalplat/hooks/useDpDomains。调用点前置于所有 dpDomains
@@ -441,10 +436,10 @@ export function useAppControllerView() {
     setDpEditingAccount,
     handleDpDeleteAccount,
     handleDpUpdateAccount,
-  } = useDpDomains({ setActionLoading, waitForAccountDomainSync });
+  } = useDpDomains({ setActionLoading, waitForAccountDomainSync, page: catalog.source("digitalplat") });
 
   // DP「跨来源跳转 + 跳转后定位高亮」（实现见 features/digitalplat/hooks/useDpZoneHighlight）
-  const { dpHighlightDomainId, gotoDpDomain } = useDpZoneHighlight({
+  const { dpHighlightDomainId, gotoDpDomain: gotoLoadedDpDomain } = useDpZoneHighlight({
     activeTab,
     dpDomains,
     dpAccountFilter,
@@ -453,6 +448,7 @@ export function useAppControllerView() {
     persistDpCollapsed,
     setActiveTab,
   });
+  const gotoDpDomain = (name: string) => { catalog.locate("digitalplat", name); setDpAccountFilter("all"); persistDpCollapsed(new Set()); setGlobalSearch(""); gotoLoadedDpDomain(name); };
 
   const { fetchQuotas, fetchLogs, handleClearLogs } = useAppControllerDataActions({
     apiFetch,
@@ -499,7 +495,9 @@ export function useAppControllerView() {
     multiToggleAccountCollapse,
     handleMultiUpdateAccount,
     handleMultiDeleteAccount,
-  } = useMultiProviders({ setActionLoading, waitForAccountDomainSync, handleSyncAccount });
+  } = useMultiProviders({ setActionLoading, waitForAccountDomainSync, handleSyncAccount, pages: {
+    dnspod: catalog.source("dnspod"), alidns: catalog.source("alidns"), huaweicloud: catalog.source("huaweicloud"), vercel: catalog.source("vercel"),
+  } });
 
   // 跨来源聚合搜索：见下方 useCustomProviders 之后（消费 multiProviderData / customDomains）。
 
@@ -617,7 +615,7 @@ export function useAppControllerView() {
     setCustomGroupFilter,
     customGroupList,
     customAccounts,
-    customDomains,
+    customMetadataError,
     loadingCustomDomains,
     groupedCustomDomains,
     customCollapsedGroups,
@@ -672,7 +670,8 @@ export function useAppControllerView() {
     handleDeleteCustomAccount,
     handleDeleteCustomDomain,
     handleDeleteCustomGroup,
-  } = useCustomProviders({ isPermanentExpiry });
+    persistCustomCollapsed,
+  } = useCustomProviders({ isPermanentExpiry, page: customPage });
 
   const { invalidateQuotaTabCache } = useAppControllerDataEffects({
     sessionToken,
@@ -680,7 +679,7 @@ export function useAppControllerView() {
     fetchAccounts,
     fetchDomains,
     refreshAllProviderDomains,
-    fetchCustomDomains,
+    fetchCustomDomains: () => fetchCustomDomains(false),
     fetchLogs,
     fetchQuotas: () => { void fetchQuotas(); },
     fetchSettings: () => { void fetchSettings(); },
@@ -692,50 +691,46 @@ export function useAppControllerView() {
   // 下方的聚合下拉展示与跳转。
   // NOTE: 消费 multiProviderData 与 customDomains，故必须晚于 useMultiProviders /
   //       useCustomProviders 的调用点。
-  const crossSourceSearch = useMemo(() => {
-    const kw = globalSearch.trim().toLowerCase();
-    if (!kw) return null;
-    const dnsheHits = domains.filter((d) => domainMatchesKeyword(d.full_domain, kw));
-    const cfHits = cfZones.filter((z) => domainMatchesKeyword(z.full_domain, kw));
-    const dpHits = dpDomains.filter((d) => domainMatchesKeyword(d.full_domain, kw));
-    const multiHits = {} as Record<MultiProviderKey, Domain[]>;
-    MULTI_PROVIDER_ORDER.forEach((key) => {
-      multiHits[key] = multiProviderData[key].filter((d) => domainMatchesKeyword(d.full_domain, kw));
-    });
-    const customHits = customDomains.filter((d) => domainMatchesKeyword(d.full_domain, kw));
-    return { kw, dnsheHits, cfHits, dpHits, multiHits, customHits };
-  }, [globalSearch, domains, cfZones, dpDomains, multiProviderData, customDomains]);
+  const groups = catalog.result?.groups;
+  const crossSourceSearch = groups ? {
+    kw: catalog.result!.query, dnsheHits: groups.dnshe.items, cfHits: groups.cloudflare.items, dpHits: groups.digitalplat.items,
+    multiHits: { dnspod: groups.dnspod.items, alidns: groups.alidns.items, huaweicloud: groups.huaweicloud.items, vercel: groups.vercel.items },
+    customHits: groups.custom.items, totals: { dnshe: groups.dnshe.total, cf: groups.cloudflare.total, dp: groups.digitalplat.total,
+      custom: groups.custom.total, dnspod: groups.dnspod.total, alidns: groups.alidns.total, huaweicloud: groups.huaweicloud.total, vercel: groups.vercel.total },
+  } : null;
+  const hints = currentPage?.hints || {};
 
   const cfZoneFullDomainSet = useMemo(
-    () => new Set(cfZones.flatMap((z) => domainKeyCandidates(String(z.full_domain || "")))),
+    () => new Set([...cfZones.flatMap((z) => domainKeyCandidates(String(z.full_domain || ""))), ...Object.keys(hints).filter(key => hints[key].providers.includes("cloudflare"))]),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [cfZones]
+    [cfZones, hints]
   );
 
   // DNSHE 注册域名集合，供 CF zone 卡片显示「DNSHE 注册」标识
   const dnsheFullDomainSet = useMemo(
-    () => new Set(domains.flatMap((d) => domainKeyCandidates(String(d.full_domain || "")))),
+    () => new Set([...domains.flatMap((d) => domainKeyCandidates(String(d.full_domain || ""))), ...Object.keys(hints).filter(key => hints[key].providers.includes("dnshe"))]),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [domains]
+    [domains, hints]
   );
 
   // DigitalPlat 账号域名集合，供 CF zone 卡片显示「DigitalPlat 注册」跳转提示
   const dpDomainFullDomainSet = useMemo(
-    () => new Set(dpDomains.flatMap((d) => domainKeyCandidates(String(d.full_domain || "")))),
+    () => new Set([...dpDomains.flatMap((d) => domainKeyCandidates(String(d.full_domain || ""))), ...Object.keys(hints).filter(key => hints[key].providers.includes("digitalplat"))]),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [dpDomains]
+    [dpDomains, hints]
   );
 
   // Cloudflare zone 注册/到期时间：缓存 + 手动覆盖 + RDAP 自动查询（实现见 features/cloudflare/hooks/useCfExpiry）
   // NOTE: 必须在 cfZones / dpDomains / dnsheFullDomainSet / dpDomainFullDomainSet 之后调用；
   //       内部 effect 依赖 activeTab/cfZones，返回的 cfZoneDateInfo 供卡片与编辑弹窗共用。
-  const { cfExpiryMap, persistCfExpiryMap, cfZoneDateInfo } = useCfExpiry({
+  const { cfExpiryMap, persistCfExpiryMap: persistLocalCfExpiry, cfZoneDateInfo } = useCfExpiry({
     activeTab,
     cfZones,
     domains,
     dpDomains,
     dnsheFullDomainSet,
     dpDomainFullDomainSet,
+    hints,
   });
 
   // 打开 CF zone 注册信息编辑弹窗（手动值由弹窗挂载时自行预填，见 features/cloudflare/components/CfEditModal）
@@ -747,6 +742,9 @@ export function useAppControllerView() {
 
   // 交叉提示跳转（CF zone 卡片「注册来源 = DNSHE」→ DNSHE 域名列表页）：切页、清搜索、展开账号并定位
   const gotoDnsheDomain = (fullDomain: string) => {
+    catalog.locate("dnshe", fullDomain);
+    setSelectedAccountFilter("all");
+    persistCollapsed(new Set());
     const keys = domainKeyCandidates(String(fullDomain || ""));
     const dom = domains.find((d) =>
       domainKeyCandidates(String(d.full_domain || "")).some((k) => keys.includes(k))
@@ -777,7 +775,7 @@ export function useAppControllerView() {
     };
   }, [dnsheHighlightDomainId, activeTab]);
 
-  const { toJumpSource, handleCrossSourceJump } = useAppControllerNavigation({
+  const { toJumpSource } = useAppControllerNavigation({
     activeTab,
     setActiveTab,
     setGlobalSearch,
@@ -787,6 +785,17 @@ export function useAppControllerView() {
     gotoCfZone,
     gotoDpDomain,
   });
+  const persistCfExpiryMap = (map: Parameters<typeof persistLocalCfExpiry>[0], touchTs = true) => {
+    persistLocalCfExpiry(map, touchTs); void catalog.refreshSummary();
+  };
+  const handleCrossSourceJump = (source: JumpSource, name: string) => {
+    if (source === "dnshe") return gotoDnsheDomain(name);
+    if (source === "cf") return gotoCfZone(name);
+    if (source === "dp") return gotoDpDomain(name);
+    if (source === "custom") { setCustomGroupFilter("all"); persistCustomCollapsed(new Set()); }
+    else { setMultiProviderFilter(prev => ({ ...prev, [source]: "all" })); }
+    catalog.locate(source as CatalogProvider, name); setGlobalSearch(""); setActiveTab(source);
+  };
 
   // 渲染单个 Cloudflare zone 卡片（渲染本体见 features/cloudflare/components/CfZoneCard，Phase 5-4b 抽出）
   //
@@ -953,28 +962,35 @@ export function useAppControllerView() {
     knownRootDomains,
   } = useLineDnsSettings({
     domains,
-    scannerRootDomains,
+    scannerRootDomains: [...scannerRootDomains, ...(catalog.summary?.root_domains || [])],
     dnsheAccountCount: dnsheAccounts.length,
     apiFetch,
     showToast,
     setActionLoading,
   });
+  // Preserve line-DNS inference, but only resolve roots used by the current page.
+  useEffect(() => {
+    if (!sessionToken || activeTab !== "domains" || loadingDomains || !dnsheAccounts.length) return;
+    const roots = [...new Set([...domains.map(domain => domain.rootdomain), ...scannerRootDomains].filter(Boolean))];
+    void fetchRootNs(roots);
+  }, [sessionToken, activeTab, loadingDomains, domains, dnsheAccounts.length, scannerRootDomains]);
 
   // 动态服务商菜单项：按该服务商账号的「最早添加时间」动态排序
   // 只有真正绑定了账号的服务商才会显示，且不再受 loadingAccounts 影响，杜绝刷新时一闪而过的闪烁。
   const providerNavItems = useMemo(
     () =>
       buildProviderNavItems(accounts, {
-        dnshe: domains.length,
-        cloudflare: cfZones.length,
-        digitalplat: dpDomains.length,
-        dnspod: multiProviderData.dnspod.length,
-        alidns: multiProviderData.alidns.length,
-        huaweicloud: multiProviderData.huaweicloud.length,
-        vercel: multiProviderData.vercel.length,
+         dnshe: catalog.summary?.provider_counts.dnshe || 0,
+         cloudflare: catalog.summary?.provider_counts.cloudflare || 0,
+         digitalplat: catalog.summary?.provider_counts.digitalplat || 0,
+         dnspod: catalog.summary?.provider_counts.dnspod || 0,
+         alidns: catalog.summary?.provider_counts.alidns || 0,
+         huaweicloud: catalog.summary?.provider_counts.huaweicloud || 0,
+         vercel: catalog.summary?.provider_counts.vercel || 0,
       }),
     [
-      accounts,
+       accounts,
+       catalog.summary,
       domains.length,
       cfZones.length,
       dpDomains.length,
@@ -987,26 +1003,14 @@ export function useAppControllerView() {
 
   /** 实际渲染的侧栏菜单项:概览 + 动态排序的服务商 + 自定义 + 管理项 */
   const visibleNavItems = useMemo(
-    () => buildVisibleNavItems(providerNavItems, customDomains.length, accounts.length),
-    [providerNavItems, customDomains.length, accounts.length]
+    () => buildVisibleNavItems(providerNavItems, catalog.summary?.provider_counts.custom || 0, accounts.length),
+    [providerNavItems, catalog.summary, accounts.length]
   );
 
   const { alertLogs, unreadAlert, markAlertsRead, filteredLogs } = useAppAlerts(logs, logCategory);
 
   // Dashboard 概览统计（实现见 features/dashboard/hooks/useDashboardStats）
-  const dashboardStats = useDashboardStats({
-    domains,
-    cfZones,
-    dpDomains,
-    customDomains,
-    multiProviderDomains: multiProviderData,
-    dnsheAccounts,
-    cfAccountList,
-    dpAccountList,
-    customGroupList,
-    multiProviderAccounts: multiProviderAccountLists,
-    cfExpiryMap,
-  });
+  const dashboardStats = catalog.summary?.stats;
 
   // 顶部搜索提交：跳转到域名页并带入搜索词
   const handleGlobalSearchSubmit = () => {
@@ -1036,6 +1040,7 @@ export function useAppControllerView() {
       searchFocused={searchFocused}
       setSearchFocused={setSearchFocused}
       crossSourceSearch={crossSourceSearch}
+      searchStatus={catalog.searchError || (globalSearch.trim() && !crossSourceSearch ? "正在搜索全部来源…" : "")}
       onGlobalSearchSubmit={handleGlobalSearchSubmit}
       onCrossSourceJump={handleCrossSourceJump}
       notifOpen={notifOpen}
@@ -1051,8 +1056,9 @@ export function useAppControllerView() {
     >
       {/* 标签页均为 React.lazy 按需加载的独立 chunk，切换时展示统一骨架 */}
       <LazyBoundary resetKey={activeTab} label="页面">
+         {catalog.summaryError && dashboardStats && <p role="alert" className="p-3 text-content-muted">摘要刷新失败，以下保留上次结果：{catalog.summaryError}</p>}
         {/* Tab 0: Dashboard 概览 */}
-        {activeTab === "dashboard" && (
+         {activeTab === "dashboard" && dashboardStats && (
           <DashboardPage
             stats={dashboardStats}
             syncing={actionLoading === "sync-all"}
@@ -1061,19 +1067,27 @@ export function useAppControllerView() {
             onJump={handleCrossSourceJump}
             toJumpSource={toJumpSource}
           />
-        )}
+         )}
+         {activeTab === "dashboard" && !dashboardStats && (
+           <div role={catalog.summaryError ? "alert" : "status"} className="p-6">
+             {catalog.summaryError || "正在读取全量域名摘要…"}
+             <button className="ml-3 underline" onClick={() => void catalog.refreshSummary()}>重试</button>
+           </div>
+         )}
+         {currentPage && <DomainPagination page={currentPage} />}
 
         {/* Tab 1: 域名列表 */}
-        {activeTab === "domains" && (
-          <DomainsPage
+        {activeTab === "domains" && !dnshePage.error && (
+           <DomainsPage
+             counts={dnshePage.account_counts}
             selectedAccountFilter={selectedAccountFilter}
             onSelectAccountFilter={setSelectedAccountFilter}
             dnsheAccounts={dnsheAccounts}
             fetchDomains={fetchDomains}
             globalSearch={globalSearch}
             onClearSearch={() => setGlobalSearch("")}
-            searchHitCount={searchHitCount}
-            domainsCount={domains.length}
+             searchHitCount={dnshePage.total}
+             domainsCount={dnshePage.total}
             actionLoading={actionLoading}
             onSyncDnsheDomains={handleSyncDnsheDomains}
             collapsedAccounts={collapsedAccounts}
@@ -1083,13 +1097,15 @@ export function useAppControllerView() {
             checkHasDns={checkHasDns}
             onToggleAccountCollapse={toggleAccountCollapse}
             onSyncAccount={handleSyncAccount}
-            renderDomainCard={renderDomainCard}
+             renderDomainCard={dom => catalogCard(dom, renderDomainCard(dom))}
           />
         )}
 
         {/* Tab 1.5: Cloudflare 独立标签页 */}
-        {activeTab === "cloudflare" && (
-          <CfZonesPage
+        {activeTab === "cloudflare" && !catalog.pages.cloudflare.error && (
+           <CfZonesPage
+             totalCount={catalog.pages.cloudflare.total}
+             counts={catalog.pages.cloudflare.account_counts}
             cfAccountFilter={cfAccountFilter}
             setCfAccountFilter={setCfAccountFilter}
             cfAccountList={cfAccountList}
@@ -1107,14 +1123,16 @@ export function useAppControllerView() {
             cfToggleAccountCollapse={cfToggleAccountCollapse}
             handleSyncAccount={handleSyncAccount}
             fetchCfZones={fetchCfZones}
-            renderCfZoneCard={renderCfZoneCard}
+             renderCfZoneCard={dom => catalogCard(dom, renderCfZoneCard(dom))}
             onGotoAccounts={() => setActiveTab("accounts")}
           />
         )}
 
         {/* DigitalPlat 标签页（结构与 Cloudflare 标签页同构：账号分组 → 域名卡片 → DNS 面板） */}
-        {activeTab === "digitalplat" && (
-          <DpZonesPage
+        {activeTab === "digitalplat" && !catalog.pages.digitalplat.error && (
+           <DpZonesPage
+             totalCount={catalog.pages.digitalplat.total}
+             counts={catalog.pages.digitalplat.account_counts}
             dpAccountFilter={dpAccountFilter}
             setDpAccountFilter={setDpAccountFilter}
             dpAccountList={dpAccountList}
@@ -1128,7 +1146,7 @@ export function useAppControllerView() {
             dpToggleAccountCollapse={dpToggleAccountCollapse}
             handleSyncAccount={handleSyncAccount}
             fetchDpDomains={fetchDpDomains}
-            renderDpDomainCard={renderDpDomainCard}
+             renderDpDomainCard={dom => catalogCard(dom, renderDpDomainCard(dom))}
             onGotoAccounts={() => setActiveTab("accounts")}
           />
         )}
@@ -1137,8 +1155,10 @@ export function useAppControllerView() {
             共用同一段渲染，靠 key 切换到各自的数据槽位 */}
         {MULTI_PROVIDER_ORDER.map(
           (key) =>
-            activeTab === key && (
-              <MultiProviderPage
+            activeTab === key && !catalog.pages[key].error && (
+               <MultiProviderPage
+                 totalCount={catalog.pages[key].total}
+                 counts={catalog.pages[key].account_counts}
                 providerKey={key}
                 accountFilter={multiProviderFilter[key]}
                 setAccountFilter={(v) =>
@@ -1161,20 +1181,21 @@ export function useAppControllerView() {
                 onToggleAccountCollapse={(accountId) => multiToggleAccountCollapse(key, accountId)}
                 onSyncAccount={(accountId) => multiSyncOneAccount(key, accountId)}
                 onFetchDomains={(f) => fetchMultiProviderDomains(key, f)}
-                renderDomainCard={(dom) => renderMultiProviderDomainCard(key, dom)}
+                 renderDomainCard={(dom) => catalogCard(dom, renderMultiProviderDomainCard(key, dom))}
                 onGotoAccounts={() => setActiveTab("accounts")}
               />
             )
         )}
 
         {/* 自定义服务商（无 API 的社区公益域名，三层：分组 → 账号 → 域名） */}
-        {activeTab === "custom" && (
+        {activeTab === "custom" && !customPage.error && (
           <CustomProvidersPage
             customGroupFilter={customGroupFilter}
             setCustomGroupFilter={setCustomGroupFilter}
             customGroupList={customGroupList}
-            customAccountCount={customAccounts.length}
-            customDomainCount={customDomains.length}
+             customAccountCount={customMetadataError || (loadingCustomDomains && !customAccounts.length) ? undefined : customAccounts.length}
+             metadataError={customMetadataError}
+             customDomainCount={customPage.total}
             loadingCustomDomains={loadingCustomDomains}
             groupedCustomDomains={groupedCustomDomains}
             customCollapsedGroups={customCollapsedGroups}
@@ -1188,7 +1209,7 @@ export function useAppControllerView() {
             }
             onRequestDeleteGroup={setCustomDeleteGroup}
             onRequestDeleteAccount={(acc) => setCustomDeleteAccount(acc as CustomAccount)}
-            renderDomainCard={renderCustomDomainCard}
+             renderDomainCard={(groupId, groupAlias, acc, dom) => catalogCard(dom, renderCustomDomainCard(groupId, groupAlias, acc, dom))}
           />
         )}
 

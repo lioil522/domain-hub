@@ -55,11 +55,13 @@ export const createApiFetch = ({ backendUrl, onSessionExpired }: ApiFetchDeps): 
 
     try {
       const res = await fetch(finalUrl, { ...options, headers });
+      if (options.signal?.aborted) throw new DOMException("Request aborted", "AbortError");
       if (res.status === 401 || res.status === 403) {
         // Business-level 401/403 (password / TOTP / permissions) must not log the user out.
         const isAuthEndpoint = url.startsWith("/api/auth/login") || url.startsWith("/api/auth/setup") || url.startsWith("/api/auth/status");
         const payload = await res.clone().json().catch(() => null) as { error_code?: string } | null;
-        if (!isAuthEndpoint && (payload?.error_code === "session_expired" || payload?.error_code === "unauthorized")) {
+        if (!isAuthEndpoint && !options.signal?.aborted && readSessionToken() === token &&
+          (payload?.error_code === "session_expired" || payload?.error_code === "unauthorized")) {
           sessionStorage.removeItem(SESSION_KEY);
           localStorage.removeItem(SESSION_KEY);
           onSessionExpired();
@@ -68,7 +70,7 @@ export const createApiFetch = ({ backendUrl, onSessionExpired }: ApiFetchDeps): 
       return res;
     } catch (err) {
       // 遇网络连接异常自动提示配置后端服务
-      console.error("API Fetch Error:", err);
+      if (!options.signal?.aborted) console.error("API Fetch Error:", err);
       throw err;
     }
   };

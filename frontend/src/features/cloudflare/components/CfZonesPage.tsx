@@ -14,6 +14,7 @@ import { CustomSelect } from "../../../components/form/CustomSelect";
 import { CloudflareIcon } from "../../../components/icons/CloudflareIcon";
 import type { Account } from "../../../types/account";
 import type { Domain } from "../../../types/domain";
+import type { CatalogCount } from "../../../../../shared/domain-catalog";
 
 /**
  * Cloudflare 标签页（zone 列表页）
@@ -27,6 +28,8 @@ import type { Domain } from "../../../types/domain";
  * 页面三态：加载中 → 未绑定账号 → 按账号分组的 zone 卡片网格。
  */
 export interface CfZonesPageProps {
+  totalCount?: number;
+  counts?: Record<string, CatalogCount>;
   /** 账号筛选（"all" 或账号 id 字符串） */
   cfAccountFilter: string;
   setCfAccountFilter: (v: string) => void;
@@ -104,7 +107,7 @@ export function CfZonesPage(props: CfZonesPageProps) {
           </div>
           <div className="text-xs text-content-muted font-mono whitespace-nowrap">
             已绑定账号: <span className="text-accent font-bold">{cfAccountList.length}</span> |
-            托管 zones: <span className="text-emerald-400 font-bold">{cfZones.length}</span> 个
+            托管 zones: <span className="text-emerald-400 font-bold">{props.totalCount ?? cfZones.length}</span> 个
           </div>
         </div>
 
@@ -193,7 +196,7 @@ export function CfZonesPage(props: CfZonesPageProps) {
                       <CloudflareIcon className="w-4 h-4 shrink-0" />
                       <span className="text-accent-strong dark:text-accent truncate max-w-full">{group.alias}</span>
                       <span className="text-[11px] md:text-xs bg-accent-soft text-accent border border-accent/20 px-2 md:px-2.5 py-0.5 rounded-full font-normal">
-                        {group.zones.length} 个 zone
+                        {props.counts?.[group.accountId]?.total ?? group.zones.length} 个 zone · 本页 {group.zones.length}
                       </span>
                     </h3>
                   </button>

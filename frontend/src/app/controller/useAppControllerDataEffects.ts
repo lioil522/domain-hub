@@ -18,8 +18,6 @@ export function useAppControllerDataEffects({
   sessionToken,
   activeTab,
   fetchAccounts,
-  fetchDomains,
-  refreshAllProviderDomains,
   fetchCustomDomains,
   fetchLogs,
   fetchQuotas,
@@ -36,9 +34,7 @@ export function useAppControllerDataEffects({
     if (!sessionToken) return;
     tabDataFetchedAtRef.current = {};
     fetchAccounts();
-    fetchDomains();
-    refreshAllProviderDomains();
-    fetchCustomDomains();
+    // Domain pages and global summary have independent bounded query lifecycles.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionToken]);
 

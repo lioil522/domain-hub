@@ -54,6 +54,7 @@ export interface AppShellProps {
   setSearchFocused: (v: boolean) => void;
   /** 跨来源聚合命中(无命中时为 null,不渲染下拉) */
   crossSourceSearch: CrossSourceResult | null;
+  searchStatus?: string;
   onGlobalSearchSubmit: () => void;
   onCrossSourceJump: (source: JumpSource, fullDomain: string) => void;
 
@@ -88,6 +89,7 @@ export function AppShell(props: AppShellProps) {
     searchFocused,
     setSearchFocused,
     crossSourceSearch,
+    searchStatus,
     onGlobalSearchSubmit,
     onCrossSourceJump,
     notifOpen,
@@ -300,6 +302,9 @@ export function AppShell(props: AppShellProps) {
               className="form-input w-full pl-9 pr-3 py-2 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
             />
             {/* 跨来源聚合搜索下拉:输入关键词且聚焦时展示各来源命中 */}
+            {searchFocused && globalSearch.trim() && !crossSourceSearch && searchStatus && (
+              <div role="status" className="absolute top-full left-0 right-0 bg-surface p-4 rounded-xl shadow-lg z-50">{searchStatus}</div>
+            )}
             {searchFocused && globalSearch.trim() && crossSourceSearch && (
               <div
                 className="!absolute left-0 right-0 top-full mt-1.5 max-h-80 overflow-y-auto dropdown-panel"

@@ -7,23 +7,14 @@ const CUSTOM_COLLAPSED_LS_KEY = "DOMAIN_HUB_CUSTOM_COLLAPSED_GROUPS";
 
 export function useCustomProvidersState() {
   const [customGroupFilter, setCustomGroupFilter] = useState<string>("all");
-  const readCustomCache = (): { accounts: CustomAccount[]; domains: CustomDomain[] } => {
-    try {
-      const raw = localStorage.getItem(CUSTOM_CACHE_LS_KEY);
-      if (!raw) return { accounts: [], domains: [] };
-      const parsed = JSON.parse(raw) as { accounts?: CustomAccount[]; domains?: CustomDomain[] };
-      return { accounts: Array.isArray(parsed.accounts) ? parsed.accounts : [], domains: Array.isArray(parsed.domains) ? parsed.domains : [] };
-    } catch {
-      return { accounts: [], domains: [] };
-    }
-  };
   const persistCustomCache = (accounts: CustomAccount[], domains: CustomDomain[]) => {
     try { localStorage.setItem(CUSTOM_CACHE_LS_KEY, JSON.stringify({ ts: Date.now(), accounts, domains })); } catch { /* storage unavailable */ }
   };
 
-  const [customAccounts, setCustomAccounts] = useState<CustomAccount[]>(() => readCustomCache().accounts);
-  const [customDomains, setCustomDomains] = useState<CustomDomain[]>(() => readCustomCache().domains);
+  const [customAccounts, setCustomAccounts] = useState<CustomAccount[]>([]);
+  const [customDomains, setCustomDomains] = useState<CustomDomain[]>([]);
   const [loadingCustomDomains, setLoadingCustomDomains] = useState(false);
+  const [customMetadataError, setCustomMetadataError] = useState<string | null>(null);
   const [customCollapsedGroups, setCustomCollapsedGroups] = useState<Set<number>>(() => {
     try {
       const raw = localStorage.getItem(CUSTOM_COLLAPSED_LS_KEY);
@@ -70,6 +61,7 @@ export function useCustomProvidersState() {
   }, [customNewGroupOpen]);
 
   return {
+    customMetadataError, setCustomMetadataError,
     customGroupFilter, setCustomGroupFilter, customAccounts, setCustomAccounts, customDomains, setCustomDomains, loadingCustomDomains, setLoadingCustomDomains,
     customCollapsedGroups, persistCustomCollapsed, persistCustomCache,
     customNewGroupOpen, setCustomNewGroupOpen, customNewGroupAlias, setCustomNewGroupAlias, customNewGroupWebsite, setCustomNewGroupWebsite,

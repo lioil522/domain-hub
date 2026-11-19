@@ -4,6 +4,7 @@ import { fetchExpiryDirect } from "../../../lib/rdap";
 import { formatDate } from "../../../lib/display-domain";
 import { domainKeyCandidates, isRegistrableDomain, normalizeDomainKey } from "../../../lib/domain-keys";
 import type { CfExpiryEntry, Domain } from "../../../types/domain";
+import type { CatalogHint } from "../../../../../shared/domain-catalog";
 
 /** CF zone 注册/到期时间的本地兜底缓存键（localStorage） */
 export const CF_EXPIRY_LS_KEY = "DOMAIN_HUB_CF_EXPIRY_CACHE_V1";
@@ -12,6 +13,7 @@ export const CF_EXPIRY_FRESH_MS = 6 * 3600 * 1000;
 
 /** `useCfExpiry` 的外部依赖 —— 由 `App.tsx` 注入 */
 export interface UseCfExpiryOptions {
+  hints?: Record<string, CatalogHint>;
   /** 当前激活标签页（仅 "cloudflare" 时触发拉取） */
   activeTab: string;
   /** 当前 CF zones 列表 */
@@ -49,6 +51,7 @@ export function useCfExpiry({
   dpDomains,
   dnsheFullDomainSet,
   dpDomainFullDomainSet,
+  hints = {},
 }: UseCfExpiryOptions) {
   const { apiFetch } = useAppData();
 
@@ -144,8 +147,12 @@ export function useCfExpiry({
       queried = true;
       // 后端回源失败的域名交给浏览器直查兜底（注册局拦的是 Worker 出口 IP，不是你的 IP）
       let needDirect: string[] = [];
+      // A list page may contain 100 zones. The expiry endpoint is bounded and a
+      // miss entails read + upstream + cache write; keep each request below its budget.
+      for (let offset = 0; offset < targets.length; offset += 15) {
+      const batch = targets.slice(offset, offset + 15);
       try {
-        const res = await apiFetch(`/api/expiry?domains=${encodeURIComponent(targets.join(","))}`);
+        const res = await apiFetch(`/api/expiry?domains=${encodeURIComponent(batch.join(","))}`);
         const data = await res.json();
         if (data.success && data.expiry) {
           for (const [k, v] of Object.entries(data.expiry as Record<string, CfExpiryEntry>)) {
@@ -163,11 +170,12 @@ export function useCfExpiry({
             }
           }
         } else {
-          needDirect = targets.filter((k) => !next[k]?.manual);
+          needDirect.push(...batch.filter((k) => !next[k]?.manual));
         }
       } catch {
         // 后端整体不可达时，也给浏览器直查一次机会
-        needDirect = targets.filter((k) => !next[k]?.manual);
+        needDirect.push(...batch.filter((k) => !next[k]?.manual));
+      }
       }
 
       if (needDirect.length > 0) {
@@ -213,25 +221,26 @@ export function useCfExpiry({
   // 而不是落到「—」，否则两边对永久域名的展示不一致。
   const cfZoneDateInfo = (zone: Domain) => {
     const zoneKeys = domainKeyCandidates(String(zone.full_domain || ""));
+    const hint = zoneKeys.map(key => hints[key]).find(Boolean);
     const isDnsheRegistered = zoneKeys.some((k) => dnsheFullDomainSet.has(k));
     const isDpRegistered = zoneKeys.some((k) => dpDomainFullDomainSet.has(k));
-    const dnsheMatch = isDnsheRegistered
+    const dnsheMatch = (isDnsheRegistered
       ? domains.find((d) => domainKeyCandidates(String(d.full_domain || "")).some((k) => zoneKeys.includes(k)))
-      : undefined;
-    const dpMatch = isDpRegistered
+      : undefined) || hint?.dnshe;
+    const dpMatch = (isDpRegistered
       ? dpDomains.find((d) => domainKeyCandidates(String(d.full_domain || "")).some((k) => zoneKeys.includes(k)))
-      : undefined;
+      : undefined) || hint?.digitalplat;
     const key = normalizeDomainKey(String(zone.full_domain || ""));
     // RDAP 结果按注册域（即完整域名本身，子域已被过滤不查）存，直接按完整域名取 key。
     const entry = cfExpiryMap[key];
     const manualEntry = entry?.manual ? entry : undefined;
     // DNSHE 命中：透传上游语义（空值用 0000 占位 → formatDate 显示「永久」）。
     // DNSHE 未命中：DP 优先，其次 RDAP。
-    const dnsheExpiryStr = dnsheMatch?.expires_at;
+    const dnsheExpiryStr = hint?.dnshe?.expires_at ?? dnsheMatch?.expires_at;
     const autoExpiryRaw = isDnsheRegistered
       ? (dnsheExpiryStr || "0000-00-00 00:00:00")
-      : (dpMatch?.expires_at || entry?.expires_at);
-    const dnsheRegisteredStr = dnsheMatch?.created_at;
+      : (hint?.digitalplat?.expires_at || dpMatch?.expires_at || entry?.expires_at);
+    const dnsheRegisteredStr = hint?.dnshe?.created_at ?? dnsheMatch?.created_at;
     const autoRegisteredRaw = isDnsheRegistered
       ? (dnsheRegisteredStr || "0000-00-00 00:00:00")
       : (dpMatch?.created_at || entry?.registered_at);

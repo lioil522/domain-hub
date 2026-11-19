@@ -83,7 +83,7 @@ export function registerCustomGroupRoutes(app: Hono<AppEnv>, deps: CustomGroupRo
     try {
       const [accounts, domains] = await Promise.all([
         dbManager.listAllCustomAccounts(),
-        dbManager.listAllCustomDomains(),
+        c.req.query("include_domains") === "0" ? Promise.resolve([]) : dbManager.listAllCustomDomains(),
       ]);
       return c.json(successRes({
         accounts,

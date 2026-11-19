@@ -41,3 +41,4 @@ Docker 修复后再次通过全量验证（192 个用例），并用打包后的
 - [通知 outbox（2026-11-18，本地验证阶段）](./NOTIFICATION_OUTBOX_PROGRESS_2026-11-18.md)
 - [概览统计口径（2026-11-18，本地验证阶段）](./DASHBOARD_STATS_PROGRESS_2026-11-18.md)
 - [前端入口体积与加载门禁（2026-11-18）](./FRONTEND_ENTRY_PROGRESS_2026-11-18.md)
+- [八类域名分页与全量摘要（2026-11-19）](./DOMAIN_PAGINATION_PROGRESS_2026-11-19.md)

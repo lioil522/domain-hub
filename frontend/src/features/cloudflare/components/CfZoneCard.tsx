@@ -7,8 +7,8 @@ import { ExternalLink, Globe, Pencil, Settings } from "lucide-react";
 export interface CfZoneDateInfo {
   isDnsheRegistered: boolean;
   isDpRegistered: boolean;
-  dnsheMatch?: Domain;
-  dpMatch?: Domain;
+  dnsheMatch?: Pick<Domain, "created_at" | "expires_at">;
+  dpMatch?: Pick<Domain, "created_at" | "expires_at">;
   entry?: CfExpiryEntry;
   manualEntry?: CfExpiryEntry;
   registeredText: string;

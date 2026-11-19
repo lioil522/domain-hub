@@ -5,9 +5,11 @@ import type { Domain } from "../../../types/domain";
 import type { MultiProviderKey } from "../../../types/provider";
 import { observeSyncAction, type WaitForAccountSync } from "../../domains/utils/sync-action";
 import { MULTI_PROVIDER_META, MULTI_PROVIDER_ORDER, MULTI_PROVIDER_COLLAPSED_STORAGE } from "../providerMeta";
+import type { DomainPageSource } from "../../domains/hooks/useDomainCatalog";
 
 /** `useMultiProviders` 的外部依赖 —— 由 `App.tsx` 注入 */
 export interface UseMultiProvidersOptions {
+  pages: Record<MultiProviderKey, DomainPageSource>;
   /** 动作级 loading 标记（App 的 `actionLoading` setter） */
   setActionLoading: (v: string | null) => void;
   /** 等待账号域名在后端落库后再刷新（App 的 `waitForAccountDomainSync`） */
@@ -46,6 +48,7 @@ export function useMultiProviders({
   setActionLoading,
   waitForAccountDomainSync,
   handleSyncAccount,
+  pages,
 }: UseMultiProvidersOptions) {
   const { apiFetch, showToast, accounts, fetchAccounts } = useAppData();
 
@@ -55,18 +58,8 @@ export function useMultiProviders({
   // 显示名、配色与凭据字段名。若各写一套 state（4 份 fetch + 4 份卡片渲染），光是
   // 同步维护就会失控（新增字段时改漏一个页面很常见）。收敛成表后四个页面共用同一
   // 段渲染代码。
-  const [multiProviderData, setMultiProviderData] = useState<Record<MultiProviderKey, Domain[]>>({
-    dnspod: [],
-    alidns: [],
-    huaweicloud: [],
-    vercel: [],
-  });
-  const [multiProviderLoading, setMultiProviderLoading] = useState<Record<MultiProviderKey, boolean>>({
-    dnspod: false,
-    alidns: false,
-    huaweicloud: false,
-    vercel: false,
-  });
+  const multiProviderData = { dnspod: pages.dnspod.domains, alidns: pages.alidns.domains, huaweicloud: pages.huaweicloud.domains, vercel: pages.vercel.domains };
+  const multiProviderLoading = { dnspod: pages.dnspod.loading, alidns: pages.alidns.loading, huaweicloud: pages.huaweicloud.loading, vercel: pages.vercel.loading };
   const [multiProviderFilter, setMultiProviderFilter] = useState<Record<MultiProviderKey, string>>({
     dnspod: "all",
     alidns: "all",
@@ -129,32 +122,17 @@ export function useMultiProviders({
         const group = byId.get(d.account_id);
         if (group) group.domains.push(d);
       });
-      grouped[key] = groups;
+      grouped[key] = groups.filter(group => group.domains.length || filter !== "all" || pages[key].total === 0);
     });
     return grouped;
-  }, [multiProviderAccountLists, multiProviderData, multiProviderFilter]);
+  }, [multiProviderAccountLists, multiProviderData, multiProviderFilter, pages]);
 
   // 2.4.2 获取四个新托管商账号的域名列表（后端默认排除这些行，需显式传 provider）
   //
   // NOTE: 四个页面共用这一个函数 —— 差异只有 provider 参数与显示名，靠 key 索引
   // 到 multiProviderData / multiProviderLoading 的对应槽位。
   const fetchMultiProviderDomains = async (key: MultiProviderKey, accountIdFilter?: string) => {
-    const targetAcc = accountIdFilter ?? multiProviderFilter[key];
-    const accParam = targetAcc && targetAcc !== "all" ? `&account_id=${targetAcc}` : "";
-    setMultiProviderLoading((prev) => ({ ...prev, [key]: true }));
-    try {
-      const res = await apiFetch(`/api/domains?provider=${key}${accParam}`);
-      const data = await res.json();
-      if (data.success) {
-        setMultiProviderData((prev) => ({ ...prev, [key]: data.domains || [] }));
-      } else {
-        showToast("error", data.message || `拉取 ${MULTI_PROVIDER_META[key].label} 域名失败`);
-      }
-    } catch (e) {
-      showToast("error", `网络连接异常，无法获取 ${MULTI_PROVIDER_META[key].label} 域名`);
-    } finally {
-      setMultiProviderLoading((prev) => ({ ...prev, [key]: false }));
-    }
+    await pages[key].refresh(accountIdFilter ?? multiProviderFilter[key]);
   };
 
   /**

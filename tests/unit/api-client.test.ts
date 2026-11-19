@@ -74,3 +74,28 @@ test("non-JSON authentication errors do not masquerade as session expiry", async
   assert.equal(await response.text(), "<html>proxy error</html>");
   assert.equal(sessionStorage.getItem(SESSION_KEY), "local-session");
 });
+
+test("cancelled stale requests cannot log out the current session or log expected cancellation as an error", async t => {
+  installStorage(t);
+  const controller = new AbortController();
+  t.mock.method(globalThis, "fetch", async () => {
+    controller.abort();
+    return Response.json({ success: false, error_code: "session_expired" }, { status: 401 });
+  });
+  const log = t.mock.method(console, "error", () => {});
+  const api = createApiFetch({ backendUrl: "", onSessionExpired() { assert.fail("Cancelled request logged out current session"); } });
+  await assert.rejects(() => api("/api/domains/page", { signal: controller.signal }), { name: "AbortError" });
+  assert.equal(sessionStorage.getItem(SESSION_KEY), "local-session");
+  assert.equal(log.mock.calls.length, 0);
+});
+
+test("an old token expiry response cannot invalidate a newly established session", async t => {
+  installStorage(t);
+  t.mock.method(globalThis, "fetch", async () => {
+    sessionStorage.setItem(SESSION_KEY, "new-session");
+    return Response.json({ success: false, error_code: "unauthorized" }, { status: 401 });
+  });
+  const api = createApiFetch({ backendUrl: "", onSessionExpired() { assert.fail("Old request invalidated new session"); } });
+  assert.equal((await api("/api/domains/page")).status, 401);
+  assert.equal(sessionStorage.getItem(SESSION_KEY), "new-session");
+});

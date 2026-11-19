@@ -39,6 +39,7 @@ export interface TimelineBucket {
   month: number;
   isCurrent: boolean;
   items: TimelineBucketItem[];
+  count?: number;
 }
 
 export interface DomainTimelineProps {
@@ -92,7 +93,7 @@ export function DomainTimeline(props: DomainTimelineProps) {
   } = props;
 
   // 展开态：默认展开最近一个「有域名到期」的桶，因为那是用户最可能关心的
-  const firstNonEmpty = buckets.findIndex((b) => b.items.length > 0);
+  const firstNonEmpty = buckets.findIndex((b) => (b.count ?? b.items.length) > 0);
   const [openKey, setOpenKey] = React.useState<string | null>(
     firstNonEmpty >= 0 ? buckets[firstNonEmpty].key : null
   );
@@ -142,11 +143,11 @@ export function DomainTimeline(props: DomainTimelineProps) {
               className="flex items-end gap-1 sm:gap-1.5 h-32"
               role="img"
               aria-label={`未来 12 个月域名到期分布，共 ${scheduledTotal} 个域名。逐月数量：${buckets
-                .map((b) => `${b.month}月 ${b.items.length} 个`)
+                .map((b) => `${b.month}月 ${b.count ?? b.items.length} 个`)
                 .join("，")}`}
             >
               {buckets.map((b) => {
-                const count = b.items.length;
+                const count = b.count ?? b.items.length;
                 const isOpen = openKey === b.key;
                 // 归一高度；有域名时保底 12% 高度
                 const heightPct = count === 0 ? 0 : Math.max(12, (count / maxCount) * 100);
@@ -243,9 +244,12 @@ export function DomainTimeline(props: DomainTimelineProps) {
                   {openBucket.year} 年 {openBucket.month} 月
                 </span>
                 <span className="text-[11px] text-content-muted">
-                  {openBucket.items.length} 个到期
+                  {openBucket.count ?? openBucket.items.length} 个到期
                 </span>
               </div>
+              {(openBucket.count ?? openBucket.items.length) > openBucket.items.length && (
+                <p className="px-4 py-2 text-xs text-content-muted">摘要展示前 {openBucket.items.length} 条；更多域名可通过列表搜索查看。</p>
+              )}
               <ul className="divide-y divide-border-soft">
                 {openBucket.items.map((item) => {
                   const ToneBadge = (

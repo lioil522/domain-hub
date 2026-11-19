@@ -3,6 +3,7 @@ import type { DBDomain } from "../db";
 import { RDAP_CACHE_PREFIX } from "../db";
 import type { CatalogProvider } from "../../shared/domain-catalog";
 import type { SummaryDomain } from "../../shared/dashboard-stats";
+import { CATALOG_REVISION_KEY, CATALOG_CACHE_PREFIX } from "../db/catalog-version";
 
 export interface CatalogRow extends SummaryDomain {
   id: number;
@@ -19,6 +20,29 @@ export interface CatalogCustomRow {
 interface SqlPageFilter { provider: CatalogProvider; filter?: number; status?: string; ids?: number[]; }
 export class DomainCatalogRepository {
   constructor(private readonly db: DatabaseManager) {}
+  cacheBinding() { return this.db.catalogCacheBinding(); }
+  revision() {
+    return this.db.firstRaw<{ value: string }>("SELECT value FROM settings WHERE key=?", [CATALOG_REVISION_KEY])
+      .then(row => row?.value ?? null);
+  }
+  cachedSummary(offset: number, now: number) {
+    const json = "CASE WHEN json_valid(value) THEN value ELSE '{}' END";
+    return this.db.firstRaw<{ value: string }>(`SELECT value FROM cache WHERE key=? AND expires_at>?
+      AND length(value)<=524288
+      AND json_extract(${json},'$.revision') IS (SELECT value FROM settings WHERE key=?)
+      AND json_extract(${json},'$.generated_at')<=? AND json_extract(${json},'$.valid_until')>?`,
+      [`${CATALOG_CACHE_PREFIX}${offset}`, Math.floor(now / 1000), CATALOG_REVISION_KEY, now, now])
+      .then(row => row?.value ?? null);
+  }
+  async storeSummary(offset: number, value: string, revision: string | null, validUntil: number) {
+    const row = await this.db.firstRaw<{ value: string }>("SELECT value FROM settings WHERE key=?", [CATALOG_REVISION_KEY]);
+    if ((row?.value ?? null) !== revision) return false;
+    await this.db.executeRaw(`INSERT INTO cache(key,value,expires_at)
+      SELECT ?,?,? WHERE (SELECT value FROM settings WHERE key=?) IS ?
+      ON CONFLICT(key) DO UPDATE SET value=excluded.value,expires_at=excluded.expires_at`,
+      [`${CATALOG_CACHE_PREFIX}${offset}`, value, Math.floor(validUntil / 1000), CATALOG_REVISION_KEY, revision]);
+    return (await this.revision()) === revision;
+  }
 
   // Compact projection is consumed on the server, never sent as a full browser inventory.
   projection() {
@@ -70,12 +94,12 @@ export class DomainCatalogRepository {
       WHERE lower(trim(d.full_domain,' .')) IN (SELECT value FROM json_each(?)) ORDER BY d.id`, [JSON.stringify(names)]);
   }
   accounts() { return this.db.allRaw<{ id: number; alias: string; provider: CatalogProvider }>("SELECT id,alias,provider FROM accounts ORDER BY id"); }
-  expiryMetadata() {
-    return this.db.allRaw<{ kind: "cache" | "manual"; full_domain: string; expires_at: string | null; value: string | null }>(`
-      SELECT 'cache' kind,substr(key,?) full_domain,NULL expires_at,value,'' updated_at,0 id
+  expiryMetadata(now = Date.now()) {
+    return this.db.allRaw<{ kind: "cache" | "manual"; full_domain: string; expires_at: string | null; value: string | null; cache_expires_at: number | null }>(`
+      SELECT 'cache' kind,substr(key,?) full_domain,NULL expires_at,value,expires_at cache_expires_at,'' updated_at,0 id
       FROM cache WHERE key LIKE ? AND expires_at>?
-      UNION ALL SELECT 'manual' kind,full_domain,expires_at,NULL value,updated_at,id
+      UNION ALL SELECT 'manual' kind,full_domain,expires_at,NULL value,NULL cache_expires_at,updated_at,id
       FROM domain_date_overrides ORDER BY kind,updated_at,id`,
-      [RDAP_CACHE_PREFIX.length + 1, `${RDAP_CACHE_PREFIX}%`, Math.floor(Date.now() / 1000)]);
+      [RDAP_CACHE_PREFIX.length + 1, `${RDAP_CACHE_PREFIX}%`, Math.floor(now / 1000)]);
   }
 }

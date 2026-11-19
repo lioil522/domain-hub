@@ -50,7 +50,7 @@ test("page cancellation prevents older filter responses and clears source data o
   const render = (tab, search = "") => <AppDataProvider><Probe tab={tab} search={search} /></AppDataProvider>;
   try {
     await act(async () => { tree = create(render("domains")); });
-    await act(async () => { t.mock.timers.tick(1); });
+    await act(async () => { t.mock.timers.tick(26); });
     assert.equal(requests.length, 1);
     await act(async () => { void model.source("dnshe").refresh("2"); });
     assert.equal(requests.length, 2);
@@ -180,4 +180,36 @@ test("search response validation requires all providers and bounded candidate li
   assert.equal(isCatalogSearchResponse(value), false);
   delete value.result.groups.custom;
   assert.equal(isCatalogSearchResponse(value), false);
+});
+
+test("a summary invalidated during its request is not published before the follow-up result", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const values = new Map([["DOMAIN_HUB_SESSION", "summary-test"]]);
+  const storage = { getItem: key => values.get(key) || null, setItem: (key, value) => values.set(key, value), removeItem: key => values.delete(key) };
+  const previous = { localStorage: globalThis.localStorage, sessionStorage: globalThis.sessionStorage, window: globalThis.window };
+  Object.assign(globalThis, { localStorage: storage, sessionStorage: storage, window: {
+    setTimeout: (...args) => globalThis.setTimeout(...args), clearTimeout: value => globalThis.clearTimeout(value),
+  } });
+  const requests = [];
+  t.mock.method(globalThis, "fetch", async () => { const request = deferred(); requests.push(request); return request.promise; });
+  let model, tree;
+  function Probe() { model = useDomainCatalog("dashboard", ""); return null; }
+  try {
+    await act(async () => { tree = create(<AppDataProvider><Probe /></AppDataProvider>); });
+    await act(async () => { t.mock.timers.tick(26); });
+    assert.equal(requests.length, 1);
+    await act(async () => { void model.refreshSummary(); });
+    await act(async () => { requests[0].resolve(Response.json(summaryResponse())); });
+    assert.equal(model.summary, null, "an invalidated old result must not appear as current");
+    await act(async () => { t.mock.timers.tick(26); });
+    assert.equal(requests.length, 2);
+    const latest = summaryResponse(); latest.summary.stats.total = 12_345; latest.summary.stats.active = 12_345;
+    latest.summary.provider_counts.dnshe = 12_345;
+    await act(async () => { requests[1].resolve(Response.json(latest)); });
+    assert.equal(model.summary.stats.total, 12_345);
+    assert.equal(model.refreshingSummary, false);
+  } finally {
+    if (tree) await act(async () => { tree.unmount(); });
+    Object.assign(globalThis, previous);
+  }
 });

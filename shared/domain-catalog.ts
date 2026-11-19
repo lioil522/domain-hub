@@ -8,6 +8,8 @@ export interface CatalogHint {
   digitalplat?: { id: number; expires_at: string; created_at?: string };
 }
 export interface CatalogSummary {
+  snapshot_at?: number;
+  valid_until?: number;
   stats: DashboardStats;
   provider_counts: Record<CatalogProvider, number>;
   account_counts: Record<string, CatalogCount>;

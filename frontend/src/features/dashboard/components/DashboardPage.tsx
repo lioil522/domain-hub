@@ -44,6 +44,9 @@ const DomainSourceBadge = ({ source }: { source: string }) => {
 };
 
 interface DashboardPageProps {
+  snapshotAt?: number;
+  refreshing?: boolean;
+  onRefresh?: () => void;
   stats: DashboardStats;
   /** 当前是否正在全量同步（actionLoading === "sync-all"） */
   syncing: boolean;
@@ -64,6 +67,9 @@ export function DashboardPage({
   onGotoTab,
   onJump,
   toJumpSource,
+  snapshotAt,
+  refreshing,
+  onRefresh,
 }: DashboardPageProps) {
   return (
     <div className="space-y-6 pt-5 md:pt-6">
@@ -73,8 +79,12 @@ export function DashboardPage({
             <LayoutDashboard className="w-6 h-6 text-accent" /> 概览
           </h2>
           <p className="text-content-muted mt-1 text-sm">域名资产总览与到期预警</p>
+          {typeof snapshotAt === "number" && <p className="text-xs text-content-muted mt-1">库存快照：{new Date(snapshotAt).toLocaleTimeString()} · 变化后会重新读取</p>}
         </div>
         {/* 全量同步（唯一入口）：跨所有服务商回源，子请求量最大，日常优先用各页的「同步域名」 */}
+        <div className="flex items-center gap-2">
+        {onRefresh && <button type="button" onClick={onRefresh} disabled={refreshing}
+          className="px-3 py-2 text-sm text-content-secondary bg-elevated border border-border-base rounded-lg disabled:opacity-50">刷新快照</button>}
         <button
           onClick={onSyncAll}
           disabled={syncing}
@@ -84,6 +94,7 @@ export function DashboardPage({
           <RefreshCw className={`w-4 h-4 ${syncing ? "animate-spin" : ""}`} />
           同步所有账号
         </button>
+        </div>
       </div>
 
       {/* 顶部统计卡片 */}

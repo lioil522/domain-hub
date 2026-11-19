@@ -2,7 +2,8 @@ import { normalizeDomainKey, domainKeyCandidates } from "../../shared/domain-key
 import { toASCII, toUnicode } from "../../shared/punycode";
 import { computeDashboardStats, type SummaryExpiry } from "../../shared/dashboard-stats";
 import { CATALOG_PROVIDERS, type CatalogProvider, type CatalogSummary, type CatalogSearch, type CatalogHint } from "../../shared/domain-catalog";
-import { DomainCatalogRepository } from "../repositories/domain-catalog-repository";
+import { DomainCatalogRepository, type CatalogRow } from "../repositories/domain-catalog-repository";
+import { cachedCatalogSummary, initialSummaryDeadline, capSummaryDeadline } from "./catalog-summary-cache";
 
 export function catalogMatches(name: string, query: string) {
   const q = query.trim().toLowerCase();
@@ -29,20 +30,55 @@ export class DomainCatalogService {
   constructor(private readonly repository: DomainCatalogRepository) {}
 
   async summary(now = Date.now(), timezoneOffset = 0): Promise<CatalogSummary> {
+    return (await this.summaryResult(now, timezoneOffset)).summary;
+  }
+  summaryResult(now = Date.now(), timezoneOffset = 0, force = false) {
+    return cachedCatalogSummary(this.repository, now, timezoneOffset, force, () => this.buildSummary(now, timezoneOffset));
+  }
+  private async buildSummary(now: number, timezoneOffset: number) {
     const [rows, custom, accounts, dates] = await Promise.all([
       this.repository.projection(), this.repository.custom(), this.repository.accounts(),
-      this.repository.expiryMetadata(),
+      this.repository.expiryMetadata(now),
     ]);
+    let validUntil = initialSummaryDeadline(now, timezoneOffset);
     const expiry: Record<string, SummaryExpiry> = {};
     for (const row of dates) {
       const key = normalizeDomainKey(row.full_domain);
-      if (row.kind === "manual") expiry[key] = { found: false, manual: true, expires_at: row.expires_at || undefined };
+      if (row.cache_expires_at !== null) validUntil = Math.min(validUntil, row.cache_expires_at * 1000);
+      if (row.kind === "manual") {
+        expiry[key] = { found: false, manual: true, expires_at: row.expires_at || undefined };
+        validUntil = capSummaryDeadline(validUntil, row.expires_at, now, timezoneOffset);
+      }
       else {
-        try { expiry[key] = JSON.parse(row.value || "") as SummaryExpiry; } catch { /* malformed cache is unknown */ }
+        try {
+          expiry[key] = JSON.parse(row.value || "") as SummaryExpiry;
+          validUntil = capSummaryDeadline(validUntil, expiry[key]?.expires_at, now, timezoneOffset);
+        } catch { /* malformed cache is unknown */ }
       }
     }
-    const byProvider = (provider: CatalogProvider) => rows.filter(row => row.provider === provider);
-    const accountList = (provider: CatalogProvider) => accounts.filter(row => row.provider === provider);
+    const partition = (): Record<CatalogProvider, CatalogRow[]> => ({
+      dnshe: [], cloudflare: [], digitalplat: [], dnspod: [], alidns: [], huaweicloud: [], vercel: [], custom: [],
+    });
+    const grouped = partition();
+    const groupedAccounts: Record<CatalogProvider, typeof accounts> = {
+      dnshe: [], cloudflare: [], digitalplat: [], dnspod: [], alidns: [], huaweicloud: [], vercel: [], custom: [],
+    };
+    const account_counts: CatalogSummary["account_counts"] = {};
+    const roots = new Set<string>();
+    for (const row of rows) {
+      grouped[row.provider]?.push(row);
+      const count = account_counts[row.account_id] ||= { total: 0, has_dns: 0 };
+      count.total++; if (row.has_dns) count.has_dns++;
+      if (row.provider === "dnshe" && row.rootdomain) roots.add(row.rootdomain);
+      validUntil = capSummaryDeadline(validUntil, row.expires_at, now, timezoneOffset);
+    }
+    for (const row of accounts) groupedAccounts[row.provider]?.push(row);
+    for (const row of custom) {
+      const count = account_counts[row.group_id] ||= { total: 0, has_dns: 0 }; count.total++;
+      validUntil = capSummaryDeadline(validUntil, row.expires_at, now, timezoneOffset);
+    }
+    const byProvider = (provider: CatalogProvider) => grouped[provider];
+    const accountList = (provider: CatalogProvider) => groupedAccounts[provider];
     const stats = computeDashboardStats({
       domains: byProvider("dnshe"), cfZones: byProvider("cloudflare"), dpDomains: byProvider("digitalplat"), customDomains: custom,
       multiProviderDomains: { dnspod: byProvider("dnspod"), alidns: byProvider("alidns"), huaweicloud: byProvider("huaweicloud"), vercel: byProvider("vercel") },
@@ -52,15 +88,7 @@ export class DomainCatalogService {
       cfExpiryMap: expiry,
     }, now, 20, timezoneOffset);
     const provider_counts = Object.fromEntries(CATALOG_PROVIDERS.map(provider => [provider, provider === "custom" ? custom.length : byProvider(provider).length])) as CatalogSummary["provider_counts"];
-    const account_counts: CatalogSummary["account_counts"] = {};
-    for (const row of rows) {
-      const count = account_counts[row.account_id] ||= { total: 0, has_dns: 0 };
-      count.total++; if (row.has_dns) count.has_dns++;
-    }
-    for (const row of custom) {
-      const count = account_counts[row.group_id] ||= { total: 0, has_dns: 0 }; count.total++;
-    }
-    return { stats, provider_counts, account_counts, root_domains: [...new Set(byProvider("dnshe").map(row => row.rootdomain).filter(Boolean))] };
+    return { summary: { stats, provider_counts, account_counts, root_domains: [...roots] }, validUntil };
   }
 
   async search(query: string): Promise<CatalogSearch> {

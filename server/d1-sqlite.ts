@@ -114,6 +114,11 @@ class SqliteD1PreparedStatement implements D1PreparedStatement {
   execSync(): RawExecResult {
     const stmt = this.owner.getStatement(this.sql);
     const args = this.params as unknown[];
+    if (/^\s*(insert|update|delete|replace)\b/i.test(this.sql) && /\breturning\b/i.test(this.sql)) {
+      const rows = stmt.all(...args);
+      const info = this.owner.getStatement("SELECT changes() AS changes,last_insert_rowid() AS lastRowId").get() as { changes: number; lastRowId: number };
+      return { rows, changes: info.changes, lastRowId: info.lastRowId };
+    }
     if (isReaderSql(this.sql)) {
       return { rows: stmt.all(...args), changes: 0, lastRowId: 0 };
     }

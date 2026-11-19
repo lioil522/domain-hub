@@ -5,6 +5,7 @@ import type { Domain } from "../../../types/domain";
 import type { CustomDomain } from "../../../types/custom";
 import { CATALOG_PROVIDERS, type CatalogPage, type CatalogProvider, type CatalogSummary, type CatalogSearch } from "../../../../../shared/domain-catalog";
 import { isCatalogPageResponse, isCatalogSearchResponse, isCatalogSummaryResponse } from "../utils/catalog-response";
+import { SummaryRefresh } from "../utils/summary-refresh";
 
 export interface DomainPageState extends CatalogPage<Domain, CustomDomain> {
   loading: boolean;
@@ -30,6 +31,7 @@ export function useDomainCatalog(activeTab: string, search: string) {
     () => Object.fromEntries(CATALOG_PROVIDERS.map(provider => [provider, empty()])) as Record<CatalogProvider, DomainPageState>);
   const [summary, setSummary] = useState<CatalogSummary | null>(null);
   const [summaryError, setSummaryError] = useState<string | null>(null);
+  const [refreshingSummary, setRefreshingSummary] = useState(false);
   const [result, setResult] = useState<CatalogSearch | null>(null);
   const [searchError, setSearchError] = useState<string | null>(null);
   const current = useRef({ activeTab, search, sessionToken });
@@ -37,21 +39,40 @@ export function useDomainCatalog(activeTab: string, search: string) {
   const pageRef = useRef(pages);
   const controllers = useRef(new Map<string, AbortController>());
   const generation = useRef(0);
+  const summaryEpoch = useRef(0);
+  const apiRef = useRef(apiFetch);
+  apiRef.current = apiFetch;
+  const summarySnapshot = useRef({ data: summary, error: summaryError });
+  summarySnapshot.current = { data: summary, error: summaryError };
+  const coordinator = useRef<SummaryRefresh | null>(null);
+  const loadSummary = useRef<(signal: AbortSignal, force: boolean) => Promise<void>>(async () => {});
   pageRef.current = pages;
 
-  const refreshSummary = async () => {
+  loadSummary.current = async (signal, force) => {
     if (!current.current.sessionToken) return;
-    controllers.current.get("summary")?.abort();
-    const controller = new AbortController(), identity = generation.current;
-    controllers.current.set("summary", controller);
+    const identity = generation.current;
+    const epoch = summaryEpoch.current;
+    setRefreshingSummary(true);
     try {
-      const data = await apiJson<{ summary: CatalogSummary }>(apiFetch, `/api/domains/summary?timezone_offset=${new Date().getTimezoneOffset()}`, { signal: controller.signal });
-      if (controller.signal.aborted || identity !== generation.current) return;
+      const data = await apiJson<{ summary: CatalogSummary }>(apiRef.current,
+        `/api/domains/summary?timezone_offset=${new Date().getTimezoneOffset()}${force ? "&refresh=1" : ""}`, { signal });
+      if (signal.aborted || identity !== generation.current || epoch !== summaryEpoch.current) return;
       if (!isCatalogSummaryResponse(data)) throw new Error("全量摘要响应格式不正确，请确认前后端版本一致");
+      summarySnapshot.current = { data: data.summary, error: null };
       setSummary(data.summary); setSummaryError(null);
     } catch (error) {
-      if (!controller.signal.aborted && identity === generation.current) setSummaryError(error instanceof Error ? error.message : "摘要读取失败");
+      if (!signal.aborted && identity === generation.current && epoch === summaryEpoch.current) {
+        const message = error instanceof Error ? error.message : "摘要读取失败";
+        summarySnapshot.current = { ...summarySnapshot.current, error: message }; setSummaryError(message);
+      }
+    } finally {
+      if (!signal.aborted && identity === generation.current && epoch === summaryEpoch.current) setRefreshingSummary(false);
     }
+  };
+  const refreshSummary = (force = false) => {
+    if (!current.current.sessionToken) return Promise.resolve();
+    summaryEpoch.current++;
+    return coordinator.current?.request({ invalidate: true, force }) ?? Promise.resolve();
   };
   const load = async (provider: CatalogProvider, changes: Partial<DomainPageState> = {}) => {
     if (!current.current.sessionToken) return;
@@ -102,14 +123,40 @@ export function useDomainCatalog(activeTab: string, search: string) {
   });
   useEffect(() => {
     generation.current++;
+    summaryEpoch.current = 0;
+    coordinator.current?.dispose();
+    coordinator.current = new SummaryRefresh((signal, force) => loadSummary.current(signal, force));
     for (const controller of controllers.current.values()) controller.abort();
     pageRef.current = Object.fromEntries(CATALOG_PROVIDERS.map(provider => [provider, empty()])) as typeof pages;
     setPages(pageRef.current); setSummary(null); setResult(null); setSummaryError(null); setSearchError(null);
-    if (sessionToken) void refreshSummary();
-    return () => { generation.current++; for (const controller of controllers.current.values()) controller.abort(); };
+    setRefreshingSummary(false);
+    summarySnapshot.current = { data: null, error: null };
+    if (sessionToken) void coordinator.current.request();
+    return () => { generation.current++; coordinator.current?.dispose(); for (const controller of controllers.current.values()) controller.abort(); };
     // API identity is explicitly reset on session/backend changes.
   }, [sessionToken, backendUrl]);
   useEffect(() => { if (sessionToken) void refreshSummary(); }, [accounts]);
+  useEffect(() => {
+    if (!sessionToken || typeof document === "undefined") return;
+    let closed = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const schedule = () => {
+      if (timer !== undefined) clearTimeout(timer);
+      if (closed) return;
+      const snapshot = summarySnapshot.current;
+      const remaining = snapshot.error ? 30_000 : (snapshot.data?.valid_until ?? Date.now() + 30_000) - Date.now();
+      timer = setTimeout(read, Math.max(1000, Math.min(30_000, remaining)));
+    };
+    const read = () => {
+      if (closed) return;
+      if (document.visibilityState === "visible") void coordinator.current?.request().then(schedule);
+      else schedule();
+    };
+    document.addEventListener("visibilitychange", read);
+    read();
+    return () => { closed = true; if (timer !== undefined) clearTimeout(timer); document.removeEventListener("visibilitychange", read); };
+  }, [sessionToken, backendUrl]);
+  useEffect(() => { if (sessionToken && activeTab === "dashboard") void coordinator.current?.request(); }, [activeTab, sessionToken, backendUrl]);
   useEffect(() => {
     const provider = catalogProviderForTab(activeTab);
     if (!sessionToken || !provider) return;
@@ -136,7 +183,7 @@ export function useDomainCatalog(activeTab: string, search: string) {
     return () => { window.clearTimeout(timer); controller.abort(); };
   }, [search, sessionToken, backendUrl]);
   return {
-    source, pages, summary, summaryError, result, searchError, refreshSummary,
+    source, pages, summary, summaryError, refreshingSummary, result, searchError, refreshSummary,
     locate: (provider: CatalogProvider, name: string) => {
       // The navigation effect will load this scope after the tab/search state settles.
       controllers.current.get(provider)?.abort();
@@ -144,7 +191,7 @@ export function useDomainCatalog(activeTab: string, search: string) {
       setPages(pageRef.current);
       if (catalogProviderForTab(current.current.activeTab) === provider && !current.current.search) void load(provider);
     },
-    invalidateAll: () => { void refreshSummary(); const provider = catalogProviderForTab(current.current.activeTab); if (provider) void refresh(provider); },
+    invalidateAll: () => { const provider = catalogProviderForTab(current.current.activeTab); if (provider) void refresh(provider); else void refreshSummary(); },
   };
 }
 export type DomainPageSource = ReturnType<ReturnType<typeof useDomainCatalog>["source"]>;

@@ -39,7 +39,12 @@ export function registerDomainRoutes(app: Hono<AppEnv>, deps: DomainRouteDeps) {
     try {
       const offset = Number(c.req.query("timezone_offset") || 0);
       if (!Number.isInteger(offset) || offset < -840 || offset > 840) return c.json(errorRes("无效的时区偏移"), 400);
-      return c.json(successRes({ summary: await catalog(c.get("db")).summary(Date.now(), offset) }));
+      const refresh = c.req.query("refresh");
+      if (refresh !== undefined && refresh !== "0" && refresh !== "1") return c.json(errorRes("无效的刷新参数"), 400);
+      const result = await catalog(c.get("db")).summaryResult(Date.now(), offset, refresh === "1");
+      c.header("Cache-Control", "private, no-store");
+      c.header("X-Catalog-Summary-Cache", result.cache);
+      return c.json(successRes({ summary: result.summary }));
     }
     catch { return c.json(errorRes("无法读取全量域名摘要"), 500); }
   });

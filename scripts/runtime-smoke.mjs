@@ -27,6 +27,39 @@ async function authentication(fetcher) {
   assert.equal((await fetcher("/api/notifications", { headers })).status, 200);
   return headers;
 }
+async function summaryCacheSmoke(fetcher, headers) {
+  const endpoint = "/api/domains/summary?timezone_offset=0";
+  const cold = await fetcher(endpoint, { headers });
+  assert.equal(cold.status, 200, await cold.clone().text());
+  assert.equal(cold.headers.get("X-Catalog-Summary-Cache"), "miss");
+  const before = (await cold.json()).summary;
+  const hot = await fetcher(endpoint, { headers });
+  assert.equal(hot.status, 200);
+  assert.equal(hot.headers.get("X-Catalog-Summary-Cache"), "hit");
+  assert.equal(hot.headers.get("Cache-Control"), "private, no-store");
+  const group = await fetcher("/api/custom-groups/batch", {
+    method: "POST", headers: { ...headers, "Content-Type": "application/json" },
+    body: JSON.stringify({ groups: [{ alias: "summary-cache-runtime" }] }),
+  });
+  assert.equal(group.status, 200, await group.clone().text());
+  const accountList = await (await fetcher("/api/accounts", { headers })).json();
+  const id = accountList.accounts.find(account => account.alias === "summary-cache-runtime").id;
+  const domain = await fetcher(`/api/custom-groups/${id}/domains`, {
+    method: "POST", headers: { ...headers, "Content-Type": "application/json" },
+    body: JSON.stringify({ full_domain: "summary-cache-runtime.example.com", expires_at: "" }),
+  });
+  assert.equal(domain.status, 200, await domain.clone().text());
+  const changed = await fetcher(endpoint, { headers });
+  assert.equal(changed.status, 200, await changed.clone().text());
+  assert.equal(changed.headers.get("X-Catalog-Summary-Cache"), "miss");
+  const after = (await changed.json()).summary;
+  assert.equal(after.stats.total, before.stats.total + 1);
+  assert.equal(after.stats.accounts, before.stats.accounts + 1);
+  const forced = await fetcher(`${endpoint}&refresh=1`, { headers });
+  assert.equal(forced.status, 200, await forced.clone().text());
+  assert.equal(forced.headers.get("X-Catalog-Summary-Cache"), "bypass");
+  console.log("[runtime-smoke] summary cache hit, transactional invalidation and explicit bypass passed");
+}
 
 const base = process.platform === "win32" && process.env.LOCALAPPDATA
   ? path.join(process.env.LOCALAPPDATA, "Temp/opencode") : tmpdir();
@@ -84,6 +117,7 @@ try {
   assert.equal((await fetcher("/__test_tick")).status, 200);
   assert.equal(workerDeliveries, 1, "Confirmed delivery cannot be repeated on another tick");
   console.log("[runtime-smoke] workerd expiry/outbox production, delivery and dedupe passed");
+  await summaryCacheSmoke(fetcher, headers);
 }
 finally { await mf.dispose(); }
 
@@ -110,7 +144,9 @@ try {
   const port = await ready, url = `http://127.0.0.1:${port}`;
   assert.equal((await request(`${url}/healthz`)).status, 200);
   assert.equal((await request(`${url}/`)).status, 200);
-  await authentication((pathname, init) => request(`${url}${pathname}`, init));
+  const fetcher = (pathname, init) => request(`${url}${pathname}`, init);
+  const headers = await authentication(fetcher);
+  await summaryCacheSmoke(fetcher, headers);
   console.log("[runtime-smoke] isolated workerd/D1 and Node/SQLite passed");
 } finally {
   child.kill("SIGTERM");

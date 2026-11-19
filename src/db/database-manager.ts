@@ -37,13 +37,14 @@ import { SyncWorkQueue } from "./dao/sync-work-dao";
 import { NotificationOutbox } from "./dao/notification-dao";
 import { sha256Hex } from "./crypto";
 import { ConflictError } from "../errors";
+import { versionedCatalogDatabase } from "./catalog-version";
 
 export class DatabaseManager {
   private db: D1Database;
   private aesKey?: string;
 
   constructor(d1Database: D1Database, aesKey?: string) {
-    this.db = d1Database;
+    this.db = versionedCatalogDatabase(d1Database);
     this.aesKey = aesKey;
   }
 
@@ -63,6 +64,7 @@ export class DatabaseManager {
   }
 
   // ===== 原始查询出口（供 Repository 层使用） =====
+  catalogCacheBinding(): object { return this.db; }
 
   async executeRaw(sql: string, bindings: unknown[] = []): Promise<void> {
     await this.db.prepare(sql).bind(...bindings).run();

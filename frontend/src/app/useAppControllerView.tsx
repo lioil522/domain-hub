@@ -1060,6 +1060,9 @@ export function useAppControllerView() {
         {/* Tab 0: Dashboard 概览 */}
          {activeTab === "dashboard" && dashboardStats && (
           <DashboardPage
+            snapshotAt={catalog.summary?.snapshot_at}
+            refreshing={catalog.refreshingSummary}
+            onRefresh={() => void catalog.refreshSummary(true)}
             stats={dashboardStats}
             syncing={actionLoading === "sync-all"}
             onSyncAll={handleSyncDomains}
@@ -1071,7 +1074,7 @@ export function useAppControllerView() {
          {activeTab === "dashboard" && !dashboardStats && (
            <div role={catalog.summaryError ? "alert" : "status"} className="p-6">
              {catalog.summaryError || "正在读取全量域名摘要…"}
-             <button className="ml-3 underline" onClick={() => void catalog.refreshSummary()}>重试</button>
+             <button className="ml-3 underline" onClick={() => void catalog.refreshSummary(true)}>重试</button>
            </div>
          )}
          {currentPage && <DomainPagination page={currentPage} />}

@@ -36,6 +36,12 @@ export interface SummaryExpiry {
   manual?: boolean;
   expires_at?: string;
 }
+export function parseCatalogDate(raw: string, timezoneOffset = 0): number {
+  if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?$/.test(raw)) {
+    return Date.parse(raw.replace(" ", "T") + "Z") + timezoneOffset * 60_000;
+  }
+  return Date.parse(raw);
+}
 
 export interface DashboardStatsOptions {
   domains: SummaryDomain[];
@@ -81,13 +87,18 @@ export function computeDashboardStats({
   multiProviderAccounts,
   cfExpiryMap,
 }: DashboardStatsOptions, now = Date.now(), timelineLimit = Infinity, timezoneOffset = new Date(now).getTimezoneOffset()) {
-  const parseTime = (raw: string) => {
-    // SQLite-style timestamps have no zone; preserve the requesting browser's
-    // interpretation instead of silently treating them as Worker UTC.
-    if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?$/.test(raw)) {
-      return Date.parse(raw.replace(" ", "T") + "Z") + timezoneOffset * 60_000;
-    }
-    return Date.parse(raw);
+  const parseTime = (raw: string) => parseCatalogDate(raw, timezoneOffset);
+  const keyCache = new Map<string, string>();
+  const candidateCache = new Map<string, string[]>();
+  const keyOf = (raw: string) => {
+    let key = keyCache.get(raw);
+    if (key === undefined) { key = normalizeDomainKey(raw); keyCache.set(raw, key); }
+    return key;
+  };
+  const candidatesOf = (raw: string) => {
+    let keys = candidateCache.get(raw);
+    if (!keys) { keys = domainKeyCandidates(raw); candidateCache.set(raw, keys); }
+    return keys;
   };
   const calendarDate = (time: number) => new Date(time - timezoneOffset * 60_000);
   // 归一到期判断：空/非法/「永久」占位(0000 前缀) → 视为永久（未过期）
@@ -101,7 +112,7 @@ export function computeDashboardStats({
   // 按归一化域名去重的聚合记录：value 记录「是否过期」；任一来源过期即算过期
   const seen = new Map<string, boolean>(); // key → 是否过期
   const record = (fullDomain: string, expiredFlag: boolean) => {
-    const key = normalizeDomainKey(fullDomain);
+    const key = keyOf(fullDomain);
     if (!key) return;
     // 已存在时：任一来源判定过期则整体算过期（取 OR）
     seen.set(key, seen.has(key) ? (seen.get(key)! || expiredFlag) : expiredFlag);
@@ -131,7 +142,7 @@ export function computeDashboardStats({
   // 自定义域名的归属：CustomDomain 只带 group_id，分组名要从 customGroupList 里反查。
   const groupNameById = new Map(customGroupList.map((g) => [g.id, g.alias]));
   const resolveExpiry = (fullDomain: string, fallback?: string): string | undefined => {
-    const candidates = domainKeyCandidates(fullDomain);
+    const candidates = candidatesOf(fullDomain);
     for (const k of candidates) {
       const entry = cfExpiryMap[k];
       const manual = entry?.manual ? entry : undefined;
@@ -160,7 +171,7 @@ export function computeDashboardStats({
   ].filter((x) => x.created_at);
   const recentByName = new Map<string, (typeof recentRaw)[number]>();
   recentRaw.forEach((x) => {
-    const key = normalizeDomainKey(x.full_domain);
+    const key = keyOf(x.full_domain);
     if (!key) return;
     if (!recentByName.has(key)) recentByName.set(key, x);
   });
@@ -177,7 +188,7 @@ export function computeDashboardStats({
   const permanentCandidates = new Set<string>();
   const expiryByKey = new Map<string, ExpiryEntry>();
   for (const r of expiryRecords) {
-    const key = normalizeDomainKey(r.full_domain);
+    const key = keyOf(r.full_domain);
     if (!key) continue;
     // 永久占位（0000 前缀）与空值：不算过期，也不进预警
     const permanent = !r.expires_at || r.expires_at.startsWith("0000");

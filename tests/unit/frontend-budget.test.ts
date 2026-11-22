@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { randomBytes } from "node:crypto";
+import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { bundleBudget, inspectBundle, type BudgetChunk } from "../../frontend/tooling/bundle-budget";
+import { dependencyChunkName } from "../../frontend/tooling/chunking";
 
 function chunk(fileName: string, overrides: Partial<BudgetChunk> = {}): BudgetChunk {
   return { fileName, isEntry: false, code: "export default 1;", imports: [], modules: {}, ...overrides };
@@ -66,4 +70,43 @@ test("Vite budget runs after generateBundle preload dependency rewriting", () =>
   const hook = bundleBudget().generateBundle;
   assert.equal(typeof hook, "object");
   assert.equal(hook && typeof hook === "object" ? hook.order : undefined, "post");
+});
+test("Rolldown chunk names only classify dependencies, including Windows paths", () => {
+  assert.equal(dependencyChunkName("D:\\app\\node_modules\\react-dom\\client.js"), "react-vendor");
+  assert.equal(dependencyChunkName("/app/node_modules/lucide-react/dist/index.js"), "icons");
+  assert.equal(dependencyChunkName("/app/node_modules/qrcode.react/lib/index.js"), "react-vendor");
+  assert.equal(dependencyChunkName("/app/node_modules/another-library/index.js"), "vendor");
+  assert.equal(dependencyChunkName("/app/src/features/scanner/ScannerFeature.tsx"), null);
+  assert.equal(dependencyChunkName("/app/src/components/CreateDomainModal.tsx"), null);
+});
+test("emitted-byte gate refuses an oversized on-disk chunk even when hook metadata contains a tiny draft", () => {
+  const base = process.platform === "win32" ? path.join(process.env.LOCALAPPDATA!, "Temp/opencode") : tmpdir();
+  const dir = mkdtempSync(path.join(base, "domain-hub-emitted-budget-"));
+  mkdirSync(path.join(dir, "assets"));
+  writeFileSync(path.join(dir, "index.html"), '<script type="module" src="/assets/index-a.js"></script>');
+  const entry = { ...chunk("assets/index-a.js", { isEntry: true }), type: "chunk" };
+  writeFileSync(path.join(dir, entry.fileName), randomBytes(200_000).toString("base64"));
+  const hook = bundleBudget().writeBundle;
+  assert.equal(typeof hook, "object");
+  assert.equal(hook && typeof hook === "object" ? hook.order : undefined, "post");
+  assert.throws(() => {
+    if (hook && typeof hook === "object") hook.handler.call({ error(message: string) { throw new Error(message); } },
+      { dir }, { [entry.fileName]: entry });
+  }, /business static closure/);
+});
+test("a bundler without entry module metadata cannot silently bypass the lazy-module gate", () => {
+  const hook = bundleBudget().generateBundle;
+  const entry = { ...chunk("assets/index-a.js", { isEntry: true }), type: "chunk" };
+  assert.throws(() => {
+    if (hook && typeof hook === "object") hook.handler.call({ error(message: string) { throw new Error(message); } },
+      {}, { [entry.fileName]: entry }, false);
+  }, /entry module metadata is missing/);
+});
+test("copied public startup scripts cannot hide in an excluded framework filename", () => {
+  const report = inspectBundle([
+    chunk("assets/index-a.js", { isEntry: true }),
+    chunk("icons-public.js", { isEntry: true, publicStartup: true, code: randomBytes(100_000).toString("base64") }),
+  ]);
+  assert.match(report.failures.join(), /business static closure/);
+  assert.equal(report.rows.find(row => row.file === "icons-public.js")?.framework, false);
 });

@@ -119,6 +119,8 @@ Node.js >= 22.12.0
 npm
 ```
 
+开发工具链现固定为 Wrangler 4.166、Vite 8.3.8 + React 插件 6.3，并保留 React 18／Tailwind 3。使用两套 `npm ci` 安装锁文件，`npm run audit:dependencies` 检查完整开发/生产依赖；CI 不再忽略开发依赖审计。升级范围、体积口径及兼容限制见 [工具链记录](docs/TOOLCHAIN_PROGRESS_2026-11-22.md)。
+
 ---
 
 ## 项目结构

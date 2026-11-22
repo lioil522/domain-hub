@@ -43,7 +43,7 @@ jobs:
             echo "::notice::main has advanced; this older deployment is skipped."
           fi
 
-      # wrangler 4 的 engines 要求 Node >= 22
+      # 与 package.json 锁定的 Wrangler 一致；工具链需要 Node >=22.12。
       - name: Setup Node.js
         if: steps.freshness.outputs.current == 'true'
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -201,7 +201,7 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          wranglerVersion: '4.127.0'
+          wranglerVersion: '4.166.0'
           command: deploy release/worker/index.js --no-bundle
 
       - name: Auto-Configure & Sync AES_KEY Secret
@@ -211,21 +211,27 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           AES_KEY: ${{ secrets.AES_KEY }}
         run: |
+          set -euo pipefail
           # 1. GitHub Secrets 已配置 AES_KEY → 优先使用用户自定义密钥
           if [ -n "$AES_KEY" ]; then
             echo "🔐 使用 GitHub Secret 中配置的 AES_KEY 同步到 Worker..."
-            echo "$AES_KEY" | npx wrangler secret put AES_KEY
-          # 2. Worker 上已有 AES_KEY → 保持稳定，不重新生成（否则已加密数据将无法解密）
-          elif npx wrangler secret list 2>/dev/null | grep -q "AES_KEY"; then
-            echo "🔐 AES_KEY 已存在于 Worker，保持现有密钥不变..."
-          # 3. 首次部署 → 自动生成随机 AES_KEY 并写入 Worker
+            printf '%s' "$AES_KEY" | npx --no-install wrangler secret put AES_KEY
           else
-            echo "🔐 首次部署，自动生成 AES_KEY 并写入 Worker..."
-            NEW_KEY=$(openssl rand -hex 32)
-            echo "$NEW_KEY" | npx wrangler secret put AES_KEY
-            # 尽力写回 GitHub Secrets，便于本地开发参考（失败不影响部署）
-            if command -v gh >/dev/null 2>&1; then
-              echo "$NEW_KEY" | gh secret set AES_KEY --repo "${GITHUB_REPOSITORY}" || true
+            # 2. Introspection errors are not an empty list. Preserve the existing
+            # key unless a successful, structurally valid JSON list proves absence.
+            SECRET_LIST=$(npx --no-install wrangler secret list --format json)
+            KEY_STATE=$(printf '%s' "$SECRET_LIST" | node scripts/worker-secret-list.mjs AES_KEY)
+            if [ "$KEY_STATE" = present ]; then
+              echo "🔐 AES_KEY 已存在于 Worker，保持现有密钥不变..."
+            else
+              # 3. 首次部署 → 自动生成随机 AES_KEY 并写入 Worker
+              echo "🔐 首次部署，自动生成 AES_KEY 并写入 Worker..."
+              NEW_KEY=$(openssl rand -hex 32)
+              printf '%s' "$NEW_KEY" | npx --no-install wrangler secret put AES_KEY
+              # 尽力写回 GitHub Secrets（失败不影响部署），不输出密钥。
+              if command -v gh >/dev/null 2>&1; then
+                printf '%s' "$NEW_KEY" | gh secret set AES_KEY --repo "${GITHUB_REPOSITORY}" || true
+              fi
             fi
           fi
 

@@ -13,7 +13,7 @@ export async function loadReleaseWorkflows(root) {
 const needs = (job, name) => job?.needs === name || (Array.isArray(job?.needs) && job.needs.includes(name));
 export function validateVerificationScripts(scripts) {
   const required = ["check:architecture", "verify:worker", "build:worker", "test:invariants", "verify:node",
-    "check:theme", "check:worker-config", "check:release-package", "build:node", "check:runtimes", "check:docker-inputs"];
+    "check:theme", "check:worker-config", "check:release-package", "build:node", "check:runtimes", "check:docker-inputs", "check:toolchain"];
   const commands = (scripts["verify:all"] || "").split(" && ");
   if (required.some(name => !commands.includes(`npm run ${name}`)) ||
     !commands.includes("npm test") || !commands.includes("npm --prefix frontend run build") ||
@@ -38,6 +38,8 @@ export function validateReleaseWorkflows(workflows) {
     step.run?.includes("sha256sum -c -") &&
     step.run.includes('$TOOL_DIR/actionlint')), "Workflow syntax lint and verified tool download must remain mandatory");
   check(quality.some(step => step.run === "npm run verify:all" && !step.if), "Full regression/config/package validation must run unconditionally");
+  check(quality.some(step => step.run === "npm run audit:dependencies" && !step.if && !step["continue-on-error"]),
+    "Full development/production dependency audit must remain mandatory");
   check(quality.some(step => step.run === "npm --prefix frontend run build:selfhost" && !step.if), "Selfhost build must be verified unconditionally");
   check(!quality.some(step => step["continue-on-error"]), "Quality gates cannot ignore failure");
   const packageIndex = quality.findIndex(step => step.id === "package");
@@ -64,6 +66,12 @@ export function validateReleaseWorkflows(workflows) {
   const database = steps.find(step => step.name === "Setup & Bind Cloudflare D1 Database");
   check(database?.run.includes("set -euo pipefail") && database.run.includes("Deployment is stopped") && database.run.includes("refusing to infer"),
     "D1 lookup/creation/config failures must fail closed");
+  const key = steps.find(step => step.name === "Auto-Configure & Sync AES_KEY Secret");
+  check(key?.run.includes("set -euo pipefail") &&
+    key.run.includes("SECRET_LIST=$(npx --no-install wrangler secret list --format json)") &&
+    key.run.includes("node scripts/worker-secret-list.mjs AES_KEY") &&
+    !key.run.includes('grep -q "AES_KEY"'),
+    "AES_KEY introspection errors must stop provisioning rather than generate replacements");
   check(needs(docker.jobs?.build, "verify") && needs(docker.jobs?.merge, "build"), "Docker publication must wait for verification and architecture smoke tests");
   check(docker.concurrency?.["cancel-in-progress"] === false, "Docker release should be serialized");
   const merge = docker.jobs?.merge?.steps || [];

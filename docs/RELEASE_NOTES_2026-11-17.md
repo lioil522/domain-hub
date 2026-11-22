@@ -46,3 +46,4 @@ Docker 修复后再次通过全量验证（192 个用例），并用打包后的
 - [Node 密钥与启动就绪安全（2026-11-22）](./NODE_KEY_STARTUP_PROGRESS_2026-11-22.md)
 - [CORS、可信代理与初始化授权（2026-11-22）](./REQUEST_BOUNDARIES_PROGRESS_2026-11-22.md)
 - [自定义域名唯一性与完整归档（2026-11-22）](./CUSTOM_DOMAIN_UNIQUENESS_PROGRESS_2026-11-22.md)
+- [开发工具链审计与升级（2026-11-22）](./TOOLCHAIN_PROGRESS_2026-11-22.md)

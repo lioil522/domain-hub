@@ -20,11 +20,13 @@
     "check:cascade": "node cascade-check.mjs",
     "check:theme": "node cascade-check.mjs && node contrast-check.mjs",
     "test": "npm run test:node && npm run test:signature && npm run test:credentials && npm run test:recordset && npm run test:digitalplat && npm run test:createdomain",
-    "verify:all": "npm run check:architecture && npm run verify:worker && npm run build:worker && npm run test:invariants && npm run verify:node && npm test && npm --prefix frontend run build && npm run check:theme && npm run check:worker-config && npm run check:release-package && npm run build:node && npm run check:runtimes && npm run check:docker-inputs",
+    "verify:all": "npm run check:architecture && npm run check:toolchain && npm run verify:worker && npm run build:worker && npm run test:invariants && npm run verify:node && npm test && npm --prefix frontend run build && npm run check:theme && npm run check:worker-config && npm run check:release-package && npm run build:node && npm run check:runtimes && npm run check:docker-inputs",
+    "check:toolchain": "node scripts/check-toolchain.mjs",
+    "audit:dependencies": "npm audit --audit-level=low && npm --prefix frontend audit --audit-level=low",
     "check:runtimes": "node scripts/runtime-smoke.mjs",
     "check:release-package": "node scripts/check-release-package.mjs",
     "check:docker-inputs": "node scripts/check-docker-inputs.mjs",
-    "check:release-policy": "node --test tests/integration/release-policy.test.mjs",
+    "check:release-policy": "node --test tests/integration/release-policy.test.mjs tests/integration/toolchain-policy.test.mjs tests/integration/worker-key-provisioning.test.mjs",
     "check:worker-config": "wrangler deploy --dry-run --outdir dist-worker/wrangler-dry-run",
     "check:architecture": "node architecture-check.mjs",
     "verify:worker": "tsc --noEmit -p tsconfig.json",
@@ -62,11 +64,12 @@
     "hono": "^4.13.19"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20260828.1",
-    "@types/node": "^26.2.0",
-    "esbuild": "^0.28.2",
-    "typescript": "^5.4.3",
-    "wrangler": "^4.127.0",
+    "@cloudflare/workers-types": "5.20261121.1",
+    "@types/node": "26.2.0",
+    "esbuild": "0.28.2",
+    "miniflare": "5.20261119.0-beta",
+    "typescript": "5.9.3",
+    "wrangler": "4.166.0",
     "yaml": "2.9.1"
   }
 }

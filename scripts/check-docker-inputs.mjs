@@ -70,6 +70,8 @@ const node = process.execPath;
 const tsc = path.join(root, "node_modules/typescript/bin/tsc");
 try {
   await exec(node, [tsc, "--noEmit", "-p", frontend.cwd], { cwd: frontend.cwd, maxBuffer: 4 * 1024 * 1024 });
+  await exec(node, [tsc, "--noEmit", "-p", path.join(frontend.cwd, "tsconfig.node.json")],
+    { cwd: frontend.cwd, maxBuffer: 4 * 1024 * 1024 });
   await exec(node, [path.join(root, "frontend/node_modules/vite/bin/vite.js"), "build", "--mode", "selfhost"],
     { cwd: frontend.cwd, maxBuffer: 4 * 1024 * 1024 });
   await exec(node, [tsc, "--noEmit", "-p", path.join(backend.cwd, "server")], { cwd: backend.cwd, maxBuffer: 4 * 1024 * 1024 });

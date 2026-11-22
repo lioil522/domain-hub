@@ -50,6 +50,8 @@ jobs:
             frontend/package-lock.json
       - name: Install locked dependencies
         run: npm ci && npm --prefix frontend ci
+      - name: Audit all locked dependencies
+        run: npm run audit:dependencies
       - name: Full verification
         run: npm run verify:all
       # verify:all includes isolated workerd/Node authentication and storage smoke.

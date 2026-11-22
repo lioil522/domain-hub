@@ -36,6 +36,9 @@ for (const [name, mutate, expected] of [
   ["verification ignores failures", p => { p.verify.jobs.verify.steps.find(s => s.run === "npm run verify:all")["continue-on-error"] = true; }, /cannot ignore failure/],
   ["conditionally skipped regression", p => { p.verify.jobs.verify.steps.find(s => s.run === "npm run verify:all").if = "false"; }, /must run unconditionally/],
   ["workflow syntax lint is skipped", p => { p.verify.jobs.verify.steps.find(s => s.id === "workflow-lint").if = "false"; }, /syntax lint/],
+  ["dependency audit is skipped", p => { p.verify.jobs.verify.steps.find(s => s.run === "npm run audit:dependencies").if = "false"; }, /audit must remain mandatory/],
+  ["key introspection errors are ignored", p => { p.deploy.jobs.deploy.steps.find(s => s.name === "Auto-Configure & Sync AES_KEY Secret").run =
+    "npx wrangler secret list 2>/dev/null | grep -q AES_KEY || npx wrangler secret put AES_KEY"; }, /AES_KEY introspection/],
   ["verification job ignores failures", p => { p.verify.jobs.verify["continue-on-error"] = true; }, /Jobs cannot ignore/],
   ["Docker always runs after failed verification", p => { p.docker.jobs.build.if = "always()"; }, /dependency gates/],
   ["artifact upload drops checked hidden files", p => { delete p.verify.jobs.verify.steps.find(s => s.uses?.startsWith("actions/upload-artifact")).with["include-hidden-files"]; }, /whole checked tree/],
@@ -52,7 +55,7 @@ for (const [name, mutate, expected] of [
     assert.throws(() => validateReleaseWorkflows(changed), expected);
   });
 }
-for (const name of ["check:runtimes", "check:release-package", "check:worker-config", "test:invariants"]) {
+for (const name of ["check:runtimes", "check:release-package", "check:worker-config", "test:invariants", "check:toolchain"]) {
   test(`verification chain rejects removed ${name}`, () => {
     const changed = { ...scripts, "verify:all": scripts["verify:all"].split(" && ")
       .filter(command => command !== `npm run ${name}`).join(" && ") };

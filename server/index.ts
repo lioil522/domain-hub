@@ -10,7 +10,7 @@
  *
  * 前端由同一个端口以静态文件形式发出（同源），因此不需要配置 CORS。
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { serve } from "@hono/node-server";
@@ -22,6 +22,9 @@ import type { WebhookType } from "../src/cron";
 import { createD1FromSqlite } from "./d1-sqlite";
 import { createStaticHandler } from "./static";
 import { initializeDatabase } from "./initialize-database";
+import { verifyDatabaseSchema } from "../src/db/schema-migrations";
+import { requireSafeSqliteVersion, databaseFileExists, resolveNodeKey, verifyManagedKeyFile } from "./key-file";
+import { preflightNodeDatabase, validateStoredNodeKeys, assertNodeKeyMarker, ensureNodeKeyMarker } from "./key-validation";
 import { runBackgroundMaintenance } from "../src/services/background-maintenance";
 
 // ===== 配置读取 =====
@@ -42,10 +45,11 @@ function resolveDbPath(): string {
   if (process.env.DB_PATH) return path.resolve(process.env.DB_PATH);
   const current = path.join(DATA_DIR, "domain-hub.db");
   const legacy = path.join(DATA_DIR, "dnshe.db");
-  if (!existsSync(current) && existsSync(legacy)) return path.resolve(legacy);
+  if (!databaseFileExists(current) && databaseFileExists(legacy)) return path.resolve(legacy);
   return path.resolve(current);
 }
 
+requireSafeSqliteVersion();
 const DB_PATH = resolveDbPath();
 
 /**
@@ -80,38 +84,14 @@ function optionalEnv(name: string): string | undefined {
   return value ? value : undefined;
 }
 
-/**
- * 解析 AES 加密密钥
- *
- * 未通过环境变量提供时，在数据目录里生成并持久化一份随机密钥 —— 与 GitHub Actions
- * 部署路径「未配置则自动生成」的行为一致，避免用户不配 AES_KEY 就退化成弱 Base64
- * 编码存储 API Secret 与 2FA 密钥（见 src/db.ts 的 encryptText）。
- *
- * ⚠️ 这份密钥必须与数据库一起备份：密钥丢了，库里的 API Secret 与 2FA 密钥都解不开。
- */
-function resolveAesKey(): { key: string; source: "env" | "file" | "generated" } {
-  const fromEnv = optionalEnv("AES_KEY");
-  if (fromEnv) return { key: fromEnv, source: "env" };
-
-  const keyFile = path.join(DATA_DIR, "aes.key");
-  if (existsSync(keyFile)) {
-    const stored = readFileSync(keyFile, "utf8").trim();
-    if (stored) return { key: stored, source: "file" };
-  }
-
-  // 与 src/db.ts 的十六进制生成保持同一套写法：Workers 与 Node 都有全局
-  // crypto.getRandomValues。顺带避开 @cloudflare/workers-types v5 与 @types/node 的
-  // Buffer 全局声明冲突 —— 撞车后 randomBytes(32).toString("hex") 会被判成
-  // Uint8Array 的 0 参数 toString()，类型检查过不去。
-  const generated = Array.from(crypto.getRandomValues(new Uint8Array(32)))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-  writeFileSync(keyFile, `${generated}\n`, { mode: 0o600 });
-  return { key: generated, source: "generated" };
-}
-
 // ===== 数据库初始化 =====
 
+// Select the key before opening/creating the database. Existing databases are
+// checked read-only before PRAGMA writes, extension SQL, or schema migrations.
+const existingDatabase = databaseFileExists(DB_PATH);
+const keySelection = resolveNodeKey(DATA_DIR, DB_PATH, optionalEnv("AES_KEY"));
+const { key: aesKey, source: aesKeySource } = keySelection;
+if (existingDatabase) await preflightNodeDatabase(DB_PATH, aesKey);
 mkdirSync(DATA_DIR, { recursive: true });
 
 const sqlite = new DatabaseSync(DB_PATH);
@@ -124,15 +104,9 @@ sqlite.exec("PRAGMA busy_timeout = 5000");
 sqlite.exec("PRAGMA foreign_keys = ON");
 
 const db = createD1FromSqlite(sqlite);
-const { key: aesKey, source: aesKeySource } = resolveAesKey();
 
 // An explicitly configured SQL file remains an optional pre-migration extension.
 // The normal path needs no external schema file: Workers and Node share a migrator.
-if (optionalEnv("SCHEMA_FILE")) {
-  const schemaFile = path.resolve(optionalEnv("SCHEMA_FILE")!);
-  sqlite.exec(readFileSync(schemaFile, "utf8"));
-}
-
 const env = {
   DB: db,
   AES_KEY: aesKey,
@@ -146,7 +120,14 @@ const env = {
 };
 
 try {
+  if (optionalEnv("SCHEMA_FILE")) {
+    const schemaFile = path.resolve(optionalEnv("SCHEMA_FILE")!);
+    sqlite.exec(readFileSync(schemaFile, "utf8"));
+  }
   await initializeDatabase(db);
+  await validateStoredNodeKeys(sqlite, aesKey); // Includes extension SQL and migrated storage.
+  await new DatabaseManager(db, aesKey).getAuthConfig();
+  await ensureNodeKeyMarker(db, aesKey);
 } catch (error) {
   sqlite.close();
   throw error; // No listener, health response or Cron on an unready database.
@@ -188,14 +169,18 @@ async function fetchHandler(request: Request): Promise<Response> {
     return (await worker.fetch(request, env, executionCtx)) as Response;
   }
 
-  // 容器健康检查：顺带读一次数据库，能区分「进程活着」与「数据库可读」
+  if (url.pathname === "/livez") return Response.json({ ok: true });
+
+  // Readiness means schema and bound key are valid, not just SELECT 1.
   if (url.pathname === "/healthz") {
     try {
-      sqlite.prepare("SELECT 1 AS ok").get();
+      verifyManagedKeyFile(keySelection);
+      await verifyDatabaseSchema(db);
+      await assertNodeKeyMarker(db, aesKey);
+      await new DatabaseManager(db, aesKey).getAuthConfig();
       return Response.json({ ok: true });
-    } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      return Response.json({ ok: false, message }, { status: 503 });
+    } catch {
+      return Response.json({ ok: false, message: "数据库或密钥就绪检查失败，请恢复原配置。" }, { status: 503 });
     }
   }
 

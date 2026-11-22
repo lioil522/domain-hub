@@ -11,7 +11,7 @@ services:
       TZ: ${TZ:-Asia/Shanghai} # 容器日志时区
 
       # 以下全部可选，留空即为不启用（详见 .env.example）
-      AES_KEY: ${AES_KEY:-} # AES-GCM 加密密钥，留空自动生成并保存到 /data/aes.key
+      AES_KEY: ${AES_KEY:-} # 新库留空生成 /data/aes.key；已有库缺密钥拒绝启动，升级保持原值
       ADMIN_TOKEN: ${ADMIN_TOKEN:-} # 应急后门令牌，忘记密码时兜底登录
       WEBHOOK_URL: ${WEBHOOK_URL:-} # 通知推送地址
       WEBHOOK_TYPE: ${WEBHOOK_TYPE:-} # 通知类型：dingtalk / feishu / wecom / serverchan / custom

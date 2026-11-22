@@ -115,7 +115,7 @@ Domain Hub 2.0 是一个 **Cloudflare Worker + React/Vite** 架构的域名管�
 建议使用：
 
 ```text
-Node.js >= 22.5.0
+Node.js >= 22.12.0
 npm
 ```
 
@@ -677,7 +677,7 @@ npm -v
 Node.js 建议使用当前 `package.json` 要求的：
 
 ```text
-Node.js >= 22.5.0
+Node.js >= 22.12.0
 ```
 
 安装依赖：
@@ -1538,13 +1538,15 @@ openssl rand -hex 32
 node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 ```
 
-如果留空，Node 服务首次启动会生成：
+如果留空且数据库尚不存在，Node 服务首次启动会安全生成：
 
 ```text
 /data/aes.key
 ```
 
 并持久化在 Docker Volume 中。
+
+**已有数据库缺少 `AES_KEY`/`aes.key` 时会拒绝启动，不能自动生成替代密钥。** 启动前会以只读方式验证已有凭据、2FA、通知与恢复密文；错密钥或坏密文也会阻断启动。请恢复原密钥和完整数据卷，不要删库或随意换 key。历史 `plain:` 数据仍可在显式配置密钥后读取。
 
 ### C-6. 启动
 
@@ -1573,6 +1575,8 @@ curl http://127.0.0.1:8787/healthz
 ```
 
 Docker 镜像本身也已经包含 `HEALTHCHECK`，会定期请求 `/healthz`。
+
+`/healthz` 是就绪检查：验证 schema、启动密钥校验记录及受管理的密钥文件；失败返回 503。`/livez` 仅表示进程存活，不应代替就绪检查。已有库中密钥丢失或不匹配时，服务不会打开 HTTP 监听或启动后台任务。
 
 ### C-8. 首次访问
 

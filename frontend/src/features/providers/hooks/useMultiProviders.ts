@@ -274,6 +274,11 @@ export function useMultiProviders({
     multiSyncOneAccount,
     multiToggleAllAccounts,
     multiToggleAccountCollapse,
+    revealMultiProviderAccount: (key: MultiProviderKey, accountId?: number) => {
+      const next = new Set(accountId === undefined ? [] : multiProviderCollapsed[key]);
+      if (accountId !== undefined) next.delete(accountId);
+      persistMultiProviderCollapsed(key, next);
+    },
     handleMultiUpdateAccount,
     handleMultiDeleteAccount,
   };

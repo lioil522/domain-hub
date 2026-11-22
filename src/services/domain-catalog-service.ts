@@ -1,9 +1,10 @@
 import { normalizeDomainKey, domainKeyCandidates } from "../../shared/domain-keys";
 import { toASCII, toUnicode } from "../../shared/punycode";
 import { computeDashboardStats, type SummaryExpiry } from "../../shared/dashboard-stats";
-import { CATALOG_PROVIDERS, type CatalogProvider, type CatalogSummary, type CatalogSearch, type CatalogHint } from "../../shared/domain-catalog";
+import { CATALOG_PROVIDERS, type CatalogProvider, type CatalogSummary, type CatalogSearch, type CatalogHint, type CatalogSearchScope } from "../../shared/domain-catalog";
 import { DomainCatalogRepository, type CatalogRow } from "../repositories/domain-catalog-repository";
 import { cachedCatalogSummary, initialSummaryDeadline, capSummaryDeadline } from "./catalog-summary-cache";
+import { CachedDnsSearchRepository, dnsSearchNeedles } from "../repositories/cached-dns-search-repository";
 
 export function catalogMatches(name: string, query: string) {
   const q = query.trim().toLowerCase();
@@ -13,8 +14,13 @@ export function catalogMatches(name: string, query: string) {
 interface Cursor { version: 1; scope: string; after: number; ceiling: number; }
 export interface PageQuery {
   provider: CatalogProvider; filter?: number; search?: string; status?: string; limit: number; cursor?: string; focus?: string;
+  searchIn?: string; focusId?: number;
 }
 export class CatalogQueryError extends Error {}
+export function catalogSearchScope(value = "domain"): CatalogSearchScope {
+  if (!["domain", "dns", "all"].includes(value)) throw new CatalogQueryError("无效的搜索范围");
+  return value as CatalogSearchScope;
+}
 
 function decodeCursor(raw: string, scope: string): Cursor {
   try {
@@ -27,7 +33,7 @@ function decodeCursor(raw: string, scope: string): Cursor {
   } catch { throw new CatalogQueryError("无效或与当前筛选不匹配的分页游标"); }
 }
 export class DomainCatalogService {
-  constructor(private readonly repository: DomainCatalogRepository) {}
+  constructor(private readonly repository: DomainCatalogRepository, private readonly dns?: CachedDnsSearchRepository) {}
 
   async summary(now = Date.now(), timezoneOffset = 0): Promise<CatalogSummary> {
     return (await this.summaryResult(now, timezoneOffset)).summary;
@@ -91,44 +97,64 @@ export class DomainCatalogService {
     return { summary: { stats, provider_counts, account_counts, root_domains: [...roots] }, validUntil };
   }
 
-  async search(query: string): Promise<CatalogSearch> {
+  async search(query: string, searchIn = "domain"): Promise<CatalogSearch> {
+    query = query.trim();
+    const scope = catalogSearchScope(searchIn);
     if (query.length > 253) throw new CatalogQueryError("搜索词过长");
-    const rows = await this.repository.searchProjection();
+    const [rows, cached] = query ? await Promise.all([
+      this.repository.searchProjection(),
+      scope === "domain" ? [] : this.dnsMatches(query),
+    ]) : [[], []];
+    const byId = new Map(cached.map(row => [`${row.provider}:${row.id}:${row.account_id}:${row.full_domain}`, row]));
     const group = (): CatalogSearch["groups"]["dnshe"] => ({ total: 0, items: [] });
     const groups: CatalogSearch["groups"] = {
       dnshe: group(), cloudflare: group(), digitalplat: group(), dnspod: group(),
       alidns: group(), huaweicloud: group(), vercel: group(), custom: group(),
     };
     for (const row of rows) {
-      if (!catalogMatches(row.full_domain, query)) continue;
+      const dns = byId.get(`${row.provider}:${row.id}:${row.account_id}:${row.full_domain}`);
+      if (!(scope !== "dns" && catalogMatches(row.full_domain, query)) && !dns) continue;
       const group = groups[row.provider];
       if (!group) continue;
       group.total++;
-      if (group.items.length < 8) group.items.push({ id: row.id, full_domain: row.full_domain, account_id: row.account_id, provider: row.provider });
+      if (group.items.length < 8) group.items.push({ ...row,
+        ...(dns ? { dns_match: { type: dns.type, name: dns.name, preview: dns.preview } } : {}) });
     }
-    return { query, groups };
+    return { query, groups, scope, ...(scope === "domain" ? {} : { dns_scope: "valid_cached_records" as const }) };
+  }
+  private dnsMatches(query: string, provider?: CatalogProvider, accountId?: number) {
+    if (!this.dns) throw new CatalogQueryError("当前搜索实例未启用 DNS 缓存检索");
+    return this.dns.matches(query, { provider, accountId });
   }
 
   async page(query: PageQuery) {
-    const search = (query.search || "").trim().toLowerCase();
+    const rawSearch = (query.search || "").trim();
+    const searchIn = catalogSearchScope(query.searchIn);
+    const search = searchIn === "domain" ? rawSearch.toLowerCase() : dnsSearchNeedles(rawSearch)[0] || "";
     if (search.length > 253 || (query.focus?.length || 0) > 253 || !Number.isInteger(query.limit) || query.limit < 1 || query.limit > 100) throw new CatalogQueryError("分页参数无效");
-    const scope = JSON.stringify([query.provider, query.filter ?? null, search, query.status || ""]);
+    if (query.focusId !== undefined && (!Number.isSafeInteger(query.focusId) || query.focusId < 0 || !query.focus)) throw new CatalogQueryError("定位 ID 无效或缺少对应域名");
+    const scope = JSON.stringify([query.provider, query.filter ?? null, search, query.status || "", ...(searchIn === "domain" ? [] : [searchIn])]);
     if (query.provider === "custom" && query.status) throw new CatalogQueryError("自定义域名不支持 status 筛选");
     // Unicode partial search needs decoding, unavailable as a D1 SQL function.
     // Only compact names/IDs are scanned; normal paging uses SQL keyset + LIMIT.
-    const names = search || query.focus ? (await this.repository.searchProjection())
-      .filter(row => row.provider === query.provider && (!query.filter || row.account_id === query.filter) &&
-        (!search || catalogMatches(row.full_domain, search))) : [];
+    const [projection, cached] = search || query.focus ? await Promise.all([
+      this.repository.searchProjection(),
+      search && searchIn !== "domain" ? this.dnsMatches(rawSearch, query.provider, query.filter) : [],
+    ]) : [[], []];
+    const dnsIds = new Set(cached.map(row => `${row.id}:${row.account_id}:${row.full_domain}`));
+    const names = projection.filter(row => row.provider === query.provider && (!query.filter || row.account_id === query.filter) &&
+      (!search || (searchIn !== "dns" && catalogMatches(row.full_domain, rawSearch)) || dnsIds.has(`${row.id}:${row.account_id}:${row.full_domain}`)));
     const input = { provider: query.provider, filter: query.filter, status: query.status,
       ...(search ? { ids: names.map(row => row.id) } : {}) };
-    let ceiling: number, after = -1;
+    let ceiling: number, after = -1, focusTarget: number | undefined;
     if (query.cursor) ({ after, ceiling } = decodeCursor(query.cursor, scope));
     else {
       ceiling = await this.repository.ceiling(input);
       if (query.focus) {
         const keys = domainKeyCandidates(query.focus);
-        const target = names.find(row => domainKeyCandidates(row.full_domain).some(key => keys.includes(key)));
-        if (target) after = target.id - 1;
+        const target = names.find(row => (query.focusId === undefined || row.id === query.focusId) &&
+          domainKeyCandidates(row.full_domain).some(key => keys.includes(key)));
+        if (target && await this.repository.focus(input, target.id)) { after = target.id - 1; focusTarget = target.id; }
         else throw new CatalogQueryError("目标域名已删除或不在当前来源");
       }
     }
@@ -138,6 +164,7 @@ export class DomainCatalogService {
     ]);
     for (const row of counts) account_counts[row.account_id] = { total: row.total, has_dns: row.has_dns };
     const selected = candidates.slice(0, query.limit);
+    if (focusTarget !== undefined && selected[0]?.id !== focusTarget) throw new CatalogQueryError("目标域名已发生变化，请重新搜索");
     const next_cursor = candidates.length > query.limit
       ? btoa(String.fromCharCode(...new TextEncoder().encode(JSON.stringify(
         { version: 1, scope, after: selected[selected.length - 1].id, ceiling } satisfies Cursor)))) : null;

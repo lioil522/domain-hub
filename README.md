@@ -121,6 +121,8 @@ npm
 
 开发工具链现固定为 Wrangler 4.166、Vite 8.3.8 + React 插件 6.3，并保留 React 18／Tailwind 3。使用两套 `npm ci` 安装锁文件，`npm run audit:dependencies` 检查完整开发/生产依赖；CI 不再忽略开发依赖审计。升级范围、体积口径及兼容限制见 [工具链记录](docs/TOOLCHAIN_PROGRESS_2026-11-22.md)。
 
+顶部搜索现在支持八类域名名称与**有效已缓存 DNS 的类型/name/content**，可用 IP、TXT 值定位所属库存；不会为搜索批量回源。未缓存不代表 DNS 不存在，缓存摘要也不是实时全量记录。详见 [DNS 搜索范围与限制](docs/DNS_CONTENT_SEARCH_PROGRESS_2026-11-22.md)。
+
 ---
 
 ## 项目结构

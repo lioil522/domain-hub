@@ -12,12 +12,13 @@ export interface DomainPageState extends CatalogPage<Domain, CustomDomain> {
   error: string | null;
   filter: string;
   focus: string;
+  focusId: number | null;
   cursor: string | null;
   history: Array<string | null>;
 }
 const empty = (): DomainPageState => ({
   domains: [], custom_domains: [], next_cursor: null, total: 0, account_counts: {}, hints: {},
-  loading: false, error: null, filter: "all", focus: "", cursor: null, history: [],
+  loading: false, error: null, filter: "all", focus: "", focusId: null, cursor: null, history: [],
 });
 export function catalogProviderForTab(tab: string): CatalogProvider | null {
   if (tab === "domains") return "dnshe";
@@ -34,6 +35,7 @@ export function useDomainCatalog(activeTab: string, search: string) {
   const [refreshingSummary, setRefreshingSummary] = useState(false);
   const [result, setResult] = useState<CatalogSearch | null>(null);
   const [searchError, setSearchError] = useState<string | null>(null);
+  const [searchEpoch, setSearchEpoch] = useState(0);
   const current = useRef({ activeTab, search, sessionToken });
   current.current = { activeTab, search, sessionToken };
   const pageRef = useRef(pages);
@@ -82,15 +84,19 @@ export function useDomainCatalog(activeTab: string, search: string) {
     const state = { ...pageRef.current[provider], ...changes, loading: true, error: null };
     pageRef.current = { ...pageRef.current, [provider]: state };
     setPages(pageRef.current);
-    const params = new URLSearchParams({ provider, limit: "100", search: current.current.search.trim() });
+    const params = new URLSearchParams({ provider, limit: "100", search: current.current.search.trim(), search_in: "all" });
     if (state.filter !== "all") params.set("account_id", state.filter);
     if (state.cursor) params.set("cursor", state.cursor);
-    else if (state.focus) params.set("focus", state.focus);
+    else if (state.focus) {
+      params.set("focus", state.focus);
+      if (state.focusId !== null) params.set("focus_id", String(state.focusId));
+    }
     try {
       const data = await apiJson<CatalogPage<Domain, CustomDomain>>(apiFetch, `/api/domains/page?${params}`, { signal: controller.signal });
       if (controller.signal.aborted || identity !== generation.current) return;
       if (!isCatalogPageResponse(data)) throw new Error("分页响应格式或条数上限不正确");
-      pageRef.current = { ...pageRef.current, [provider]: { ...state, ...data, loading: false } };
+      const { domains, custom_domains, next_cursor, total, account_counts, hints } = data;
+      pageRef.current = { ...pageRef.current, [provider]: { ...state, domains, custom_domains, next_cursor, total, account_counts, hints, loading: false } };
       setPages(pageRef.current);
     } catch (error) {
       if (controller.signal.aborted || identity !== generation.current) return;
@@ -100,8 +106,9 @@ export function useDomainCatalog(activeTab: string, search: string) {
   };
   const refresh = async (provider: CatalogProvider, filter?: string) => {
     void refreshSummary();
+    if (current.current.search.trim()) setSearchEpoch(value => value + 1);
     if (catalogProviderForTab(current.current.activeTab) === provider) {
-      await load(provider, { cursor: null, history: [], focus: "", ...(filter === undefined ? {} : { filter }) });
+      await load(provider, { cursor: null, history: [], focus: "", focusId: null, ...(filter === undefined ? {} : { filter }) });
     } else {
       controllers.current.get(provider)?.abort();
       pageRef.current = { ...pageRef.current, [provider]: { ...empty(), filter: filter || pageRef.current[provider].filter } };
@@ -119,7 +126,7 @@ export function useDomainCatalog(activeTab: string, search: string) {
       const page = pageRef.current[provider];
       if (!page.loading && page.history.length) void load(provider, { cursor: page.history[page.history.length - 1], history: page.history.slice(0, -1) });
     },
-    first: () => load(provider, { cursor: null, history: [], focus: "" }),
+    first: () => load(provider, { cursor: null, history: [], focus: "", focusId: null }),
   });
   useEffect(() => {
     generation.current++;
@@ -162,7 +169,8 @@ export function useDomainCatalog(activeTab: string, search: string) {
     if (!sessionToken || !provider) return;
     const state = { ...pageRef.current[provider], domains: [], custom_domains: [], loading: true,
       total: 0, next_cursor: null, cursor: null, history: [], error: null,
-      focus: search.trim() ? "" : pageRef.current[provider].focus };
+      focus: search.trim() ? "" : pageRef.current[provider].focus,
+      focusId: search.trim() ? null : pageRef.current[provider].focusId };
     pageRef.current = { ...pageRef.current, [provider]: state }; setPages(pageRef.current);
     const timer = window.setTimeout(() => { void load(provider, { cursor: null, history: [] }); }, search.trim() ? 250 : 0);
     return () => { window.clearTimeout(timer); controllers.current.get(provider)?.abort(); };
@@ -173,21 +181,21 @@ export function useDomainCatalog(activeTab: string, search: string) {
     const controller = new AbortController(), identity = generation.current;
     const timer = window.setTimeout(async () => {
       try {
-        const data = await apiJson<{ result: CatalogSearch }>(apiFetch, `/api/domains/search?search=${encodeURIComponent(search.trim())}`, { signal: controller.signal });
-        if (!isCatalogSearchResponse(data)) throw new Error("搜索响应格式不正确");
+        const data = await apiJson<{ result: CatalogSearch }>(apiFetch, `/api/domains/search?search=${encodeURIComponent(search.trim())}&search_in=all`, { signal: controller.signal });
+        if (!isCatalogSearchResponse(data) || data.result.scope !== "all" || data.result.dns_scope !== "valid_cached_records") throw new Error("搜索响应格式或 DNS 搜索能力不匹配");
         if (!controller.signal.aborted && identity === generation.current) setResult(data.result);
       } catch (error) {
         if (!controller.signal.aborted && identity === generation.current) setSearchError(error instanceof Error ? error.message : "搜索失败");
       }
     }, 250);
     return () => { window.clearTimeout(timer); controller.abort(); };
-  }, [search, sessionToken, backendUrl]);
+  }, [search, sessionToken, backendUrl, searchEpoch]);
   return {
     source, pages, summary, summaryError, refreshingSummary, result, searchError, refreshSummary,
-    locate: (provider: CatalogProvider, name: string) => {
+    locate: (provider: CatalogProvider, name: string, id?: number, accountId?: number) => {
       // The navigation effect will load this scope after the tab/search state settles.
       controllers.current.get(provider)?.abort();
-      pageRef.current = { ...pageRef.current, [provider]: { ...empty(), filter: "all", focus: name } };
+      pageRef.current = { ...pageRef.current, [provider]: { ...empty(), filter: accountId === undefined ? "all" : String(accountId), focus: name, focusId: id ?? null } };
       setPages(pageRef.current);
       if (catalogProviderForTab(current.current.activeTab) === provider && !current.current.search) void load(provider);
     },

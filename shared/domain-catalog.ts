@@ -1,6 +1,8 @@
 import type { DashboardStats } from "./dashboard-stats";
 export const CATALOG_PROVIDERS = ["dnshe", "cloudflare", "digitalplat", "dnspod", "alidns", "huaweicloud", "vercel", "custom"] as const;
 export type CatalogProvider = typeof CATALOG_PROVIDERS[number];
+export type CatalogSearchScope = "domain" | "dns" | "all";
+export interface CatalogDnsMatch { type: string; name: string; preview: string; }
 export interface CatalogCount { total: number; has_dns: number; }
 export interface CatalogHint {
   providers: CatalogProvider[];
@@ -20,10 +22,13 @@ export interface CatalogSearchItem {
   full_domain: string;
   account_id: number;
   provider: CatalogProvider;
+  dns_match?: CatalogDnsMatch;
 }
 export interface CatalogSearch {
   query: string;
   groups: Record<CatalogProvider, { total: number; items: CatalogSearchItem[] }>;
+  scope?: CatalogSearchScope;
+  dns_scope?: "valid_cached_records";
 }
 export interface CatalogPage<T, C> {
   domains: T[];

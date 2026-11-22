@@ -22,6 +22,7 @@ import type { resyncAccountsInBackground } from "../services/account-sync-servic
 import { DomainCatalogRepository } from "../repositories/domain-catalog-repository";
 import { DomainCatalogService, CatalogQueryError } from "../services/domain-catalog-service";
 import { CATALOG_PROVIDERS, type CatalogProvider } from "../../shared/domain-catalog";
+import { CachedDnsSearchRepository } from "../repositories/cached-dns-search-repository";
 
 function accountService(db: DatabaseManager) { return new AccountService(new AccountRepository(db)); }
 function domainService(db: DatabaseManager) { return new DomainService(new DomainRepository(db)); }
@@ -34,7 +35,7 @@ export interface DomainRouteDeps {
 }
 
 export function registerDomainRoutes(app: Hono<AppEnv>, deps: DomainRouteDeps) {
-  const catalog = (db: DatabaseManager) => new DomainCatalogService(new DomainCatalogRepository(db));
+  const catalog = (db: DatabaseManager) => new DomainCatalogService(new DomainCatalogRepository(db), new CachedDnsSearchRepository(db));
   app.get("/api/domains/summary", async c => {
     try {
       const offset = Number(c.req.query("timezone_offset") || 0);
@@ -49,10 +50,12 @@ export function registerDomainRoutes(app: Hono<AppEnv>, deps: DomainRouteDeps) {
     catch { return c.json(errorRes("无法读取全量域名摘要"), 500); }
   });
   app.get("/api/domains/search", async c => {
-    try { return c.json(successRes({ result: await catalog(c.get("db")).search(c.req.query("search") || "") })); }
+    c.header("Cache-Control", "private, no-store");
+    try { return c.json(successRes({ result: await catalog(c.get("db")).search(c.req.query("search") || "", c.req.query("search_in")) })); }
     catch (error) { return c.json(errorRes(error instanceof Error ? error.message : "搜索失败"), error instanceof CatalogQueryError ? 400 : 500); }
   });
   app.get("/api/domains/page", async c => {
+    c.header("Cache-Control", "private, no-store");
     try {
       const provider = c.req.query("provider") || "dnshe";
       if (!(CATALOG_PROVIDERS as readonly string[]).includes(provider)) throw new CatalogQueryError("无效的域名来源");
@@ -62,6 +65,8 @@ export function registerDomainRoutes(app: Hono<AppEnv>, deps: DomainRouteDeps) {
       const page = await catalog(c.get("db")).page({
         provider: provider as CatalogProvider, filter, search: c.req.query("search"), status: c.req.query("status"),
         limit: c.req.query("limit") === undefined ? 100 : Number(c.req.query("limit")), cursor: c.req.query("cursor"), focus: c.req.query("focus"),
+        searchIn: c.req.query("search_in"),
+        focusId: c.req.query("focus_id") === undefined ? undefined : c.req.query("focus_id") === "" ? NaN : Number(c.req.query("focus_id")),
       });
       return c.json(successRes(page));
     } catch (error) { return c.json(errorRes(error instanceof Error ? error.message : "分页读取失败"), error instanceof CatalogQueryError ? 400 : 500); }

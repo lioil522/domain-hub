@@ -2,6 +2,8 @@ import { CATALOG_PROVIDERS } from "./domain-catalog";
 const record = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 const count = (value: unknown) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+const boundedText = (value: unknown, characters: number) => typeof value === "string" &&
+  value.length <= characters * 2 && Array.from(value).length <= characters;
 
 export function isCatalogPageResponse(value: unknown): boolean {
   return record(value) && value.success === true &&
@@ -28,9 +30,17 @@ export function isCatalogSummaryResponse(value: unknown): boolean {
 export function isCatalogSearchResponse(value: unknown): boolean {
   if (!record(value) || value.success !== true || !record(value.result) || !record(value.result.groups)) return false;
   const groups = value.result.groups;
+  const scope = value.result.scope;
+  if (value.result.scope !== undefined && !["domain", "dns", "all"].includes(String(value.result.scope))) return false;
+  if (value.result.dns_scope !== undefined && value.result.dns_scope !== "valid_cached_records") return false;
   return typeof value.result.query === "string" && CATALOG_PROVIDERS.every(provider => {
     const group = groups[provider];
     return record(group) && count(group.total) && Array.isArray(group.items) && group.items.length <= 8 &&
-      group.items.every(row => record(row) && count(row.id) && typeof row.full_domain === "string");
+      group.items.every(row => record(row) && count(row.id) && typeof row.full_domain === "string" &&
+        (row.provider === undefined || row.provider === provider) &&
+        (scope === undefined || (row.provider === provider && typeof row.account_id === "number")) &&
+        (row.account_id === undefined || (typeof row.account_id === "number" && count(row.account_id) && row.account_id > 0)) &&
+        (row.dns_match === undefined || (record(row.dns_match) && typeof row.dns_match.type === "string" && row.dns_match.type.length <= 16 &&
+          boundedText(row.dns_match.name, 254) && boundedText(row.dns_match.preview, 512))));
   });
 }

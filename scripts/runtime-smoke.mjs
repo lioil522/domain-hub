@@ -66,6 +66,34 @@ async function summaryCacheSmoke(fetcher, headers) {
   assert.equal(forced.headers.get("X-Catalog-Summary-Cache"), "bypass");
   console.log("[runtime-smoke] summary cache hit, transactional invalidation and explicit bypass passed");
 }
+async function cachedDnsSearchSmoke(fetcher, headers, run) {
+  const id = 900001, keyword = "runtime-cache-token-only";
+  await run("INSERT INTO accounts(id,alias,api_key,api_secret,provider) VALUES(900001,'search runtime','isolated-search','plain:c2VjcmV0','cloudflare')");
+  await run(`INSERT INTO domains_cache(id,account_id,subdomain,rootdomain,full_domain,status,expires_at)
+    VALUES(900001,900001,'','example.net','search-runtime.example.net','已解析','2035-01-01')`);
+  await run("INSERT INTO cache(key,value,expires_at) VALUES(?,?,?)",
+    [`api_cache:dns:${id}`, JSON.stringify([{ id: "search-record", type: "TXT", name: "_verify", content: keyword }]), Math.floor(Date.now() / 1000) + 3600]);
+  const endpoint = `/api/domains/search?search=${keyword}&search_in=all`;
+  const result = await fetcher(endpoint, { headers });
+  assert.equal(result.status, 200, await result.clone().text());
+  const group = (await result.json()).result.groups.cloudflare;
+  assert.equal(group.total, 1);
+  assert.equal(group.items[0].id, id);
+  assert.equal(group.items[0].dns_match.preview, keyword);
+  const legacy = await fetcher(`/api/search?q=${keyword}`, { headers });
+  assert.equal(legacy.status, 200, await legacy.clone().text());
+  const hit = (await legacy.json()).results.find(row => row.type === "dns");
+  assert.equal(hit.metadata.domainId, id);
+  assert.equal(hit.provider, "cloudflare");
+  const page = await fetcher(`/api/domains/page?provider=cloudflare&search_in=dns&search=${keyword}&limit=1`, { headers });
+  assert.equal(page.status, 200, await page.clone().text());
+  assert.equal((await page.json()).domains[0].id, id);
+  await run("UPDATE cache SET value=? WHERE key=?", [
+    JSON.stringify([{ id: "search-record", type: "TXT", name: "_verify", content: "runtime-cache-new-value" }]), `api_cache:dns:${id}`,
+  ]);
+  assert.equal((await (await fetcher(endpoint, { headers })).json()).result.groups.cloudflare.total, 0);
+  console.log("[runtime-smoke] cached DNS-only content search, source routing, paging and changed-cache reads passed");
+}
 
 const base = process.platform === "win32" && process.env.LOCALAPPDATA
   ? path.join(process.env.LOCALAPPDATA, "Temp/opencode") : tmpdir();
@@ -141,6 +169,8 @@ try {
   assert.equal(Number(original.runtime_real.value), 1.2345678901234567);
   console.log("[runtime-smoke] workerd/D1 v5 duplicate archive and unique migration passed");
   await summaryCacheSmoke(fetcher, headers);
+  await cachedDnsSearchSmoke(fetcher, headers, (sql, args = []) => sqlite.prepare(sql).bind(...args).run());
+  assert.equal(workerDeliveries, 1, "Search must not cause an upstream delivery or provider request");
 }
 finally { await mf.dispose(); }
 
@@ -170,6 +200,12 @@ try {
   const fetcher = (pathname, init) => request(`${url}${pathname}`, init);
   const headers = await authentication(fetcher);
   await summaryCacheSmoke(fetcher, headers);
+  const { DatabaseSync } = await import("node:sqlite");
+  const sqlite = new DatabaseSync(path.join(data, "domain-hub.db"));
+  try {
+    sqlite.exec("PRAGMA busy_timeout = 5000");
+    await cachedDnsSearchSmoke(fetcher, headers, async (sql, args = []) => sqlite.prepare(sql).run(...args));
+  } finally { sqlite.close(); }
   console.log("[runtime-smoke] isolated workerd/D1 and Node/SQLite passed");
 } finally {
   child.kill("SIGTERM");

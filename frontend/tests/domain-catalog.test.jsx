@@ -10,6 +10,10 @@ import { computeDashboardStats } from "../../shared/dashboard-stats";
 import { useCustomProvidersActions } from "../src/features/custom/hooks/custom-providers/useCustomProvidersActions";
 import { useCustomProvidersData } from "../src/features/custom/hooks/custom-providers/useCustomProvidersData";
 import { isCatalogPageResponse, isCatalogSearchResponse, isCatalogSummaryResponse } from "../src/features/domains/utils/catalog-response";
+import { useDnsheDomains } from "../src/features/domains/hooks/useDnsheDomains";
+import { SearchResultGroups } from "../src/components/search/SearchResultGroups";
+import { useMultiProviders } from "../src/features/providers/hooks/useMultiProviders";
+import { MULTI_PROVIDER_COLLAPSED_STORAGE } from "../src/features/providers/providerMeta";
 
 function deferred() {
   let resolve;
@@ -212,4 +216,101 @@ test("a summary invalidated during its request is not published before the follo
     if (tree) await act(async () => { tree.unmount(); });
     Object.assign(globalThis, previous);
   }
+});
+test("DNS-filtered server pages cannot be discarded by the DNSHE name-only grouping hook", async () => {
+  const previous = globalThis.localStorage;
+  globalThis.localStorage = { getItem() { return null; }, setItem() {} };
+  let model, tree;
+  function Probe({ filtered }) { model = useDnsheDomains([row(9999)], [], "content-only-token", filtered); return null; }
+  try {
+    await act(async () => { tree = create(<Probe filtered />); });
+    assert.equal(model.groupedDomains[0].domains[0].id, 9999);
+    await act(async () => { tree.update(<Probe filtered={false} />); });
+    assert.equal(model.groupedDomains.length, 0, "legacy callers retain name-only filtering");
+  } finally { if (tree) await act(async () => tree.unmount()); globalThis.localStorage = previous; }
+});
+test("DNS search results explain cache scope and pass exact source/ID/account to navigation", async () => {
+  let tree, jump;
+  const result = { kw: "content-only-token", dns_scope: "valid_cached_records", dnsheHits: [], cfHits: [
+    { id: 100001, account_id: 9, full_domain: "same.example.net", dns_match: { type: "TXT", name: "_verify", preview: "<script>content-only-token</script>" } },
+  ], dpHits: [], customHits: [], multiHits: { dnspod: [], alidns: [], huaweicloud: [], vercel: [] } };
+  try {
+    await act(async () => { tree = create(<SearchResultGroups result={result} onJump={(...args) => { jump = args; }} />); });
+    assert.ok(JSON.stringify(tree.toJSON()).includes("不是实时全量 DNS 查询"));
+    assert.ok(JSON.stringify(tree.toJSON()).includes("DNS 缓存"));
+    assert.equal(tree.root.findAllByType("script").length, 0);
+    await act(async () => tree.root.findByType("button").props.onClick());
+    assert.deepEqual(jump, ["cf", "same.example.net", 100001, 9]);
+  } finally { if (tree) await act(async () => tree.unmount()); }
+});
+test("search response metadata uses Unicode character bounds without accepting oversized previews or wrong sources", () => {
+  const value = { success: true, result: { query: "token", scope: "all", dns_scope: "valid_cached_records",
+    groups: Object.fromEntries(CATALOG_PROVIDERS.map(provider => [provider, { total: 0, items: [] }])) } };
+  value.result.groups.dnshe = { total: 1, items: [{ id: 1, account_id: 1, provider: "dnshe", full_domain: "example.net",
+    dns_match: { type: "TXT", name: "@", preview: "😀".repeat(512) } }] };
+  assert.equal(isCatalogSearchResponse(value), true);
+  value.result.groups.dnshe.items[0].dns_match.preview = "😀".repeat(513);
+  assert.equal(isCatalogSearchResponse(value), false);
+  value.result.groups.dnshe.items[0].dns_match.preview = "token";
+  value.result.groups.dnshe.items[0].provider = "cloudflare";
+  assert.equal(isCatalogSearchResponse(value), false);
+});
+test("global cached search suppresses an old response and exact locators keep their client-owned control state", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const store = { getItem: key => key === "DOMAIN_HUB_SESSION" ? "search-fixture" : null, setItem() {}, removeItem() {} };
+  const previous = { localStorage: globalThis.localStorage, sessionStorage: globalThis.sessionStorage, window: globalThis.window };
+  Object.assign(globalThis, { localStorage: store, sessionStorage: store, window: {
+    setTimeout: (...args) => globalThis.setTimeout(...args), clearTimeout: id => globalThis.clearTimeout(id),
+  } });
+  const searches = [], pages = [];
+  const result = query => ({ success: true, result: { query, scope: "all", dns_scope: "valid_cached_records",
+    groups: Object.fromEntries(CATALOG_PROVIDERS.map(provider => [provider, { total: 0, items: [] }])) } });
+  t.mock.method(globalThis, "fetch", async (input, init) => {
+    if (String(input).includes("/summary")) return Response.json(summaryResponse());
+    if (String(input).includes("/search?")) {
+      const response = deferred(); searches.push({ input: String(input), signal: init.signal, response }); return response.promise;
+    }
+    pages.push(String(input));
+    return Response.json({ ...page(100001), domains: [{ ...row(100001), account_id: 9 }], focusId: 1, filter: "all", focus: "malicious-control.example" });
+  });
+  let model, tree;
+  function Probe({ search }) { model = useDomainCatalog("domains", search); return null; }
+  const render = search => <AppDataProvider><Probe search={search} /></AppDataProvider>;
+  try {
+    await act(async () => { tree = create(render("old-content")); });
+    await act(async () => t.mock.timers.tick(251));
+    assert.ok(searches[0].input.includes("search_in=all"));
+    assert.ok(pages[0].includes("search_in=all"));
+    await act(async () => { tree.update(render("new-content")); });
+    await act(async () => t.mock.timers.tick(251));
+    assert.equal(searches[0].signal.aborted, true);
+    await act(async () => searches[1].response.resolve(Response.json(result("new-content"))));
+    await act(async () => searches[0].response.resolve(Response.json(result("old-content"))));
+    assert.equal(model.result.query, "new-content");
+    await act(async () => { model.locate("dnshe", "same.example.net", 100001, 9); tree.update(render("")); });
+    await act(async () => t.mock.timers.tick(1));
+    const url = pages[pages.length - 1];
+    assert.ok(url.includes("focus_id=100001") && url.includes("account_id=9"));
+    assert.equal(model.pages.dnshe.focusId, 100001);
+    assert.equal(model.pages.dnshe.filter, "9");
+    assert.equal(model.pages.dnshe.focus, "same.example.net");
+  } finally { if (tree) await act(async () => tree.unmount()); Object.assign(globalThis, previous); }
+});
+test("revealing a searched account expands only the target group without discarding other collapsed groups", async () => {
+  const previous = { localStorage: globalThis.localStorage, sessionStorage: globalThis.sessionStorage };
+  const values = new Map([["DOMAIN_HUB_SESSION", "fold-fixture"], [MULTI_PROVIDER_COLLAPSED_STORAGE.dnspod, "[1,2]"]]);
+  const store = { getItem: key => values.get(key) || null, setItem: (key, value) => values.set(key, value), removeItem: key => values.delete(key) };
+  Object.assign(globalThis, { localStorage: store, sessionStorage: store });
+  let model, tree;
+  const pages = Object.fromEntries(["dnspod", "alidns", "huaweicloud", "vercel"].map(key => [key,
+    { domains: [], loading: false, total: 0, filter: "all", refresh: async () => {} }]));
+  function Probe() { model = useMultiProviders({ pages, setActionLoading() {}, waitForAccountDomainSync: async () => {}, handleSyncAccount: async () => {} }); return null; }
+  try {
+    await act(async () => { tree = create(<AppDataProvider><Probe /></AppDataProvider>); });
+    assert.equal(model.multiProviderCollapsed.dnspod.has(2), true);
+    await act(async () => model.revealMultiProviderAccount("dnspod", 2));
+    assert.equal(model.multiProviderCollapsed.dnspod.has(2), false);
+    assert.equal(model.multiProviderCollapsed.dnspod.has(1), true);
+    assert.equal(values.get(MULTI_PROVIDER_COLLAPSED_STORAGE.dnspod), "[1]");
+  } finally { if (tree) await act(async () => tree.unmount()); Object.assign(globalThis, previous); }
 });

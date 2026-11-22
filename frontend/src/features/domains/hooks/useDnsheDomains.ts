@@ -30,7 +30,7 @@ const COLLAPSED_LS_KEY = "DNSHE_COLLAPSED_ACCOUNTS";
  * NOTE: `domainSearchIndex` / `accountSeqMap` 只服务于本 hook 内部的
  * `groupedDomains` 计算，属私有派生量，不对外返回。
  */
-export function useDnsheDomains(domains: Domain[], accounts: Account[], globalSearch: string) {
+export function useDnsheDomains(domains: Domain[], accounts: Account[], globalSearch: string, serverFiltered = false) {
   // 域名列表中被收起的账号分组集合（存 accountId，持久化于本地，刷新后保持上次布局）
   const [collapsedAccounts, setCollapsedAccounts] = useState<Set<number>>(() => {
     try {
@@ -95,7 +95,7 @@ export function useDnsheDomains(domains: Domain[], accounts: Account[], globalSe
     // 注意中文「部分匹配」依赖上面的解码形态，因为半个标签的 Punycode 编码
     // 并不是整标签编码的子串。
     const kwAscii = kw ? toASCII(kw).toLowerCase() : "";
-    const source = kw
+    const source = kw && !serverFiltered
       ? domains.filter((d) => {
           const hay = domainSearchIndex.get(d.id) || "";
           return hay.includes(kw) || (kwAscii !== kw && hay.includes(kwAscii));
@@ -122,7 +122,7 @@ export function useDnsheDomains(domains: Domain[], accounts: Account[], globalSe
       if (b.seq === 0) return -1;
       return a.seq - b.seq;
     });
-  }, [domains, globalSearch, domainSearchIndex, accountSeqMap]);
+  }, [domains, globalSearch, domainSearchIndex, accountSeqMap, serverFiltered]);
 
   // 当前搜索命中的域名总数 —— 供筛选栏提示使用。
   //

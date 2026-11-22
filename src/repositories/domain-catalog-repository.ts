@@ -73,6 +73,10 @@ export class DomainCatalogRepository {
     const { from, binds } = this.selection(input);
     return (await this.db.firstRaw<{ ceiling: number | null }>(`SELECT MAX(d.id) ceiling ${from}`, binds))?.ceiling ?? -1;
   }
+  async focus(input: SqlPageFilter, id: number) {
+    const { from, binds } = this.selection(input);
+    return this.db.firstRaw<{ id: number }>(`SELECT d.id ${from} AND d.id=?`, [...binds, id]);
+  }
   async counts(input: SqlPageFilter, ceiling: number) {
     const { from, binds, custom } = this.selection(input);
     return this.db.allRaw<{ account_id: number; total: number; has_dns: number }>(`

@@ -120,14 +120,15 @@ export function useAppControllerView() {
   const currentProvider = catalogProviderForTab(activeTab);
   const currentPage = currentProvider ? catalog.source(currentProvider) : null;
   const focusedDomain = currentPage?.focus ? normalizeDomainKey(currentPage.focus) : "";
+  const focusedId = currentPage?.focusId ?? null;
   const catalogCard = (domain: { full_domain: string; id?: number }, card: React.ReactNode) => (
-    <div key={domain.id ?? normalizeDomainKey(domain.full_domain)} data-catalog-domain={normalizeDomainKey(domain.full_domain)}
-      className={normalizeDomainKey(domain.full_domain) === focusedDomain ? "rounded-xl ring-2 ring-accent" : undefined}>{card}</div>
+    <div key={domain.id ?? normalizeDomainKey(domain.full_domain)} data-catalog-id={domain.id} data-catalog-domain={normalizeDomainKey(domain.full_domain)}
+      className={(focusedId !== null ? domain.id === focusedId : normalizeDomainKey(domain.full_domain) === focusedDomain) ? "rounded-xl ring-2 ring-accent" : undefined}>{card}</div>
   );
   useEffect(() => {
     if (!focusedDomain || currentPage?.loading || currentPage?.error) return;
     const find = () => {
-      const element = document.querySelector(`[data-catalog-domain="${CSS.escape(focusedDomain)}"]`);
+      const element = document.querySelector(focusedId !== null ? `[data-catalog-id="${focusedId}"]` : `[data-catalog-domain="${CSS.escape(focusedDomain)}"]`);
       if (!element) return false;
       element.scrollIntoView({ behavior: "smooth", block: "center" }); return true;
     };
@@ -135,7 +136,7 @@ export function useAppControllerView() {
     const observer = new MutationObserver(() => { if (find()) observer.disconnect(); });
     observer.observe(document.body, { childList: true, subtree: true });
     return () => observer.disconnect();
-  }, [focusedDomain, activeTab, currentPage?.loading, currentPage?.error]);
+  }, [focusedDomain, focusedId, activeTab, currentPage?.loading, currentPage?.error]);
 
   // 侧栏 / 抽屉 / 断点状态已随外壳(useAppLayout)下沉到 app/AppShell,
   // App 不再持有这些量 —— 它们在外壳之外没有任何消费点。
@@ -159,7 +160,7 @@ export function useAppControllerView() {
     groupedDomains,
     toggleAccountCollapse,
     toggleAllAccounts,
-  } = useDnsheDomains(domains, accounts, globalSearch);
+  } = useDnsheDomains(domains, accounts, globalSearch, true);
 
   // Toast 提示状态已在 AppDataProvider 内通过 useToast 挂载（Phase 2.5）
 
@@ -493,6 +494,7 @@ export function useAppControllerView() {
     multiSyncOneAccount,
     multiToggleAllAccounts,
     multiToggleAccountCollapse,
+    revealMultiProviderAccount,
     handleMultiUpdateAccount,
     handleMultiDeleteAccount,
   } = useMultiProviders({ setActionLoading, waitForAccountDomainSync, handleSyncAccount, pages: {
@@ -693,7 +695,7 @@ export function useAppControllerView() {
   //       useCustomProviders 的调用点。
   const groups = catalog.result?.groups;
   const crossSourceSearch = groups ? {
-    kw: catalog.result!.query, dnsheHits: groups.dnshe.items, cfHits: groups.cloudflare.items, dpHits: groups.digitalplat.items,
+    kw: catalog.result!.query, dns_scope: catalog.result!.dns_scope, dnsheHits: groups.dnshe.items, cfHits: groups.cloudflare.items, dpHits: groups.digitalplat.items,
     multiHits: { dnspod: groups.dnspod.items, alidns: groups.alidns.items, huaweicloud: groups.huaweicloud.items, vercel: groups.vercel.items },
     customHits: groups.custom.items, totals: { dnshe: groups.dnshe.total, cf: groups.cloudflare.total, dp: groups.digitalplat.total,
       custom: groups.custom.total, dnspod: groups.dnspod.total, alidns: groups.alidns.total, huaweicloud: groups.huaweicloud.total, vercel: groups.vercel.total },
@@ -788,7 +790,20 @@ export function useAppControllerView() {
   const persistCfExpiryMap = (map: Parameters<typeof persistLocalCfExpiry>[0], touchTs = true) => {
     persistLocalCfExpiry(map, touchTs); void catalog.refreshSummary();
   };
-  const handleCrossSourceJump = (source: JumpSource, name: string) => {
+  const handleCrossSourceJump = (source: JumpSource, name: string, id?: number, accountId?: number) => {
+    if (id !== undefined) {
+      const filter = accountId === undefined ? "all" : String(accountId);
+      if (source === "dnshe") { setSelectedAccountFilter(filter); persistCollapsed(new Set()); }
+      if (source === "cf") { setCfAccountFilter(filter); persistCfCollapsed(new Set()); }
+      if (source === "dp") { setDpAccountFilter(filter); persistDpCollapsed(new Set()); }
+      if (source === "custom") { setCustomGroupFilter(filter); persistCustomCollapsed(new Set()); }
+      else if (source !== "dnshe" && source !== "cf" && source !== "dp") {
+        setMultiProviderFilter(prev => ({ ...prev, [source]: filter })); revealMultiProviderAccount(source, accountId);
+      }
+      const provider = source === "cf" ? "cloudflare" : source === "dp" ? "digitalplat" : source;
+      catalog.locate(provider, name, id, accountId); setGlobalSearch(""); setActiveTab(provider === "dnshe" ? "domains" : provider);
+      return;
+    }
     if (source === "dnshe") return gotoDnsheDomain(name);
     if (source === "cf") return gotoCfZone(name);
     if (source === "dp") return gotoDpDomain(name);

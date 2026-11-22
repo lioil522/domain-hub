@@ -71,7 +71,7 @@ export interface AppLayoutProps {
   /** 跨来源聚合命中（无命中时为 null，不渲染下拉） */
   crossSourceSearch: CrossSourceResult | null;
   onGlobalSearchSubmit: () => void;
-  onCrossSourceJump: (source: JumpSource, fullDomain: string) => void;
+  onCrossSourceJump: (source: JumpSource, fullDomain: string, id?: number, accountId?: number) => void;
 
   // ── 通知铃铛 ──
   notifOpen: boolean;
@@ -306,7 +306,7 @@ export function AppLayout(props: AppLayoutProps) {
               onKeyDown={(e) => { if (e.key === "Enter") onGlobalSearchSubmit(); }}
               onFocus={() => setSearchFocused(true)}
               onBlur={() => window.setTimeout(() => setSearchFocused(false), 150)}
-              placeholder="搜索域名…"
+              placeholder="搜索域名或已缓存 DNS 内容…"
               className="form-input w-full pl-9 pr-3 py-2 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
             />
             {/* 跨来源聚合搜索下拉：输入关键词且聚焦时展示各来源命中 */}

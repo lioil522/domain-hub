@@ -76,6 +76,7 @@ export class DatabaseManager {
 
   async allRaw<T>(sql: string, bindings: unknown[] = []): Promise<T[]> {
     const result = await this.db.prepare(sql).bind(...bindings).all<T>();
+    if (!result.success || !Array.isArray(result.results)) throw new Error("读取数据库结果失败");
     return result.results || [];
   }
 

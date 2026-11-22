@@ -11,6 +11,8 @@ import { resolveNodeKey, verifyManagedKeyFile, requireSafeSqliteVersion, NodeKey
 import { validateStoredNodeKeys, preflightNodeDatabase, ensureNodeKeyMarker, assertNodeKeyMarker, NODE_KEY_CHECK } from "../../server/key-validation";
 import { encryptText } from "../../src/db/crypto";
 import { freshSchemaSql, MIGRATION_NAMES } from "../../src/db/schema-definition";
+import { configureSqliteStartup } from "../../server/sqlite-startup";
+import { loopbackFetch as fetch } from "../helpers/loopback-fetch.mjs";
 
 const KEY = "node-key-security-fixture";
 const SECRET = "private-fixture-do-not-log";
@@ -319,4 +321,70 @@ test("concurrent real Node processes migrate v5 duplicates once and retain their
     assert.equal(JSON.parse(String(saved)).columns.remark.value, "archive");
     assert.equal(read.prepare("SELECT COUNT(*) n FROM domain_hub_schema_migrations WHERE version=6").get()?.n, 1);
   } finally { read.close(); }
+});
+test("real Node WAL setup waits for a separate reader after key preflight", async t => {
+  const { dir, sqlite } = fixture(t);
+  account(sqlite, await encryptText(SECRET, KEY));
+  sqlite.exec("BEGIN");
+  sqlite.prepare("SELECT COUNT(*) FROM accounts").get(); // Hold a rollback-journal read lock.
+  let released = false;
+  const release = setTimeout(() => { sqlite.exec("ROLLBACK"); released = true; }, 300);
+  try {
+    const server = await runningProcess(t, dir, KEY);
+    assert.equal(released, true);
+    assert.equal((await fetch(`${server.url}/healthz`)).status, 200);
+    assert.equal(existsSync(path.join(dir, "aes.key")), false);
+  } finally {
+    clearTimeout(release);
+    if (!released) sqlite.exec("ROLLBACK");
+  }
+});
+test("WAL setup retries immediate BUSY with a decreasing total wait budget", async () => {
+  let clock = 0, attempts = 0, mode = "delete";
+  const commands: string[] = [], waits: number[] = [];
+  const sqlite = {
+    exec(sql: string) {
+      commands.push(sql);
+      if (sql === "PRAGMA journal_mode = WAL") {
+        if (++attempts < 3) throw Object.assign(new Error("immediate busy"), { code: "ERR_SQLITE_ERROR", errcode: 5 });
+        mode = "wal";
+      }
+    },
+    prepare() { return { get: () => ({ journal_mode: mode }) }; },
+  };
+  await configureSqliteStartup(sqlite, { timeoutMs: 100, now: () => clock, wait: async ms => { waits.push(ms); clock += ms; } });
+  assert.equal(attempts, 3);
+  assert.deepEqual(waits, [25, 25]);
+  assert.deepEqual(commands.filter(sql => sql.startsWith("PRAGMA busy_timeout")), [
+    "PRAGMA busy_timeout = 100", "PRAGMA busy_timeout = 75", "PRAGMA busy_timeout = 50", "PRAGMA busy_timeout = 5000",
+  ]);
+});
+test("WAL setup rejects permanent BUSY at deadline instead of looping or ignoring failure", async () => {
+  let clock = 0, attempts = 0;
+  const busy = Object.assign(new Error("busy"), { code: "ERR_SQLITE_ERROR", errcode: 517 });
+  const sqlite = {
+    exec(sql: string) { if (sql === "PRAGMA journal_mode = WAL") { attempts++; throw busy; } },
+    prepare() { return { get: () => ({ journal_mode: "delete" }) }; },
+  };
+  await assert.rejects(() => configureSqliteStartup(sqlite, { timeoutMs: 60, now: () => clock, wait: async ms => { clock += ms; } }), error => error === busy);
+  assert.equal(clock, 60);
+  assert.equal(attempts, 4);
+});
+test("WAL setup never retries non-BUSY errors or silently accepts a rejected mode", async () => {
+  const failure = Object.assign(new Error("storage failure"), { code: "ERR_SQLITE_ERROR", errcode: 10 });
+  const badStorage = { exec(sql: string) { if (sql === "PRAGMA journal_mode = WAL") throw failure; },
+    prepare() { return { get: () => ({ journal_mode: "delete" }) }; } };
+  await assert.rejects(() => configureSqliteStartup(badStorage, { wait: async () => { assert.fail("Non-BUSY retried"); } }), error => error === failure);
+  const rejected = { exec() {}, prepare() { return { get: () => ({ journal_mode: "delete" }) }; } };
+  await assert.rejects(() => configureSqliteStartup(rejected), /did not accept WAL/);
+});
+test("an existing WAL database does not require another journal-mode transition", async t => {
+  const { sqlite } = fixture(t);
+  sqlite.exec("PRAGMA journal_mode = WAL");
+  const before = sqlite.prepare("SELECT name,sql FROM sqlite_master ORDER BY name").all();
+  await configureSqliteStartup(sqlite);
+  assert.equal(sqlite.prepare("PRAGMA journal_mode").get()?.journal_mode, "wal");
+  assert.equal(sqlite.prepare("PRAGMA foreign_keys").get()?.foreign_keys, 1);
+  assert.equal(sqlite.prepare("PRAGMA busy_timeout").get()?.timeout, 5000);
+  assert.deepEqual(sqlite.prepare("SELECT name,sql FROM sqlite_master ORDER BY name").all(), before);
 });

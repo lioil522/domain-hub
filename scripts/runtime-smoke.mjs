@@ -5,6 +5,7 @@ import { mkdtemp, mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { loopbackFetch } from "../tests/helpers/loopback-fetch.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const require = createRequire(path.join(root, "package.json"));
@@ -12,7 +13,7 @@ const { Miniflare, convertV4MiniflareOptions, Response: MiniflareResponse } = re
 const { build } = require("esbuild");
 const key = "isolated-runtime-smoke-test-key";
 const setupToken = "isolated-runtime-smoke-setup-token";
-const request = (url, init = {}) => fetch(url, { ...init, signal: AbortSignal.timeout(15000) });
+const request = (url, init = {}) => loopbackFetch(url, { ...init, signal: AbortSignal.timeout(15000) });
 async function authentication(fetcher) {
   assert.equal((await fetcher("/api/accounts")).status, 401);
   assert.equal((await fetcher("/api/auth/status", { headers: { Origin: "https://untrusted-smoke.invalid" } })).status, 403);

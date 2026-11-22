@@ -12,6 +12,7 @@ import type { Bindings } from "../../src/routes/types";
 import { Hono } from "hono";
 import { apiCors } from "../../src/middleware/cors";
 import type { AppEnv } from "../../src/routes/types";
+import { loopbackFetch } from "../helpers/loopback-fetch.mjs";
 
 const SETUP = "isolated-owner-setup-token-for-boundary-tests";
 const context = { waitUntil(promise: Promise<unknown>) { void promise.catch(() => {}); }, props: {} } as unknown as ExecutionContext;
@@ -216,7 +217,7 @@ async function nodeServer(t: TestContext, extra: Record<string, string> = {}) {
     child.once("exit", () => { clearTimeout(timer); reject(new Error(output)); });
   });
   assert.ok(!output.includes(SETUP) && !output.includes(TEST_AES_KEY));
-  return (route: string, init: RequestInit = {}) => fetch(`http://127.0.0.1:${port}${route}`, { ...init, signal: AbortSignal.timeout(15000) });
+  return (route: string, init: RequestInit = {}) => loopbackFetch(`http://127.0.0.1:${port}${route}`, { ...init, signal: AbortSignal.timeout(15000) });
 }
 test("real Node ingress cannot evade login limits by rotating forged proxy headers", async t => {
   const fetcher = await nodeServer(t);

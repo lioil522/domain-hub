@@ -64,6 +64,8 @@
 
 提交前最终验证：**417 个用例**、Worker/Node 类型与构建、真实 workerd/Node 冒烟（含 v5→v6 归档、通知、摘要缓存）、普通和自建前端、主题、源码边界与发布包检查全部通过。完整 npm 审计两套均为 0；新的 Secret CLI 字节上限、无效 UTF-8、输出脱敏与实际 provisioning Shell 桩回归也通过。SQL 预算仍为 bootstrap 44／首 setup 50。
 
+远端 `56d41e8` 的 CI／Worker 成功，但 Docker 公共验证暴露了旧库双启动的 WAL 锁升级窗口，未发布新镜像。后续独立补救及真实结果见 [启动锁有界重试](./SQLITE_STARTUP_RETRY_PROGRESS_2026-11-22.md)；没有回退工具链或绕过门禁。
+
 参考（本批读取当前文档及包元数据）：
 - https://vite.dev/guide/migration
 - https://vite.dev/config/build-options

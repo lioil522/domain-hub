@@ -27,6 +27,7 @@ import { requireSafeSqliteVersion, databaseFileExists, resolveNodeKey, verifyMan
 import { preflightNodeDatabase, validateStoredNodeKeys, assertNodeKeyMarker, ensureNodeKeyMarker } from "./key-validation";
 import { runBackgroundMaintenance } from "../src/services/background-maintenance";
 import { nodeNetworkPolicy, nodeRequestSecurity } from "./request-security";
+import { configureSqliteStartup } from "./sqlite-startup";
 
 // ===== 配置读取 =====
 
@@ -97,13 +98,11 @@ if (existingDatabase) await preflightNodeDatabase(DB_PATH, aesKey);
 mkdirSync(DATA_DIR, { recursive: true });
 
 const sqlite = new DatabaseSync(DB_PATH);
-// WAL 提升读写并发与崩溃安全性；busy_timeout 兜住极偶发的锁等待。
+// WAL 提升读写并发；首次锁升级可能绕过 busy_timeout，单独有界重试。
 // NOTE: foreign_keys 在 node:sqlite 里默认就是开启的，与 D1 一致 ——
 // src/db.ts 的 deleteAccount() 依赖 domains_cache 的 ON DELETE CASCADE。
-sqlite.exec("PRAGMA busy_timeout = 5000");
-sqlite.exec("PRAGMA journal_mode = WAL");
-sqlite.exec("PRAGMA synchronous = NORMAL");
-sqlite.exec("PRAGMA foreign_keys = ON");
+try { await configureSqliteStartup(sqlite); }
+catch (error) { sqlite.close(); throw error; }
 
 const db = createD1FromSqlite(sqlite);
 

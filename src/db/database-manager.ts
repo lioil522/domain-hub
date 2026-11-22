@@ -335,6 +335,9 @@ export class DatabaseManager {
   async listAllCustomDomains() {
     return customDao.listAllCustomDomains(this.db);
   }
+  async listCustomDomainArchives(cursor?: string) {
+    return customDao.listCustomDomainArchives(this.db, cursor);
+  }
   async getDateOverrides() {
     return customDao.getDateOverrides(this.db);
   }

@@ -3,6 +3,8 @@ import type { DatabaseManager } from "../db";
 import type { AppEnv } from "./types";
 import { errorRes, successRes } from "./response";
 import { AccountService } from "../services/account-service";
+import { AppError } from "../errors";
+import type { ContentfulStatusCode } from "hono/utils/http-status";
 
 /** Manual/custom provider group, account and domain management routes. */
 export interface CustomGroupRouteDeps {
@@ -10,6 +12,14 @@ export interface CustomGroupRouteDeps {
 }
 
 export function registerCustomGroupRoutes(app: Hono<AppEnv>, deps: CustomGroupRouteDeps) {
+  app.get("/api/custom-groups/domain-conflicts", async (c) => {
+    c.header("Cache-Control", "private, no-store");
+    try { return c.json(successRes(await c.get("db").listCustomDomainArchives(c.req.query("cursor")))); }
+    catch (error) {
+      return c.json(errorRes(error instanceof Error ? error.message : "读取归档失败", error instanceof AppError ? error.code : "internal_error"),
+        (error instanceof AppError ? error.statusCode : 500) as ContentfulStatusCode);
+    }
+  });
   app.post("/api/custom-groups/batch", async (c) => {
     const dbManager = c.get("db");
     try {
@@ -193,7 +203,8 @@ export function registerCustomGroupRoutes(app: Hono<AppEnv>, deps: CustomGroupRo
       await dbManager.upsertCustomDomain(groupId, accountId, fullDomain, normalizedExpiry, remark, registeredAt || null);
       return c.json(successRes({ message: "域名已保存" }));
     } catch (e: unknown) {
-      return c.json(errorRes(e instanceof Error ? e.message : "未知错误"), 400);
+      return c.json(errorRes(e instanceof Error ? e.message : "未知错误", e instanceof AppError ? e.code : undefined),
+        (e instanceof AppError ? e.statusCode : 400) as ContentfulStatusCode);
     }
   });
 

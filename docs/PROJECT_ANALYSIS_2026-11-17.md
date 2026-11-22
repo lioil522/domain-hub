@@ -1,5 +1,7 @@
 # Domain Hub：全仓分析与优化方案
 
+> 后续更新（2026-11-22）：本报告保留初始分析基线，不代表问题仍全部未修或路线已全部完成。安全收尾第 1–3 项分别见 [Node 密钥/启动](./NODE_KEY_STARTUP_PROGRESS_2026-11-22.md)、[CORS/可信代理/初始化授权](./REQUEST_BOUNDARIES_PROGRESS_2026-11-22.md)、[自定义域名唯一性/完整归档](./CUSTOM_DOMAIN_UNIQUENESS_PROGRESS_2026-11-22.md)。实际发布以各提交的 CI、Worker、Docker 结果为准；真实账号写入、通知通道和完整灾备等生产验收仍未完成。
+
 ## 1. 结论与分析范围
 
 **建议保留现有 Hono + React + D1/SQLite 架构，先修复安全与数据一致性问题，再完善任务执行、API 契约和前端性能。现在不适合继续以拆文件或新增功能为主要目标。**

@@ -10,7 +10,7 @@ import { initializeDatabase } from "../../server/initialize-database";
 import { resolveNodeKey, verifyManagedKeyFile, requireSafeSqliteVersion, NodeKeyError, databaseFileExists } from "../../server/key-file";
 import { validateStoredNodeKeys, preflightNodeDatabase, ensureNodeKeyMarker, assertNodeKeyMarker, NODE_KEY_CHECK } from "../../server/key-validation";
 import { encryptText } from "../../src/db/crypto";
-import { freshSchemaSql } from "../../src/db/schema-definition";
+import { freshSchemaSql, MIGRATION_NAMES } from "../../src/db/schema-definition";
 
 const KEY = "node-key-security-fixture";
 const SECRET = "private-fixture-do-not-log";
@@ -299,4 +299,24 @@ test("read-only preflight tolerates a short exclusive lock without creating a re
     clearTimeout(release);
     if (!released) sqlite.exec("ROLLBACK");
   }
+});
+test("concurrent real Node processes migrate v5 duplicates once and retain their complete archive", async t => {
+  const { dir, sqlite } = fixture(t);
+  sqlite.exec("DROP INDEX idx_custom_domains_unassigned_unique");
+  for (let i = 0; i < 5; i++) sqlite.prepare("INSERT INTO domain_hub_schema_migrations(version,name) VALUES(?,?)").run(i + 1, MIGRATION_NAMES[i]);
+  account(sqlite, await encryptText(SECRET, KEY));
+  sqlite.exec(`INSERT INTO custom_domains(id,group_id,full_domain,expires_at,remark)
+    VALUES(1,1,'node-migration.example','2030-01-01','keep'),(2,1,'node-migration.example','2032-01-01','archive')`);
+  sqlite.close();
+  const [one, two] = await Promise.all([runningProcess(t, dir, KEY), runningProcess(t, dir, KEY)]);
+  assert.equal((await fetch(`${one.url}/healthz`)).status, 200);
+  assert.equal((await fetch(`${two.url}/healthz`)).status, 200);
+  await one.stop(); await two.stop();
+  const read = new DatabaseSync(path.join(dir, "domain-hub.db"), { readOnly: true });
+  try {
+    assert.equal(read.prepare("SELECT COUNT(*) n FROM custom_domains").get()?.n, 1);
+    const saved = read.prepare("SELECT value FROM settings WHERE key='schema_v6_custom_domain_duplicate:2'").get()?.value;
+    assert.equal(JSON.parse(String(saved)).columns.remark.value, "archive");
+    assert.equal(read.prepare("SELECT COUNT(*) n FROM domain_hub_schema_migrations WHERE version=6").get()?.n, 1);
+  } finally { read.close(); }
 });

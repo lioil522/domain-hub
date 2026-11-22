@@ -42,6 +42,8 @@
 
 提交前全量 `verify:all` 成功：**375 个用例**、Worker/Node 构建与真实运行时冒烟、普通和自建前端、主题/发布产物/Docker 源码边界门禁通过。首 setup 与 bootstrap SQL 预算保持原门禁，不跳过 Node 并发启动测试。
 
+已发布提交 `7c601b90e2ab09298e0db0d067c7584a5addbdd6`：CI `44993981414`、Cloudflare `44993981419`、Docker（amd64/arm64 容器冒烟及清单发布）`44993981438` 全部成功。线上首页 200；同源 `/api/auth/status` 200，既有管理员及 2FA 仍开启；外域请求 403；同源 PATCH 预检 204，方法列表包含 PATCH。未发送生产登录失败或初始化写请求。
+
 参考（本批获取当前版本）：
 - https://developers.cloudflare.com/fundamentals/reference/http-request-headers/
 - https://developers.cloudflare.com/workers/best-practices/workers-best-practices/

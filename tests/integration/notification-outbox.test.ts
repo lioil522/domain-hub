@@ -223,10 +223,10 @@ test("notification operations are authenticated and expose only safe delivery me
   for (const secret of [webhook.url, telegram.token, telegram.chatId, "payload_cipher", event.message]) assert.ok(!text.includes(secret));
   assert.equal((await worker.fetch(new Request("http://localhost/api/notifications?limit=999", { headers }), env, ctx)).status, 400);
 });
-test("v4 upgrades append only notification tables/indexes and preserve business/migration data", async t => {
+test("v4 upgrades append notification tables/indexes and later migrations while preserving old data/history", async t => {
   const { sqlite, d1 } = await testDatabase(t);
-  sqlite.exec("DROP TABLE notification_scans; DROP TABLE notification_outbox");
-  sqlite.exec(`DELETE FROM ${MIGRATION_TABLE} WHERE version=5; INSERT INTO settings(key,value) VALUES('preserve','original')`);
+  sqlite.exec("DROP TABLE notification_scans; DROP TABLE notification_outbox; DROP INDEX idx_custom_domains_unassigned_unique");
+  sqlite.exec(`DELETE FROM ${MIGRATION_TABLE} WHERE version>=5; INSERT INTO settings(key,value) VALUES('preserve','original')`);
   const before = sqlite.prepare(`SELECT * FROM ${MIGRATION_TABLE}`).all();
   await ensureDatabaseSchema(d1); await verifyDatabaseSchema(d1);
   assert.deepEqual(sqlite.prepare(`SELECT * FROM ${MIGRATION_TABLE} WHERE version<5`).all(), before);
@@ -235,8 +235,8 @@ test("v4 upgrades append only notification tables/indexes and preserve business/
 });
 test("failed v5 migration rolls back tables and cannot stamp the version", async t => {
   const { sqlite, d1 } = await testDatabase(t);
-  sqlite.exec("DROP TABLE notification_scans; DROP TABLE notification_outbox");
-  sqlite.exec(`DELETE FROM ${MIGRATION_TABLE} WHERE version=5`);
+  sqlite.exec("DROP TABLE notification_scans; DROP TABLE notification_outbox; DROP INDEX idx_custom_domains_unassigned_unique");
+  sqlite.exec(`DELETE FROM ${MIGRATION_TABLE} WHERE version>=5`);
   const failing = new Proxy(d1, { get(target, property) {
     if (property === "prepare") return (sql: string) => target.prepare(sql.includes("CREATE INDEX IF NOT EXISTS idx_notification_due") ? "SELECT * FROM broken_migration" : sql);
     const value = Reflect.get(target, property); return typeof value === "function" ? value.bind(target) : value;

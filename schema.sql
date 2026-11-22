@@ -302,6 +302,8 @@ CREATE INDEX IF NOT EXISTS idx_notification_due ON notification_outbox(status, n
 
 CREATE INDEX IF NOT EXISTS idx_notification_retention ON notification_outbox(status, updated_at);
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_custom_domains_unassigned_unique ON custom_domains(group_id, full_domain) WHERE account_id IS NULL;
+
 CREATE TABLE IF NOT EXISTS domain_hub_schema_migrations (
     version INTEGER PRIMARY KEY,
     name TEXT NOT NULL,

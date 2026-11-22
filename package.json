@@ -36,7 +36,7 @@
     "test:integration:notifications": "esbuild tests/integration/notification-outbox.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/notification-outbox.test.mjs && node --test dist-node/notification-outbox.test.mjs",
     "schema:generate": "node scripts/generate-schema.mjs",
     "check:schema": "node scripts/generate-schema.mjs --check",
-    "test:integration:schema": "esbuild tests/integration/schema-migrations.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/schema-migrations.test.mjs && node --test dist-node/schema-migrations.test.mjs",
+    "test:integration:schema": "esbuild tests/integration/schema-migrations.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/schema-migrations.test.mjs && esbuild tests/integration/custom-domain-uniqueness.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/custom-domain-uniqueness.test.mjs && node --test dist-node/schema-migrations.test.mjs dist-node/custom-domain-uniqueness.test.mjs",
     "test:unit:state": "esbuild tests/unit/dns-state-machine.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/dns-state-machine.test.mjs && node --test dist-node/dns-state-machine.test.mjs",
     "test:unit:search": "esbuild tests/unit/search-ranking.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/search-ranking.test.mjs && node --test dist-node/search-ranking.test.mjs",
     "test:unit:provider": "esbuild tests/unit/provider-registry.test.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist-node/provider-registry.test.mjs && node --test dist-node/provider-registry.test.mjs",

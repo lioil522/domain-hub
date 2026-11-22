@@ -170,15 +170,19 @@ export const SCHEMA_INDEXES = [
   ["idx_actions_type_status", "actions(type, status)"],
   ["idx_notification_due", "notification_outbox(status, not_before, created_at)"],
   ["idx_notification_retention", "notification_outbox(status, updated_at)"],
+  ["idx_custom_domains_unassigned_unique", "custom_domains(group_id, full_domain) WHERE account_id IS NULL"],
 ].map(([name, target]) => ({ name, sql: `CREATE INDEX IF NOT EXISTS ${name} ON ${target}` }));
 const activeAccountIndex = SCHEMA_INDEXES.find(index => index.name === "idx_sync_active_account")!;
 activeAccountIndex.sql = activeAccountIndex.sql.replace("CREATE INDEX", "CREATE UNIQUE INDEX");
+const unassignedDomainIndex = SCHEMA_INDEXES.find(index => index.name === "idx_custom_domains_unassigned_unique")!;
+unassignedDomainIndex.sql = unassignedDomainIndex.sql.replace("CREATE INDEX", "CREATE UNIQUE INDEX");
 
 export const BASELINE_INDEXES = SCHEMA_INDEXES.slice(0, 8);
 export const RESTORE_SCHEMA_INDEXES = SCHEMA_INDEXES.slice(8, 11);
 export const SYNC_SCHEMA_INDEXES = SCHEMA_INDEXES.slice(11, 15);
-export const NOTIFICATION_SCHEMA_INDEXES = SCHEMA_INDEXES.slice(15);
-export const MIGRATION_NAMES = ["baseline_and_legacy_columns", "required_query_indexes", "staged_business_restore", "persistent_sync_queue", "notification_outbox"] as const;
+export const NOTIFICATION_SCHEMA_INDEXES = SCHEMA_INDEXES.slice(15, 17);
+export const CUSTOM_DOMAIN_SCHEMA_INDEXES = SCHEMA_INDEXES.slice(17);
+export const MIGRATION_NAMES = ["baseline_and_legacy_columns", "required_query_indexes", "staged_business_restore", "persistent_sync_queue", "notification_outbox", "unassigned_custom_domain_uniqueness"] as const;
 export const SCHEMA_VERSION = MIGRATION_NAMES.length;
 export const MIGRATION_TABLE = "domain_hub_schema_migrations";
 export const MIGRATION_TABLE_SQL = `CREATE TABLE IF NOT EXISTS ${MIGRATION_TABLE} (

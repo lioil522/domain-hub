@@ -113,6 +113,7 @@ test("first-request bootstrap uses combined metadata reads and leaves a bounded 
   const queries: string[] = [];
   const observed = proxyDatabase(db, sql => { queries.push(sql); return db.prepare(sql); });
   await ensureDatabaseSchema(observed);
+  console.log(`[schema-budget] bootstrap=${queries.length}/44`);
   assert.ok(queries.length <= 44, `Bootstrap prepared ${queries.length} queries`);
   assert.ok(!queries.some(sql => sql.startsWith("PRAGMA")), queries.join("\n"));
 });
@@ -125,6 +126,7 @@ test("first setup request including schema bootstrap stays within the 50-query b
     body: JSON.stringify({ username: "fresh-budget", password: "isolated-budget-password" }),
   }), { DB: observed, SETUP_TOKEN: "isolated-schema-budget-setup-token" }, { waitUntil() {}, props: {} } as unknown as ExecutionContext);
   assert.equal(response.status, 200);
+  console.log(`[schema-budget] first-setup=${queries.length}/50`);
   assert.ok(queries.length <= 50, `First setup prepared ${queries.length} queries`);
 });
 
@@ -248,7 +250,7 @@ test("Node startup rejects missing required indexes even when the version ledger
   await assert.rejects(() => initializeDatabase(db), /idx_domains_account is missing/);
 });
 
-test("unrelated custom indexes, columns and nullable duplicates remain untouched", async t => {
+test("unrelated custom indexes/columns remain while nullable duplicates are losslessly archived", async t => {
   const { sqlite, db } = fixture(t, true);
   sqlite.exec(`
     ALTER TABLE accounts ADD COLUMN operator_note TEXT;
@@ -259,7 +261,10 @@ test("unrelated custom indexes, columns and nullable duplicates remain untouched
   await initializeDatabase(db);
   assert.equal(sqlite.prepare("SELECT operator_note FROM accounts").get()?.operator_note, "keep me");
   assert.ok(sqlite.prepare("SELECT name FROM sqlite_master WHERE name='operator_domains_name'").get());
-  assert.equal(sqlite.prepare("SELECT COUNT(*) AS count FROM custom_domains").get()?.count, 2);
+  assert.equal(sqlite.prepare("SELECT COUNT(*) AS count FROM custom_domains").get()?.count, 1);
+  const archived = sqlite.prepare("SELECT value FROM settings WHERE key LIKE 'schema_v6_custom_domain_duplicate:%'").get()?.value;
+  assert.ok(archived);
+  assert.equal(JSON.parse(String(archived)).columns.remark.value, "another remark");
 });
 
 test("account-expiry, cache cleanup and action-list query plans use the required indexes", async t => {
@@ -274,7 +279,7 @@ test("account-expiry, cache cleanup and action-list query plans use the required
     assert.ok(plan.includes(expected), plan);
     assert.ok(!plan.includes("USE TEMP B-TREE"), plan);
   }
-  assert.equal(SCHEMA_INDEXES.length, 17);
+  assert.equal(SCHEMA_INDEXES.length, 18);
 });
 
 test("an existing v2 database appends v3 without changing its previous migration history", async t => {
@@ -335,4 +340,73 @@ test("v4 failure rolls back work tables and CF fingerprint migration together", 
   assert.ok(!sqlite.prepare("PRAGMA table_info(cf_sync_state)").all().some(row => row.name === "credential_fingerprint"));
   assert.equal(sqlite.prepare(`SELECT MAX(version) n FROM ${MIGRATION_TABLE}`).get()?.n, 3);
   await ensureDatabaseSchema(db);
+});
+test("independent fresh facades share a committed ledger without a redundant bootstrap read", async t => {
+  const { sqlite, db } = fixture(t);
+  let arrivals = 0, release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const competing = () => new Proxy(db, { get(target, property) {
+    if (property === "batch") return async (statements: D1PreparedStatement[]) => {
+      if (++arrivals === 2) release();
+      await gate;
+      return target.batch(statements);
+    };
+    const value = Reflect.get(target, property);
+    return typeof value === "function" ? value.bind(target) : value;
+  } });
+  assert.deepEqual(await Promise.all([ensureDatabaseSchema(competing()), ensureDatabaseSchema(competing())]), [SCHEMA_VERSION, SCHEMA_VERSION]);
+  assert.equal(sqlite.prepare("SELECT COUNT(*) n FROM domain_hub_schema_migrations").get()?.n, SCHEMA_VERSION);
+});
+test("future history appearing during ledger creation is rejected without resetting it", async t => {
+  const { sqlite, db } = fixture(t);
+  let seeded = false;
+  const facade = proxyDatabase(db, sql => {
+    const statement = db.prepare(sql);
+    if (sql !== MIGRATION_TABLE_SQL) return statement;
+    return new Proxy(statement, { get(target, property) {
+      if (property === "run") return async () => {
+        const result = await target.run();
+        if (!seeded) {
+          seeded = true;
+          for (const table of SCHEMA_TABLES) sqlite.exec(table.sql);
+          for (let i = 0; i < SCHEMA_VERSION; i++) sqlite.prepare("INSERT INTO domain_hub_schema_migrations(version,name) VALUES(?,?)").run(i + 1, MIGRATION_NAMES[i]);
+          sqlite.prepare("INSERT INTO domain_hub_schema_migrations(version,name) VALUES(?,'future')").run(SCHEMA_VERSION + 1);
+        }
+        return result;
+      };
+      const value = Reflect.get(target, property);
+      return typeof value === "function" ? value.bind(target) : value;
+    } });
+  });
+  await assert.rejects(() => ensureDatabaseSchema(facade), /Unsupported or inconsistent/);
+  assert.equal(sqlite.prepare("SELECT COUNT(*) n FROM domain_hub_schema_migrations").get()?.n, SCHEMA_VERSION + 1);
+});
+test("an isolated future ledger row racing with fresh bootstrap cannot be filled in or reported ready", async t => {
+  const { sqlite, db } = fixture(t);
+  const facade = proxyDatabase(db, sql => {
+    const statement = db.prepare(sql);
+    if (sql !== MIGRATION_TABLE_SQL) return statement;
+    return new Proxy(statement, { get(target, property) {
+      if (property === "run") return async () => {
+        const result = await target.run();
+        sqlite.prepare("INSERT INTO domain_hub_schema_migrations(version,name) VALUES(?,'future-only')").run(SCHEMA_VERSION + 1);
+        return result;
+      };
+      const value = Reflect.get(target, property);
+      return typeof value === "function" ? value.bind(target) : value;
+    } });
+  });
+  await assert.rejects(() => ensureDatabaseSchema(facade), /Unsupported or inconsistent/);
+  assert.equal(sqlite.prepare("SELECT COUNT(*) n FROM domain_hub_schema_migrations").get()?.n, 1);
+  assert.equal(sqlite.prepare("SELECT name FROM sqlite_master WHERE name='accounts'").get(), undefined);
+});
+test("fresh bootstrap cannot report success when its batch returns unsuccessful results", async t => {
+  const { sqlite, db } = fixture(t);
+  const failing = new Proxy(db, { get(target, property) {
+    if (property === "batch") return async () => [{ success: false, results: [], meta: {} }];
+    const value = Reflect.get(target, property);
+    return typeof value === "function" ? value.bind(target) : value;
+  } });
+  await assert.rejects(() => ensureDatabaseSchema(failing), /Schema query or migration failed/);
+  assert.equal(sqlite.prepare("SELECT COUNT(*) n FROM domain_hub_schema_migrations").get()?.n, 0);
 });

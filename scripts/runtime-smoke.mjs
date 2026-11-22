@@ -122,6 +122,23 @@ try {
   assert.equal((await fetcher("/__test_tick")).status, 200);
   assert.equal(workerDeliveries, 1, "Confirmed delivery cannot be repeated on another tick");
   console.log("[runtime-smoke] workerd expiry/outbox production, delivery and dedupe passed");
+  // Isolated legacy-v5 fixture only: production never exposes these test writes.
+  // Force the actual workerd/D1 migration path with an existing conflicting row.
+  await sqlite.prepare("DROP INDEX idx_custom_domains_unassigned_unique").run();
+  await sqlite.prepare("DELETE FROM domain_hub_schema_migrations WHERE version=6").run();
+  await sqlite.prepare("ALTER TABLE custom_domains ADD COLUMN runtime_blob BLOB").run();
+  await sqlite.prepare("ALTER TABLE custom_domains ADD COLUMN runtime_real REAL").run();
+  await sqlite.prepare("INSERT INTO custom_domains(group_id,full_domain,expires_at,remark,runtime_blob,runtime_real) VALUES(1,'isolated.example.com','2035-01-01','runtime archived original',x'00ff',1.2345678901234567)").run();
+  assert.equal((await fetcher("/api/auth/status")).status, 200);
+  assert.equal((await sqlite.prepare("SELECT COUNT(*) n FROM custom_domains WHERE group_id=1 AND full_domain='isolated.example.com'").first()).n, 1);
+  const archived = await fetcher("/api/custom-groups/domain-conflicts", { headers });
+  assert.equal(archived.status, 200);
+  const original = (await archived.json()).archives[0].payload.columns;
+  assert.equal(original.remark.value, "runtime archived original");
+  assert.equal(original.expires_at.value, "2035-01-01");
+  assert.deepEqual(original.runtime_blob, { storage: "blob", value: "00FF" });
+  assert.equal(Number(original.runtime_real.value), 1.2345678901234567);
+  console.log("[runtime-smoke] workerd/D1 v5 duplicate archive and unique migration passed");
   await summaryCacheSmoke(fetcher, headers);
 }
 finally { await mf.dispose(); }

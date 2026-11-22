@@ -3,6 +3,8 @@
  */
 
 import { getBeijingNow } from "../time-utils";
+import { ConflictError, ValidationError, ServiceUnavailableError } from "../../errors";
+import { CUSTOM_DOMAIN_ARCHIVE_PREFIX, CUSTOM_DOMAIN_ARCHIVE_FORMAT } from "../custom-domain-uniqueness";
 
 // ===== 自定义账号 =====
 
@@ -65,24 +67,15 @@ export async function upsertCustomDomain(
 
   // NOTE: SQLite 的 UNIQUE 把每个 NULL 视作互不相同
   if (accountId === null) {
-    const existing = await db
-      .prepare("SELECT id FROM custom_domains WHERE group_id = ? AND account_id IS NULL AND full_domain = ?")
-      .bind(groupId, fullDomain)
-      .first<{ id: number }>();
-    if (existing?.id) {
-      await db
-        .prepare("UPDATE custom_domains SET registered_at = ?, expires_at = ?, remark = ?, updated_at = ? WHERE id = ?")
-        .bind(registeredAt || null, expiresAt, remark || null, now, existing.id)
-        .run();
-      return;
-    }
-    await db
-      .prepare(`
+    await db.prepare(`
         INSERT INTO custom_domains (group_id, account_id, full_domain, registered_at, expires_at, remark, updated_at)
         VALUES (?, NULL, ?, ?, ?, ?, ?)
-      `)
-      .bind(groupId, fullDomain, registeredAt || null, expiresAt, remark || null, now)
-      .run();
+        ON CONFLICT(group_id, full_domain) WHERE account_id IS NULL DO UPDATE SET
+          registered_at = excluded.registered_at,
+          expires_at = excluded.expires_at,
+          remark = excluded.remark,
+          updated_at = excluded.updated_at
+      `).bind(groupId, fullDomain, registeredAt || null, expiresAt, remark || null, now).run();
     return;
   }
 
@@ -110,20 +103,57 @@ export async function updateCustomDomainById(
   registeredAt?: string | null
 ): Promise<boolean> {
   const now = getBeijingNow();
-  const row = await db
-    .prepare("SELECT id FROM custom_domains WHERE id = ? AND group_id = ?")
-    .bind(id, groupId)
-    .first<{ id: number }>();
-  if (!row?.id) return false;
-  await db
+  try {
+    const result = await db
     .prepare(`
       UPDATE custom_domains
       SET full_domain = ?, registered_at = ?, expires_at = ?, remark = ?, updated_at = ?
-      WHERE id = ?
+      WHERE id = ? AND group_id = ?
     `)
-    .bind(fullDomain, registeredAt || null, expiresAt, remark || null, now, id)
+    .bind(fullDomain, registeredAt || null, expiresAt, remark || null, now, id, groupId)
     .run();
-  return true;
+    return Number(result.meta.changes) > 0;
+  } catch (error) {
+    if (error instanceof Error && /UNIQUE constraint failed:\s*custom_domains\./i.test(error.message)) {
+      throw new ConflictError("此分组及账号范围内已存在同名域名，原记录未修改", "custom_domain_conflict");
+    }
+    throw error;
+  }
+}
+
+/** Bounded, authenticated export surface for permanent migration archives. */
+export async function listCustomDomainArchives(db: D1Database, cursor?: string) {
+  if (cursor && (!cursor.startsWith(CUSTOM_DOMAIN_ARCHIVE_PREFIX) ||
+    !/^-?\d{1,20}$/.test(cursor.slice(CUSTOM_DOMAIN_ARCHIVE_PREFIX.length)))) throw new ValidationError("无效的归档游标");
+  const metadata = await db.prepare(`SELECT key,updated_at,length(CAST(value AS BLOB)) bytes FROM settings
+    WHERE key>? AND key<? ORDER BY key LIMIT 21`)
+    .bind(cursor || CUSTOM_DOMAIN_ARCHIVE_PREFIX, `${CUSTOM_DOMAIN_ARCHIVE_PREFIX}\uffff`)
+    .all<{ key: string; updated_at: string; bytes: number }>();
+  if (!metadata.success) throw new ServiceUnavailableError("读取域名归档失败");
+  const selected: typeof metadata.results = [];
+  let bytes = 0;
+  for (const row of metadata.results.slice(0, 20)) {
+    if (bytes + row.bytes > 512 * 1024) break;
+    bytes += row.bytes; selected.push(row);
+  }
+  if (metadata.results.length && !selected.length) throw new ValidationError("单条归档超过接口导出上限，请使用完整 SQLite/D1 导出；数据未被跳过或删除");
+  const rows = selected.length ? await db.prepare(`WITH selected(key,max_bytes) AS
+    (VALUES ${selected.map(() => "(?,?)").join(",")})
+    SELECT s.key,s.value FROM settings s JOIN selected x ON x.key=s.key
+    WHERE length(CAST(s.value AS BLOB))<=x.max_bytes`)
+    .bind(...selected.flatMap(row => [row.key, row.bytes])).all<{ key: string; value: string }>() : null;
+  if (rows && !rows.success) throw new ServiceUnavailableError("读取域名归档失败");
+  const values = new Map(rows?.results.map(row => [row.key, row.value]));
+  const archives = selected.map(row => {
+    let payload: unknown;
+    try { payload = JSON.parse(values.get(row.key) || ""); } catch { throw new ServiceUnavailableError("域名归档格式损坏，请恢复完整数据库备份"); }
+    if (!payload || typeof payload !== "object" || !("format" in payload) || payload.format !== CUSTOM_DOMAIN_ARCHIVE_FORMAT) {
+      throw new ServiceUnavailableError("域名归档格式损坏，请恢复完整数据库备份");
+    }
+    return { key: row.key, archived_at: row.updated_at, payload };
+  });
+  return { archives, page: { has_more: metadata.results.length > selected.length,
+    next_cursor: metadata.results.length > selected.length ? selected[selected.length - 1].key : null } };
 }
 
 /** 删除一条手动域名 */

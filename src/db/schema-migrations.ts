@@ -4,7 +4,9 @@ import {
   BASELINE_TABLES, BASELINE_INDEXES, RESTORE_SCHEMA_TABLES, RESTORE_SCHEMA_INDEXES,
   SYNC_SCHEMA_TABLES, SYNC_SCHEMA_INDEXES,
   NOTIFICATION_SCHEMA_TABLES, NOTIFICATION_SCHEMA_INDEXES,
+  CUSTOM_DOMAIN_SCHEMA_INDEXES,
 } from "./schema-definition";
+import { archiveCustomDomainDuplicates } from "./custom-domain-uniqueness";
 
 const inFlight = new WeakMap<D1Database, Promise<number>>();
 const historySql = `SELECT version, name FROM ${MIGRATION_TABLE} ORDER BY version`;
@@ -82,7 +84,11 @@ async function migrate(db: D1Database): Promise<number> {
     if (!(error instanceof Error) || !/no such table:\s*(?:main\.)?domain_hub_schema_migrations\b/i.test(error.message)) throw error;
     const result = await db.prepare(MIGRATION_TABLE_SQL).run();
     requireSuccess([result]);
-    version = await readVersion(db);
+    // The first ledger read proved it was absent. Start at zero without an
+    // unnecessary second read. If another connection creates/fills it first,
+    // the transaction's unique history claim and readVersion catch below prove
+    // its committed version; no ALTER/DDL batch can partially slip through.
+    version = 0;
   }
   while (version < SCHEMA_VERSION) {
     const nextVersion = version + 1;
@@ -96,12 +102,15 @@ async function migrate(db: D1Database): Promise<number> {
         // one transaction, leaving enough first-request budget for login/setup.
         checkIndexDefinitions(definitions, false);
         try {
-          await db.batch([
+          const results = await db.batch([
             ...all.map(sql => db.prepare(sql)), ...SCHEMA_INDEXES.map(index => db.prepare(index.sql)),
-            db.prepare(`INSERT INTO ${MIGRATION_TABLE}(version,name)
-              SELECT json_extract(value,'$.version'),json_extract(value,'$.name') FROM json_each(?)`)
+            db.prepare(`WITH history AS MATERIALIZED (SELECT COUNT(*) n FROM ${MIGRATION_TABLE})
+              INSERT INTO ${MIGRATION_TABLE}(version,name)
+              SELECT CASE WHEN history.n>0 THEN 'schema_history_conflict' ELSE json_extract(value,'$.version') END,
+                json_extract(value,'$.name') FROM json_each(?) CROSS JOIN history`)
               .bind(JSON.stringify(MIGRATION_NAMES.map((name, index) => ({ version: index + 1, name })))),
           ]);
+          requireSuccess(results);
         } catch (error) { if (await readVersion(db) !== SCHEMA_VERSION) throw error; }
         return SCHEMA_VERSION;
       }
@@ -121,6 +130,9 @@ async function migrate(db: D1Database): Promise<number> {
     } else if (nextVersion === 5) {
       await checkExistingIndexes(db, false, NOTIFICATION_SCHEMA_INDEXES);
       statements = [...await tableStatements(db, NOTIFICATION_SCHEMA_TABLES), ...NOTIFICATION_SCHEMA_INDEXES.map(index => index.sql)];
+    } else if (nextVersion === 6) {
+      await checkExistingIndexes(db, false, CUSTOM_DOMAIN_SCHEMA_INDEXES);
+      statements = [...await archiveCustomDomainDuplicates(db), ...CUSTOM_DOMAIN_SCHEMA_INDEXES.map(index => index.sql)];
     } else throw new Error(`No migration implementation for schema version ${nextVersion}`);
     try {
       const results = await db.batch([

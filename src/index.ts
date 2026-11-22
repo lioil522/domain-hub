@@ -1,6 +1,5 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
-import { cors } from "hono/cors";
 import { sendTelegramNotification, sendWebhookNotification } from "./cron";
 import type { WebhookType } from "./cron";
 import type { Bindings, Variables } from "./routes/types";
@@ -51,6 +50,8 @@ import { verifyTOTP, generateBase32Secret, buildOtpAuthUri } from "./auth/totp";
 import { withSecurityHeaders } from "./middleware/security-headers";
 import { LOGIN_MAX_FAILURES, LOGIN_LOCK_WINDOW_SECONDS, LOGIN_LOCKED_MESSAGE } from "./middleware/rate-limit";
 import { getClientIp, capText } from "./middleware/auth-helpers";
+import { apiCors } from "./middleware/cors";
+import { workerRequestSecurity, type RequestSecurity } from "./middleware/request-security";
 
 
 // Service factories keep the legacy route handlers thin while centralizing repository wiring.
@@ -77,44 +78,7 @@ const app = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 /**
  * CORS 中间件 — 默认仅允许同源访问，生产环境通过 ALLOWED_ORIGIN 环境变量配置
  */
-app.use(
-  "/api/*",
-  async (c, next) => {
-    const requestOrigin = c.req.header("Origin") || "";
-
-    const allowList = (c.env.ALLOWED_ORIGIN || "")
-      .split(",")
-      .map((o) => o.trim().replace(/\/$/, ""))
-      .filter(Boolean);
-    const allowOrigin =
-      allowList.length === 0
-        ? requestOrigin || "*"
-        : allowList.includes(requestOrigin)
-        ? requestOrigin
-        : "";
-
-    if (c.req.method === "OPTIONS") {
-      const headers: Record<string, string> = {
-        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization",
-        "Access-Control-Max-Age": "86400",
-        Vary: "Origin",
-      };
-      if (allowOrigin) {
-        headers["Access-Control-Allow-Origin"] = allowOrigin;
-      }
-      return new Response(null, { status: 204, headers });
-    }
-
-    const corsMiddleware = cors({
-      origin: allowList.length > 0 ? allowList : requestOrigin || "*",
-      allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-      allowHeaders: ["Content-Type", "Authorization"],
-      maxAge: 86400,
-    });
-    return corsMiddleware(c, next);
-  }
-);
+app.use("/api/*", apiCors);
 
 /**
  * DatabaseManager 实例化中间件 — 注入 dbManager 到 context
@@ -252,10 +216,15 @@ app.notFound((c) => {
   return c.json(errorRes(`路径 ${c.req.path} 不存在`, "not_found"), 404);
 });
 
+/** Node calls this with socket-derived metadata; it is not an HTTP endpoint. */
+export async function fetchWithRequestSecurity(request: Request, env: Bindings, ctx: ExecutionContext, security: RequestSecurity): Promise<Response> {
+  const res = await app.fetch(request, { ...env, REQUEST_SECURITY: security }, ctx);
+  return withSecurityHeaders(res);
+}
+
 export default {
   async fetch(request: Request, env: Bindings, ctx: ExecutionContext): Promise<Response> {
-    const res = await app.fetch(request, env, ctx);
-    return withSecurityHeaders(res);
+    return fetchWithRequestSecurity(request, env, ctx, workerRequestSecurity(request));
   },
 
   async scheduled(event: ScheduledEvent, env: Bindings, ctx: ExecutionContext) {

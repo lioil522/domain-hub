@@ -28,6 +28,7 @@ interface AuthResponseBase {
 export interface AuthStatusResponse extends AuthResponseBase {
   initialized?: boolean;
   two_fa_enabled?: boolean;
+  setup_token_configured?: boolean;
 }
 
 /** POST /api/auth/login */

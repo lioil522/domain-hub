@@ -49,7 +49,7 @@ export const createApiFetch = ({ backendUrl, onSessionExpired }: ApiFetchDeps): 
     }
 
     const headers = new Headers(options.headers || {});
-    if (token) {
+    if (token && !headers.has("Authorization")) {
       headers.set("Authorization", `Bearer ${token}`);
     }
 

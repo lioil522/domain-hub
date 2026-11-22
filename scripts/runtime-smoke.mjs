@@ -11,10 +11,15 @@ const require = createRequire(path.join(root, "package.json"));
 const { Miniflare, convertV4MiniflareOptions, Response: MiniflareResponse } = require("miniflare");
 const { build } = require("esbuild");
 const key = "isolated-runtime-smoke-test-key";
+const setupToken = "isolated-runtime-smoke-setup-token";
 const request = (url, init = {}) => fetch(url, { ...init, signal: AbortSignal.timeout(15000) });
 async function authentication(fetcher) {
   assert.equal((await fetcher("/api/accounts")).status, 401);
-  const setup = await fetcher("/api/auth/setup", { method: "POST", headers: { "Content-Type": "application/json" },
+  assert.equal((await fetcher("/api/auth/status", { headers: { Origin: "https://untrusted-smoke.invalid" } })).status, 403);
+  const denied = await fetcher("/api/auth/setup", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: "runtime-smoke", password: "isolated-runtime-password" }) });
+  assert.equal(denied.status, 401);
+  const setup = await fetcher("/api/auth/setup", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${setupToken}` },
     body: JSON.stringify({ username: "runtime-smoke", password: "isolated-runtime-password" }) });
   assert.equal(setup.status, 200, await setup.clone().text());
   const token = (await setup.json()).session_token;
@@ -88,7 +93,7 @@ let workerDeliveries = 0;
 let mockError = "";
 const mf = new Miniflare(convertV4MiniflareOptions({
   modules: true, script: harnessScript,
-  compatibilityDate: date, d1Databases: ["DB"], bindings: { AES_KEY: key },
+  compatibilityDate: date, d1Databases: ["DB"], bindings: { AES_KEY: key, SETUP_TOKEN: setupToken },
   outboundService: async request => {
     try {
       assert.equal(new URL(request.url).hostname, "notification-smoke.invalid", "Runtime smoke must never contact a real provider");
@@ -122,10 +127,10 @@ try {
 finally { await mf.dispose(); }
 
 const data = await mkdtemp(path.join(base, "domain-hub-runtime-smoke-"));
-const env = { ...process.env, DATA_DIR: data, AES_KEY: key, HOST: "127.0.0.1", PORT: "0",
+const env = { ...process.env, DATA_DIR: data, AES_KEY: key, SETUP_TOKEN: setupToken, HOST: "127.0.0.1", PORT: "0",
   STATIC_DIR: path.join(root, "frontend/dist"), DISABLE_CRON: "1" };
 for (const name of ["DB_PATH", "SCHEMA_FILE", "DEFAULT_API_KEY", "DEFAULT_API_SECRET", "DEFAULT_API_ALIAS",
-  "ADMIN_TOKEN", "WEBHOOK_URL", "WEBHOOK_TYPE", "ALLOWED_ORIGIN"]) delete env[name];
+  "ADMIN_TOKEN", "WEBHOOK_URL", "WEBHOOK_TYPE", "ALLOWED_ORIGIN", "TRUSTED_PROXIES", "PUBLIC_ORIGIN"]) delete env[name];
 const child = spawn(process.execPath, [path.join(root, "dist-node/server.mjs")], { cwd: root, env, stdio: ["ignore", "pipe", "pipe"] });
 let output = "";
 const exited = new Promise(resolve => child.on("exit", code => resolve(code)));

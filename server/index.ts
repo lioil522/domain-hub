@@ -13,9 +13,9 @@
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { serve } from "@hono/node-server";
+import { serve, type HttpBindings, type Http2Bindings } from "@hono/node-server";
 
-import worker from "../src/index";
+import { fetchWithRequestSecurity } from "../src/index";
 import { DatabaseManager } from "../src/db";
 import { runDailySyncAndRenewal } from "../src/cron";
 import type { WebhookType } from "../src/cron";
@@ -26,6 +26,7 @@ import { verifyDatabaseSchema } from "../src/db/schema-migrations";
 import { requireSafeSqliteVersion, databaseFileExists, resolveNodeKey, verifyManagedKeyFile } from "./key-file";
 import { preflightNodeDatabase, validateStoredNodeKeys, assertNodeKeyMarker, ensureNodeKeyMarker } from "./key-validation";
 import { runBackgroundMaintenance } from "../src/services/background-maintenance";
+import { nodeNetworkPolicy, nodeRequestSecurity } from "./request-security";
 
 // ===== 配置读取 =====
 
@@ -75,6 +76,7 @@ const STATIC_DIR = resolveStaticDir();
 const CRON_UTC_HOUR = Number(process.env.CRON_UTC_HOUR ?? 2);
 const CRON_UTC_MINUTE = Number(process.env.CRON_UTC_MINUTE ?? 0);
 const CRON_DISABLED = process.env.DISABLE_CRON === "1";
+const networkPolicy = nodeNetworkPolicy(optionalEnv("TRUSTED_PROXIES"), optionalEnv("PUBLIC_ORIGIN"));
 
 /** 把空字符串归一成 undefined —— docker-compose 里未填的变量会传进空串，
  *  而 src/ 里多处用 `c.env.X || 默认值` 判断「是否配置过」，空串与 undefined 等价，
@@ -113,6 +115,7 @@ const env = {
   WEBHOOK_URL: optionalEnv("WEBHOOK_URL"),
   WEBHOOK_TYPE: optionalEnv("WEBHOOK_TYPE"),
   ADMIN_TOKEN: optionalEnv("ADMIN_TOKEN"),
+  SETUP_TOKEN: optionalEnv("SETUP_TOKEN"),
   ALLOWED_ORIGIN: optionalEnv("ALLOWED_ORIGIN"),
   DEFAULT_API_KEY: optionalEnv("DEFAULT_API_KEY"),
   DEFAULT_API_SECRET: optionalEnv("DEFAULT_API_SECRET"),
@@ -161,12 +164,13 @@ const executionCtx = {
 
 const handleStatic = createStaticHandler(STATIC_DIR);
 
-async function fetchHandler(request: Request): Promise<Response> {
+async function fetchHandler(request: Request, connection: HttpBindings | Http2Bindings): Promise<Response> {
   const url = new URL(request.url);
 
   // /api/* 交给业务 Worker（src/index.ts 里所有路由都挂在这个前缀下）
   if (url.pathname === "/api" || url.pathname.startsWith("/api/")) {
-    return (await worker.fetch(request, env, executionCtx)) as Response;
+    return fetchWithRequestSecurity(request, env, executionCtx,
+      nodeRequestSecurity(request, connection.incoming.socket.remoteAddress, networkPolicy));
   }
 
   if (url.pathname === "/livez") return Response.json({ ok: true });

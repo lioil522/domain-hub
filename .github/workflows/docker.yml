@@ -91,7 +91,9 @@ jobs:
           fail() { echo "::error::$1"; docker logs domain-hub-ci 2>&1 | tail -40; exit 1; }
           trap 'docker rm -f domain-hub-ci >/dev/null 2>&1 || true' EXIT
 
-          docker run -d --name domain-hub-ci -p 8787:8787 domain-hub:ci
+          SETUP_TOKEN=$(openssl rand -hex 32)
+          echo "::add-mask::$SETUP_TOKEN"
+          docker run -d --name domain-hub-ci -e SETUP_TOKEN="$SETUP_TOKEN" -p 8787:8787 domain-hub:ci
 
           # 等镜像自带的 HEALTHCHECK 变绿 —— 顺带验证探针本身可用
           for i in $(seq 1 60); do
@@ -115,8 +117,12 @@ jobs:
 
           # 4. 首次初始化 → 用签发的 Session 访问受保护接口
           #    这条会走通 SQLite 适配层的建表、PBKDF2 哈希写入与 settings UPSERT
+          [ "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/auth/setup" \
+            -H 'Content-Type: application/json' -d '{"username":"ciuser","password":"ci-smoke-password"}')" = 401 ] \
+            || fail "未授权的首次 setup 没有被拒绝"
           TOKEN=$(curl -fsS -X POST "$BASE/api/auth/setup" \
             -H 'Content-Type: application/json' \
+            -H "Authorization: Bearer $SETUP_TOKEN" \
             -d '{"username":"ciuser","password":"ci-smoke-password"}' \
             | sed -n 's/.*"session_token":"\([^"]*\)".*/\1/p')
           [ -n "$TOKEN" ] || fail "setup 没有签发 session_token"

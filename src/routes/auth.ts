@@ -8,6 +8,7 @@ import { AuditService } from "../services/audit-service";
 import { AuditRepository } from "../repositories/audit-repository";
 import { AppError } from "../errors";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
+import { setupTokenConfigured } from "../middleware/request-security";
 
 export interface AuthRouteDeps {
   loginMaxFailures: number;
@@ -43,7 +44,8 @@ export function registerAuthRoutes(app: Hono<AppEnv>, deps: AuthRouteDeps) {
     const db = c.get("db");
     try {
       const cfg = await db.getAuthConfig();
-      return c.json(successRes({ initialized: cfg.initialized, two_fa_enabled: cfg.twoFaEnabled }));
+      return c.json(successRes({ initialized: cfg.initialized, two_fa_enabled: cfg.twoFaEnabled,
+        setup_token_configured: !cfg.initialized && setupTokenConfigured(c.env.SETUP_TOKEN) }));
     } catch (e: unknown) {
       return fail(c, e, "读取鉴权状态失败");
     }
@@ -54,6 +56,23 @@ export function registerAuthRoutes(app: Hono<AppEnv>, deps: AuthRouteDeps) {
     try {
       const cfg = await db.getAuthConfig();
       if (cfg.initialized) return c.json(errorRes("系统已完成初始化，无法再次通过此接口设置密码", "already_initialized"), 403);
+      const setupToken = c.env.SETUP_TOKEN || "";
+      if (!setupTokenConfigured(setupToken)) return c.json(errorRes("首次初始化已锁定：请由部署者配置独立的 SETUP_TOKEN（32–1024 个非空白字符）", "setup_locked"), 503);
+      const authorization = c.req.header("Authorization") || "";
+      const candidate = authorization.startsWith("Bearer ") ? authorization.slice(7).trim() : "";
+      if (!candidate || candidate.length > 1024 || !timingSafeEqual(candidate, setupToken)) {
+        const scope = `setup:${deps.getClientIp(c)}`;
+        if (await db.countLoginFailures(scope) >= deps.loginMaxFailures) {
+          return c.json(errorRes(deps.loginLockedMessage, "too_many_attempts"), 429);
+        }
+        await db.recordLoginFailure(scope, deps.loginLockWindowSeconds);
+        return c.json(errorRes("请提供部署者设置的初始化授权码", "setup_unauthorized"), 401);
+      }
+      // A valid high-entropy owner token is not locked out by unauthenticated
+      // guesses. No extra SQL on this path, retaining the first-setup budget.
+      if (c.req.header("Content-Type")?.split(";")[0].trim().toLowerCase() !== "application/json") {
+        return c.json(errorRes("初始化请求必须使用 application/json", "bad_request"), 415);
+      }
       const body = await c.req.json().catch(() => ({}));
       const username = String(body.username || "").trim();
       const password = String(body.password || "");

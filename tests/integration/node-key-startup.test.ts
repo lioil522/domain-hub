@@ -31,7 +31,7 @@ function account(sqlite: DatabaseSync, cipher: string, id = 1) {
 async function failedProcess(dir: string, key?: string, extra: Record<string, string> = {}) {
   const env: NodeJS.ProcessEnv = { ...process.env, DATA_DIR: dir, HOST: "127.0.0.1", PORT: "0", DISABLE_CRON: "1" };
   for (const name of ["AES_KEY", "DB_PATH", "SCHEMA_FILE", "DEFAULT_API_KEY", "DEFAULT_API_SECRET", "DEFAULT_API_ALIAS",
-    "ADMIN_TOKEN", "WEBHOOK_URL", "WEBHOOK_TYPE", "ALLOWED_ORIGIN"]) delete env[name];
+    "ADMIN_TOKEN", "SETUP_TOKEN", "TRUSTED_PROXIES", "PUBLIC_ORIGIN", "WEBHOOK_URL", "WEBHOOK_TYPE", "ALLOWED_ORIGIN"]) delete env[name];
   if (key !== undefined) env.AES_KEY = key;
   Object.assign(env, extra);
   const child = spawn(process.execPath, ["dist-node/server.mjs"], { env, stdio: ["ignore", "pipe", "pipe"] });
@@ -52,7 +52,7 @@ async function failedProcess(dir: string, key?: string, extra: Record<string, st
 async function runningProcess(t: TestContext, dir: string, key?: string) {
   const env: NodeJS.ProcessEnv = { ...process.env, DATA_DIR: dir, HOST: "127.0.0.1", PORT: "0", DISABLE_CRON: "1" };
   for (const name of ["AES_KEY", "DB_PATH", "SCHEMA_FILE", "DEFAULT_API_KEY", "DEFAULT_API_SECRET", "DEFAULT_API_ALIAS",
-    "ADMIN_TOKEN", "WEBHOOK_URL", "WEBHOOK_TYPE", "ALLOWED_ORIGIN"]) delete env[name];
+    "ADMIN_TOKEN", "SETUP_TOKEN", "TRUSTED_PROXIES", "PUBLIC_ORIGIN", "WEBHOOK_URL", "WEBHOOK_TYPE", "ALLOWED_ORIGIN"]) delete env[name];
   if (key !== undefined) env.AES_KEY = key;
   const child = spawn(process.execPath, ["dist-node/server.mjs"], { env, stdio: ["ignore", "pipe", "pipe"] });
   let output = "";

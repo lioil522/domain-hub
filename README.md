@@ -797,6 +797,8 @@ npx wrangler secret put AES_KEY
 
 > `AES_KEY` 一旦用于生产数据加密就不要随意更换。它用于解密已经写入数据库的 API Secret 与 2FA/TOTP 密钥。数据库备份必须与 AES_KEY 一起保存。
 
+**首次管理员初始化还须配置独立的 `SETUP_TOKEN`**（建议另行生成 64 位随机 hex，不能使用 AES_KEY）。通过 `npx wrangler secret put SETUP_TOKEN` 写入 Worker，或在 GitHub Actions 的同名 Secret 中设置；登录页输入该授权码后才能创建管理员。未配置/短于 32 字符时 setup 返回 503，已有账户登录不受影响。初始化完成后可从部署配置中删除该授权码；仅有此码不能登录或重置已有账户。
+
 可选：
 
 ```bash
@@ -1201,6 +1203,8 @@ Worker 已存在 AES_KEY？
 
 ### 可选 Secret
 
+新安装另需 `SETUP_TOKEN` 才能创建管理员账户：独立执行一次 `openssl rand -hex 32`，将输出保存在 GitHub Secret `SETUP_TOKEN`，部署后在初始化表单输入。不得写入前端构建变量、URL 或仓库；已初始化的部署无需补配。
+
 | Secret | 用途 |
 |---|---|
 | `ADMIN_TOKEN` | 应急管理员令牌 |
@@ -1356,6 +1360,7 @@ https://domain-hub.<你的 workers.dev 子域>.workers.dev
 ```
 
 首次访问后，在登录页面创建管理员用户名和密码。
+创建前须输入部署者配置的 `SETUP_TOKEN` 初始化授权码。缺少授权码时不能抢先占用管理员账户；已初始化账户继续使用原用户名、密码和 2FA。
 
 ---
 
@@ -1546,6 +1551,8 @@ node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 
 并持久化在 Docker Volume 中。
 
+首次创建管理员前，在 Compose 使用的 `.env` 中另配 `SETUP_TOKEN`（独立随机 64 位 hex），然后重启容器。该值只用于初始化授权，不是 AES_KEY；空值会锁定 setup，但不会阻断已有账户登录。请妥善保存且不要提交 `.env`。
+
 **已有数据库缺少 `AES_KEY`/`aes.key` 时会拒绝启动，不能自动生成替代密钥。** 启动前会以只读方式验证已有凭据、2FA、通知与恢复密文；错密钥或坏密文也会阻断启动。请恢复原密钥和完整数据卷，不要删库或随意换 key。历史 `plain:` 数据仍可在显式配置密钥后读取。
 
 ### C-6. 启动
@@ -1583,10 +1590,10 @@ Docker 镜像本身也已经包含 `HEALTHCHECK`，会定期请求 `/healthz`。
 浏览器：
 
 ```text
-http://服务器IP:8787
+https://你的面板域名
 ```
 
-然后在登录页面自行设置管理员用户名和密码。
+先通过 HTTPS 反代或本机连接访问，再在登录页输入独立 `SETUP_TOKEN` 并创建管理员。不要把授权码或密码通过公网明文 HTTP 发送。
 
 ---
 
@@ -2067,6 +2074,15 @@ hub.example.com {
 
 Caddy 会负责 HTTPS 证书申请和续期。
 
+Node 侧默认**不信任任何代理 IP 头**。HTTPS 反代部署请配置实际对外来源：
+
+```dotenv
+PUBLIC_ORIGIN=https://hub.example.com
+TRUSTED_PROXIES=127.0.0.1,::1
+```
+
+`TRUSTED_PROXIES` 必须匹配 Node 实际连接的可控代理 IP/CIDR；Docker 桥接时不一定是 loopback，应按实际网络配置，不能照抄或设置 `0.0.0.0/0`。仅对信任的 socket peer 从右向左解析 `X-Forwarded-For`，遇到首个不可信跳点停止；不使用 `X-Real-IP`/`CF-Connecting-IP` 兜底。代理须追加真实连接 IP 或覆盖为实际客户端 IP，并禁止绕过代理直连。`PUBLIC_ORIGIN` 不从可伪造的转发协议/域名头推断。
+
 ### CORS
 
 Docker 前后端同源时：
@@ -2076,6 +2092,8 @@ ALLOWED_ORIGIN=
 ```
 
 通常保持为空。
+
+空白名单现在真正只允许同源，不反射任意 Origin；带不可信 Origin 的实际请求会在业务/数据库中间件前被拒绝。浏览器跨域白名单支持明确的 HTTP(S) 来源和 `PATCH`，不支持 `*`、`null` 或路径。没有 Origin 的非浏览器请求仍需原有认证，CORS 不是身份验证。
 
 只有前端与 API 被拆到不同域名时才配置：
 

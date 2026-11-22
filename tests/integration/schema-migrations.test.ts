@@ -121,9 +121,9 @@ test("first setup request including schema bootstrap stays within the 50-query b
   const queries: string[] = [];
   const observed = proxyDatabase(db, sql => { queries.push(sql); return db.prepare(sql); });
   const response = await worker.fetch(new Request("http://localhost/api/auth/setup", {
-    method: "POST", headers: { "Content-Type": "application/json" },
+    method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer isolated-schema-budget-setup-token" },
     body: JSON.stringify({ username: "fresh-budget", password: "isolated-budget-password" }),
-  }), { DB: observed }, { waitUntil() {}, props: {} } as unknown as ExecutionContext);
+  }), { DB: observed, SETUP_TOKEN: "isolated-schema-budget-setup-token" }, { waitUntil() {}, props: {} } as unknown as ExecutionContext);
   assert.equal(response.status, 200);
   assert.ok(queries.length <= 50, `First setup prepared ${queries.length} queries`);
 });

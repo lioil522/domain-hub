@@ -17,10 +17,11 @@ function request(d1: D1Database, route: string, body?: unknown, token?: string, 
   const headers = new Headers();
   if (body !== undefined) headers.set("Content-Type", "application/json");
   if (token) headers.set("Authorization", `Bearer ${token}`);
+  if (route === "/api/auth/setup") headers.set("Authorization", "Bearer isolated-setup-token-for-security-tests");
   return worker.fetch(new Request(`http://localhost${route}`, {
     method: body === undefined ? "GET" : "POST", headers,
     body: body === undefined ? undefined : JSON.stringify(body),
-  }), { DB: d1, AES_KEY: aesKey }, executionCtx);
+  }), { DB: d1, AES_KEY: aesKey, SETUP_TOKEN: "isolated-setup-token-for-security-tests" }, executionCtx);
 }
 
 async function totp(secret: string) {

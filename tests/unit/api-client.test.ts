@@ -99,3 +99,10 @@ test("an old token expiry response cannot invalidate a newly established session
   assert.equal((await api("/api/domains/page")).status, 401);
   assert.equal(sessionStorage.getItem(SESSION_KEY), "new-session");
 });
+test("explicit setup authorization is not overwritten by an old stored session", async t => {
+  installStorage(t);
+  const fetch = t.mock.method(globalThis, "fetch", async () => Response.json({ success: true }));
+  const api = createApiFetch({ backendUrl: "", onSessionExpired() {} });
+  await api("/api/auth/setup", { method: "POST", headers: { Authorization: "Bearer owner-setup-token" } });
+  assert.equal(new Headers(fetch.mock.calls[0].arguments[1]?.headers).get("Authorization"), "Bearer owner-setup-token");
+});

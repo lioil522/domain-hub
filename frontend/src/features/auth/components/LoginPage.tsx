@@ -54,6 +54,9 @@ export function LoginPage({ auth, toast }: LoginPageProps) {
     setSetupPassword,
     setupPassword2,
     setSetupPassword2,
+    setupToken,
+    setSetupToken,
+    setupTokenConfigured,
     handleLogin,
     handleSetup,
   } = auth;
@@ -68,7 +71,7 @@ export function LoginPage({ auth, toast }: LoginPageProps) {
   }
 
   return (
-    <div className="flex h-screen items-center justify-center bg-page text-content-primary px-4">
+    <div className="flex min-h-screen items-center justify-center bg-page text-content-primary px-4 py-8">
       <div className="w-full max-w-sm bg-surface border border-border-base rounded-2xl shadow-2xl p-7 space-y-6">
         {/* 头部 LOGO */}
         <div className="flex flex-col items-center gap-2 text-center">
@@ -141,6 +144,21 @@ export function LoginPage({ auth, toast }: LoginPageProps) {
         ) : (
           /* ── 首次初始化表单 ── */
           <form onSubmit={handleSetup} className="space-y-4">
+            <p className="text-xs text-content-secondary">
+              {setupTokenConfigured
+                ? "初始化授权码由部署者通过 SETUP_TOKEN 配置，不是 AES_KEY。请通过 HTTPS 或本机连接初始化。"
+                : "首次初始化已锁定，请由部署者先配置 SETUP_TOKEN，然后刷新页面。"}
+            </p>
+            <div className="space-y-1.5">
+              <label htmlFor="setup-token" className="text-xs font-semibold text-content-secondary">初始化授权码</label>
+              <PasswordInput id="setup-token"
+                autoComplete="off"
+                value={setupToken}
+                onChange={setSetupToken}
+                placeholder="部署者配置的 SETUP_TOKEN"
+                className="form-input w-full px-3.5 py-2.5 rounded-lg text-sm text-content-primary placeholder:text-content-muted"
+              />
+            </div>
             <div className="space-y-1.5">
               <label htmlFor="app-fld4" className="text-xs font-semibold text-content-secondary">设置用户名</label>
               <Input id="app-fld4" size="lg"
@@ -174,7 +192,7 @@ export function LoginPage({ auth, toast }: LoginPageProps) {
             </div>
             <button
               type="submit"
-              disabled={loginLoading}
+              disabled={loginLoading || !setupTokenConfigured}
               className="btn-primary w-full py-2.5 rounded-lg text-sm font-bold text-white flex items-center justify-center gap-2 disabled:opacity-50"
             >
               {loginLoading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <ShieldCheck className="w-4 h-4" />}

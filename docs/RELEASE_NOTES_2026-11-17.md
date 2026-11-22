@@ -44,3 +44,4 @@ Docker 修复后再次通过全量验证（192 个用例），并用打包后的
 - [八类域名分页与全量摘要（2026-11-19）](./DOMAIN_PAGINATION_PROGRESS_2026-11-19.md)
 - [摘要请求去重与原子缓存失效（2026-11-19）](./SUMMARY_CACHE_PROGRESS_2026-11-19.md)
 - [Node 密钥与启动就绪安全（2026-11-22）](./NODE_KEY_STARTUP_PROGRESS_2026-11-22.md)
+- [CORS、可信代理与初始化授权（2026-11-22）](./REQUEST_BOUNDARIES_PROGRESS_2026-11-22.md)

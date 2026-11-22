@@ -16,6 +16,9 @@ services:
       WEBHOOK_URL: ${WEBHOOK_URL:-} # 通知推送地址
       WEBHOOK_TYPE: ${WEBHOOK_TYPE:-} # 通知类型：dingtalk / feishu / wecom / serverchan / custom
       ALLOWED_ORIGIN: ${ALLOWED_ORIGIN:-} # CORS 来源，自建同源无需配置
+      SETUP_TOKEN: ${SETUP_TOKEN:-} # 首次初始化授权码，建议独立生成 64 位随机 hex；空值锁定 setup
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-} # HTTPS 反代填实际来源，如 https://domain.example.com
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-} # 默认不信任代理头；仅填可控代理 IP/CIDR
       DEFAULT_API_KEY: ${DEFAULT_API_KEY:-} # 首次启动自动绑定的 DNSHE API Key
       DEFAULT_API_SECRET: ${DEFAULT_API_SECRET:-} # 首次启动自动绑定的 DNSHE API Secret
       DEFAULT_API_ALIAS: ${DEFAULT_API_ALIAS:-} # 默认账号别名

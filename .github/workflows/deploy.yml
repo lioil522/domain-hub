@@ -235,9 +235,15 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+          SETUP_TOKEN: ${{ secrets.SETUP_TOKEN }}
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           ALLOWED_ORIGIN: ${{ secrets.ALLOWED_ORIGIN }}
         run: |
+          set -euo pipefail
+          if [ -n "$SETUP_TOKEN" ]; then
+            echo "🔑 同步独立的 SETUP_TOKEN 初始化授权码（不写入前端或日志）..."
+            printf '%s' "$SETUP_TOKEN" | npx wrangler secret put SETUP_TOKEN
+          fi
           if [ -n "$ADMIN_TOKEN" ]; then
             echo "🔑 正在同步更新 ADMIN_TOKEN 口令到 Cloudflare Worker..."
             echo "$ADMIN_TOKEN" | npx wrangler secret put ADMIN_TOKEN || true
@@ -264,7 +270,7 @@ jobs:
             if [ -n "$APP_URL" ]; then
               echo "\`${APP_URL}\`"
               echo
-              echo "前端与 API 都在这个地址上（同一个 Worker）。首次进入请在登录页自行设置管理员用户名与密码。"
+              echo "前端与 API 同源。首次初始化须先配置 GitHub/Worker Secret SETUP_TOKEN，再在登录页输入该授权码并设置管理员账户；已有账户正常登录。"
             else
               echo "⚠️ 未能检测到访问地址（既无自定义域名，也未取到 workers.dev 子域）。"
               echo "部署本身可能已成功，请到 Cloudflare Dashboard → Workers & Pages 查看。"

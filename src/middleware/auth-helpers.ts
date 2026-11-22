@@ -8,17 +8,11 @@ import type { Bindings, Variables } from "../routes/types";
 /**
  * 提取客户端 IP（供登录限流分维度计数）
  *
- * Cloudflare 上优先取 cf-connecting-ip（由 CF 注入、不可伪造）；
- * 自建版 / 反代场景回退到 x-real-ip / x-forwarded-for 的首个值。
+ * 运行时适配器提供可信上下文：Worker 只取边缘头，Node 默认取 socket。
+ * 此处绝不从客户端可伪造的 HTTP 代理头补取 IP。
  */
 export function getClientIp(c: Context<{ Bindings: Bindings; Variables: Variables }>): string {
-  const ip = (
-    c.req.header("cf-connecting-ip") ||
-    c.req.header("x-real-ip") ||
-    (c.req.header("x-forwarded-for") || "").split(",")[0] ||
-    "unknown"
-  ).trim();
-  return ip.slice(0, 64) || "unknown";
+  return c.env.REQUEST_SECURITY?.clientIp || "unknown";
 }
 
 /**

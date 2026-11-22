@@ -43,12 +43,12 @@ export async function login(
 /** 首次初始化（自行设置管理员用户名与密码） */
 export async function setup(
   apiFetch: ApiFetch,
-  payload: { username: string; password: string }
+  payload: { username: string; password: string; setupToken: string }
 ): Promise<SetupResponse> {
   return apiJson<SetupResponse>(apiFetch, "/api/auth/setup", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${payload.setupToken}` },
+    body: JSON.stringify({ username: payload.username, password: payload.password }),
   });
 }
 

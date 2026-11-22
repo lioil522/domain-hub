@@ -80,6 +80,8 @@ export function useAuthSession({
   const [setupUsername, setSetupUsername] = useState("");
   const [setupPassword, setSetupPassword] = useState("");
   const [setupPassword2, setSetupPassword2] = useState("");
+  const [setupToken, setSetupToken] = useState("");
+  const [setupTokenConfigured, setSetupTokenConfigured] = useState(true);
 
   // ===== 账户安全（设置页）状态 =====
   const [accountInfo, setAccountInfo] = useState<AccountInfo>({ username: "", two_fa_enabled: false });
@@ -100,6 +102,7 @@ export function useAuthSession({
         if (!cancelled && data.success) {
           setAuthInitialized(!!data.initialized);
           setAuthTwoFaEnabled(!!data.two_fa_enabled);
+          if (data.setup_token_configured !== undefined) setSetupTokenConfigured(data.setup_token_configured);
         }
       } catch (e) {
         // 网络异常时保持默认（已初始化），仍展示登录表单
@@ -191,6 +194,10 @@ export function useAuthSession({
     if (e) e.preventDefault();
     setLoginError("");
 
+    if (!setupTokenConfigured || !setupToken.trim()) {
+      setLoginError(setupTokenConfigured ? "请输入部署者设置的初始化授权码" : "首次初始化已锁定，请由部署者配置 SETUP_TOKEN");
+      return;
+    }
     if (!setupUsername.trim() || setupUsername.trim().length < 3) {
       setLoginError("用户名至少需要 3 个字符");
       return;
@@ -209,12 +216,14 @@ export function useAuthSession({
       const data = await setupRequest(apiFetch, {
         username: setupUsername.trim(),
         password: setupPassword,
+        setupToken: setupToken.trim(),
       });
 
       if (data.success && data.session_token) {
         persistSession(data.session_token);
         setSetupPassword("");
         setSetupPassword2("");
+        setSetupToken("");
         setAuthInitialized(true);
         showToast("success", data.message || "🎉 初始化成功");
       } else {
@@ -286,6 +295,9 @@ export function useAuthSession({
     setSetupPassword,
     setupPassword2,
     setSetupPassword2,
+    setupToken,
+    setSetupToken,
+    setupTokenConfigured,
     // 账户安全信息
     accountInfo,
     // 动作

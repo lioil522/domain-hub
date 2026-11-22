@@ -85,7 +85,12 @@ export async function preflightNodeDatabase(file: string, key: string) {
   let sqlite: DatabaseSync;
   try { sqlite = new DatabaseSync(file, { readOnly: true }); }
   catch { throw new NodeKeyError("无法只读打开已有数据库，请检查 DB_PATH、权限和完整数据卷。"); }
-  try { await validateStoredNodeKeys(sqlite, key); }
+  try {
+    // Connection-local only: this does not write the database. A concurrent
+    // initializer can temporarily hold a schema/journal lock on a new file.
+    sqlite.exec("PRAGMA busy_timeout = 5000");
+    await validateStoredNodeKeys(sqlite, key);
+  }
   finally { sqlite.close(); }
 }
 export async function assertNodeKeyMarker(db: D1Database, key: string) {

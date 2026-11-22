@@ -284,3 +284,19 @@ test("concurrent fresh processes share one complete published key", async t => {
   assert.match(stored, /^[a-f0-9]{64}$/);
   assert.ok(!one.output().includes(stored) && !two.output().includes(stored));
 });
+test("read-only preflight tolerates a short exclusive lock without creating a replacement key", async t => {
+  const { dir, sqlite } = fixture(t);
+  account(sqlite, await encryptText(SECRET, KEY));
+  sqlite.exec("BEGIN EXCLUSIVE");
+  let released = false;
+  const release = setTimeout(() => { sqlite.exec("ROLLBACK"); released = true; }, 300);
+  try {
+    const server = await runningProcess(t, dir, KEY);
+    assert.equal(released, true);
+    assert.equal((await fetch(`${server.url}/healthz`)).status, 200);
+    assert.equal(existsSync(path.join(dir, "aes.key")), false);
+  } finally {
+    clearTimeout(release);
+    if (!released) sqlite.exec("ROLLBACK");
+  }
+});

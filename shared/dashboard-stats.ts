@@ -42,6 +42,27 @@ export function parseCatalogDate(raw: string, timezoneOffset = 0): number {
   }
   return Date.parse(raw);
 }
+/** Bounded, request-local memo; never retain inventory/date state globally. */
+export function createCatalogDateParser(timezoneOffset: number) {
+  const cache = new Map<string, number>();
+  return (raw: string) => {
+    const old = cache.get(raw);
+    if (old !== undefined) return old; // NaN is cached too.
+    const time = parseCatalogDate(raw, timezoneOffset);
+    if (cache.size < 2048) cache.set(raw, time);
+    return time;
+  };
+}
+
+function insertBounded<T>(items: T[], item: T, limit: number, compare: (a: T, b: T) => number) {
+  if (limit === 0) return;
+  // Insert after equal values: same stable tie order as Array.sort + slice.
+  let index = items.length;
+  while (index > 0 && compare(items[index - 1], item) > 0) index--;
+  if (index >= limit) return;
+  items.splice(index, 0, item);
+  if (items.length > limit) items.pop();
+}
 
 export interface DashboardStatsOptions {
   domains: SummaryDomain[];
@@ -55,14 +76,6 @@ export interface DashboardStatsOptions {
   customGroupList: Array<{ id: number; alias: string }>;
   multiProviderAccounts: Record<MultiProviderKey, unknown[]>;
   cfExpiryMap: Record<string, SummaryExpiry>;
-}
-
-interface ExpiryRecord {
-  full_domain: string;
-  expires_at?: string;
-  status?: string;
-  source: string;
-  alias: string;
 }
 
 interface ExpiryEntry {
@@ -86,8 +99,8 @@ export function computeDashboardStats({
   customGroupList,
   multiProviderAccounts,
   cfExpiryMap,
-}: DashboardStatsOptions, now = Date.now(), timelineLimit = Infinity, timezoneOffset = new Date(now).getTimezoneOffset()) {
-  const parseTime = (raw: string) => parseCatalogDate(raw, timezoneOffset);
+}: DashboardStatsOptions, now = Date.now(), timelineLimit = Infinity, timezoneOffset = new Date(now).getTimezoneOffset(),
+parseTime = createCatalogDateParser(timezoneOffset)) {
   const keyCache = new Map<string, string>();
   const candidateCache = new Map<string, string[]>();
   const keyOf = (raw: string) => {
@@ -97,7 +110,11 @@ export function computeDashboardStats({
   };
   const candidatesOf = (raw: string) => {
     let keys = candidateCache.get(raw);
-    if (!keys) { keys = domainKeyCandidates(raw); candidateCache.set(raw, keys); }
+    if (!keys) {
+      const clean = raw.replace(/[\u00AD\u200B-\u200F\u2060-\u2064\uFEFF]/g, "");
+      keys = clean === raw ? [keyOf(raw)] : domainKeyCandidates(raw);
+      candidateCache.set(raw, keys);
+    }
     return keys;
   };
   const calendarDate = (time: number) => new Date(time - timezoneOffset * 60_000);
@@ -123,11 +140,9 @@ export function computeDashboardStats({
   dpDomains.forEach((d) => record(d.full_domain, isExpired(d.expires_at, d.status)));
   customDomains.forEach((d) => record(d.full_domain, isExpired(d.expires_at)));
 
-  const multiRecords = MULTI_PROVIDER_ORDER.flatMap((key) => {
-    const label = MULTI_PROVIDER_META[key].label;
-    return multiProviderDomains[key].map((d) => ({ domain: d, source: label }));
-  });
-  multiRecords.forEach(({ domain: d }) => record(d.full_domain, isExpired(d.expires_at, d.status)));
+  for (const key of MULTI_PROVIDER_ORDER) {
+    for (const d of multiProviderDomains[key]) record(d.full_domain, isExpired(d.expires_at, d.status));
+  }
 
   const total = seen.size;
 
@@ -153,28 +168,21 @@ export function computeDashboardStats({
     return fallback;
   };
 
-  const expiryRecords: ExpiryRecord[] = [
-    ...domains.map((d) => ({ full_domain: d.full_domain, expires_at: resolveExpiry(d.full_domain, d.expires_at), status: d.status, source: "DNSHE", alias: d.account_alias })),
-    ...cfZones.map((z) => ({ full_domain: z.full_domain, expires_at: resolveExpiry(z.full_domain, z.expires_at), status: undefined, source: "Cloudflare", alias: z.account_alias })),
-    ...dpDomains.map((d) => ({ full_domain: d.full_domain, expires_at: resolveExpiry(d.full_domain, d.expires_at), status: d.status, source: "DigitalPlat", alias: d.account_alias })),
-    ...customDomains.map((d) => ({ full_domain: d.full_domain, expires_at: resolveExpiry(d.full_domain, d.expires_at), status: undefined, source: "自定义", alias: groupNameById.get(d.group_id) || "" })),
-    ...multiRecords.map(({ domain: d, source }) => ({ full_domain: d.full_domain, expires_at: resolveExpiry(d.full_domain, d.expires_at), status: d.status, source, alias: d.account_alias })),
+  // Visit in the historical source order without full-sized wrapper arrays.
+  const sources: Array<{ rows: SummaryDomain[]; source: string }> = [
+    { rows: domains, source: "DNSHE" }, { rows: cfZones, source: "Cloudflare" }, { rows: dpDomains, source: "DigitalPlat" },
+    ...MULTI_PROVIDER_ORDER.map(key => ({ rows: multiProviderDomains[key], source: MULTI_PROVIDER_META[key].label })),
   ];
 
   // 最近注册：跨来源按 created_at 倒序（自定义服务商无 created_at，排除）。
   // 同名域名去重时优先保留有 created_at 的那条，避免同一域名占多行。
-  const recentRaw = [
-    ...domains.map((d) => ({ full_domain: d.full_domain, created_at: d.created_at, source: "DNSHE", alias: d.account_alias })),
-    ...cfZones.map((z) => ({ full_domain: z.full_domain, created_at: z.created_at, source: "Cloudflare", alias: z.account_alias })),
-    ...dpDomains.map((d) => ({ full_domain: d.full_domain, created_at: d.created_at, source: "DigitalPlat", alias: d.account_alias })),
-    ...multiRecords.map(({ domain: d, source }) => ({ full_domain: d.full_domain, created_at: d.created_at, source, alias: d.account_alias })),
-  ].filter((x) => x.created_at);
-  const recentByName = new Map<string, (typeof recentRaw)[number]>();
-  recentRaw.forEach((x) => {
-    const key = keyOf(x.full_domain);
-    if (!key) return;
-    if (!recentByName.has(key)) recentByName.set(key, x);
-  });
+  const recentByName = new Map<string, { full_domain: string; created_at: string | undefined; source: string; alias: string }>();
+  for (const { rows, source } of sources) for (const d of rows) {
+    if (!d.created_at) continue;
+    const key = keyOf(d.full_domain);
+    if (!key || recentByName.has(key)) continue;
+    recentByName.set(key, { full_domain: d.full_domain, created_at: d.created_at, source, alias: d.account_alias });
+  }
   const recent = Array.from(recentByName.values())
     .sort((a, b) => parseTime(b.created_at!) - parseTime(a.created_at!))
     .slice(0, 6);
@@ -187,27 +195,34 @@ export function computeDashboardStats({
   // permanentCount 与 scheduledTotal 各加一次。
   const permanentCandidates = new Set<string>();
   const expiryByKey = new Map<string, ExpiryEntry>();
-  for (const r of expiryRecords) {
-    const key = keyOf(r.full_domain);
-    if (!key) continue;
+  const addExpiry = (full_domain: string, fallback: string, source: string, alias: string) => {
+    const key = keyOf(full_domain);
+    if (!key) return;
+    const expires_at = resolveExpiry(full_domain, fallback);
     // 永久占位（0000 前缀）与空值：不算过期，也不进预警
-    const permanent = !r.expires_at || r.expires_at.startsWith("0000");
+    const permanent = !expires_at || expires_at.startsWith("0000");
     if (permanent) {
       permanentCandidates.add(key);
-      continue;
+      return;
     }
-    const time = parseTime(r.expires_at!);
-    if (isNaN(time)) continue;
+    const time = parseTime(expires_at!);
+    if (isNaN(time)) return;
     const daysLeft = (time - now) / 86400000;
     const isExp = daysLeft < 0;
     if (isExp) expiredKeys.add(key);
     const prev = expiryByKey.get(key);
     // 去重取更紧急的一条：已过期优先，其次剩余天数更少
     if (prev) {
-      if (prev.expired && !isExp) continue;
-      if (prev.expired === isExp && prev.daysLeft <= daysLeft) continue;
+      if (prev.expired && !isExp) return;
+      if (prev.expired === isExp && prev.daysLeft <= daysLeft) return;
     }
-    expiryByKey.set(key, { full_domain: r.full_domain, daysLeft, expired: isExp, source: r.source, alias: r.alias || "", time });
+    expiryByKey.set(key, { full_domain, daysLeft, expired: isExp, source, alias: alias || "", time });
+  };
+  for (let i = 0; i < sources.length; i++) {
+    // Custom sits between DigitalPlat and the four additional providers.
+    if (i === 3) for (const d of customDomains) addExpiry(d.full_domain, d.expires_at, "自定义", groupNameById.get(d.group_id) || "");
+    const { rows, source } = sources[i];
+    for (const d of rows) addExpiry(d.full_domain, d.expires_at, source, d.account_alias);
   }
 
   // 已过期口径：RDAP/手动链算出的过期域名，并上原有 isExpired 判定的过期域名
@@ -219,9 +234,13 @@ export function computeDashboardStats({
   const active = Math.max(0, total - expired);
 
   const EXPIRY_WARN_DAYS = 90;
-  const expiringAll = Array.from(expiryByKey.values())
-    .filter((x) => x.expired || x.daysLeft <= EXPIRY_WARN_DAYS)
-    .sort((a, b) => a.daysLeft - b.daysLeft);
+  const expiring: ExpiryEntry[] = [];
+  let expiringTotal = 0;
+  for (const x of expiryByKey.values()) {
+    if (!x.expired && x.daysLeft > EXPIRY_WARN_DAYS) continue;
+    expiringTotal++;
+    insertBounded(expiring, x, 8, (a, b) => a.daysLeft - b.daysLeft);
+  }
 
   /**
    * 未来 12 个月到期分布（时间轴数据源）。
@@ -266,6 +285,7 @@ export function computeDashboardStats({
     });
   }
   const bucketByKey = new Map(buckets.map((b) => [b.key, b]));
+  const boundedTimeline = Number.isInteger(timelineLimit) && timelineLimit >= 0 && Number.isFinite(timelineLimit);
 
   // NOTE: 迭代已去重的 expiryByKey（含 resolveExpiry 优先级链），而不是原始
   // expiryRecords —— 后者会把同一域名在多个来源各推一次，导致时间轴计数虚高。
@@ -274,19 +294,23 @@ export function computeDashboardStats({
     const due = calendarDate(r.time);
     const bucket = bucketByKey.get(monthKeyOf(due));
     if (!bucket) continue; // 落在 12 个月之外
-    bucket.items.push({
+    const item = {
       full_domain: r.full_domain,
       source: r.source,
       alias: r.alias || "",
       daysLeft: r.daysLeft,
       day: due.getUTCDate(),
-    });
+    };
+    bucket.count++;
+    if (boundedTimeline) insertBounded(bucket.items, item, timelineLimit, (a, b) => a.day - b.day);
+    else bucket.items.push(item);
   }
   // 桶内按自然日升序，让「这个月先到期的排前面」
   buckets.forEach((b) => {
-    b.items.sort((a, b2) => a.day - b2.day);
-    b.count = b.items.length;
-    b.items = b.items.slice(0, timelineLimit);
+    if (!boundedTimeline) {
+      b.items.sort((a, b2) => a.day - b2.day);
+      b.items = b.items.slice(0, timelineLimit);
+    }
   });
 
   // 按域名归一类：只有当该域名没有任何真实到期日、且没有被判过期时，才算永久。
@@ -308,8 +332,8 @@ export function computeDashboardStats({
       customGroupList.length +
       MULTI_PROVIDER_ORDER.reduce((sum, key) => sum + multiProviderAccounts[key].length, 0),
     recent,
-    expiring: expiringAll.slice(0, 8),
-    expiringTotal: expiringAll.length,
+    expiring,
+    expiringTotal,
     // 时间轴
     timeline: {
       buckets,

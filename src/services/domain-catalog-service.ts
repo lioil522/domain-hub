@@ -1,15 +1,14 @@
 import { normalizeDomainKey, domainKeyCandidates } from "../../shared/domain-keys";
-import { toASCII, toUnicode } from "../../shared/punycode";
-import { computeDashboardStats, type SummaryExpiry } from "../../shared/dashboard-stats";
+import { toUnicode } from "../../shared/punycode";
+import { computeDashboardStats, createCatalogDateParser, type SummaryExpiry } from "../../shared/dashboard-stats";
 import { CATALOG_PROVIDERS, type CatalogProvider, type CatalogSummary, type CatalogSearch, type CatalogHint, type CatalogSearchScope } from "../../shared/domain-catalog";
 import { DomainCatalogRepository, type CatalogRow } from "../repositories/domain-catalog-repository";
 import { cachedCatalogSummary, initialSummaryDeadline, capSummaryDeadline } from "./catalog-summary-cache";
 import { CachedDnsSearchRepository, dnsSearchNeedles } from "../repositories/cached-dns-search-repository";
+import { createCatalogMatcher } from "../../shared/catalog-match";
 
 export function catalogMatches(name: string, query: string) {
-  const q = query.trim().toLowerCase();
-  const ascii = name.toLowerCase(), unicode = toUnicode(name).toLowerCase(), qa = toASCII(q).toLowerCase();
-  return ascii.includes(q) || unicode.includes(q) || ascii.includes(qa);
+  return createCatalogMatcher(query).matches(name);
 }
 interface Cursor { version: 1; scope: string; after: number; ceiling: number; }
 export interface PageQuery {
@@ -47,18 +46,20 @@ export class DomainCatalogService {
       this.repository.expiryMetadata(now),
     ]);
     let validUntil = initialSummaryDeadline(now, timezoneOffset);
+    const parseTime = createCatalogDateParser(timezoneOffset);
+    const cap = (raw: unknown) => { validUntil = capSummaryDeadline(validUntil, raw, now, timezoneOffset, parseTime); };
     const expiry: Record<string, SummaryExpiry> = {};
     for (const row of dates) {
       const key = normalizeDomainKey(row.full_domain);
       if (row.cache_expires_at !== null) validUntil = Math.min(validUntil, row.cache_expires_at * 1000);
       if (row.kind === "manual") {
         expiry[key] = { found: false, manual: true, expires_at: row.expires_at || undefined };
-        validUntil = capSummaryDeadline(validUntil, row.expires_at, now, timezoneOffset);
+        cap(row.expires_at);
       }
       else {
         try {
           expiry[key] = JSON.parse(row.value || "") as SummaryExpiry;
-          validUntil = capSummaryDeadline(validUntil, expiry[key]?.expires_at, now, timezoneOffset);
+          cap(expiry[key]?.expires_at);
         } catch { /* malformed cache is unknown */ }
       }
     }
@@ -76,12 +77,12 @@ export class DomainCatalogService {
       const count = account_counts[row.account_id] ||= { total: 0, has_dns: 0 };
       count.total++; if (row.has_dns) count.has_dns++;
       if (row.provider === "dnshe" && row.rootdomain) roots.add(row.rootdomain);
-      validUntil = capSummaryDeadline(validUntil, row.expires_at, now, timezoneOffset);
+      cap(row.expires_at);
     }
     for (const row of accounts) groupedAccounts[row.provider]?.push(row);
     for (const row of custom) {
       const count = account_counts[row.group_id] ||= { total: 0, has_dns: 0 }; count.total++;
-      validUntil = capSummaryDeadline(validUntil, row.expires_at, now, timezoneOffset);
+      cap(row.expires_at);
     }
     const byProvider = (provider: CatalogProvider) => grouped[provider];
     const accountList = (provider: CatalogProvider) => groupedAccounts[provider];
@@ -92,7 +93,7 @@ export class DomainCatalogService {
       customGroupList: accountList("custom"),
       multiProviderAccounts: { dnspod: accountList("dnspod"), alidns: accountList("alidns"), huaweicloud: accountList("huaweicloud"), vercel: accountList("vercel") },
       cfExpiryMap: expiry,
-    }, now, 20, timezoneOffset);
+    }, now, 20, timezoneOffset, parseTime);
     const provider_counts = Object.fromEntries(CATALOG_PROVIDERS.map(provider => [provider, provider === "custom" ? custom.length : byProvider(provider).length])) as CatalogSummary["provider_counts"];
     return { summary: { stats, provider_counts, account_counts, root_domains: [...roots] }, validUntil };
   }
@@ -101,10 +102,14 @@ export class DomainCatalogService {
     query = query.trim();
     const scope = catalogSearchScope(searchIn);
     if (query.length > 253) throw new CatalogQueryError("搜索词过长");
-    const [rows, cached] = query ? await Promise.all([
-      this.repository.searchProjection(),
-      scope === "domain" ? [] : this.dnsMatches(query),
-    ]) : [[], []];
+    const matcher = createCatalogMatcher(query);
+    const cached = query && scope !== "domain" ? await this.dnsMatches(query) : [];
+    // Revalidate matched DNS IDs against current ownership/name; changes between
+    // these reads must not turn a stale cache hit into a different domain.
+    const rows = query ? await this.repository.searchProjection({
+      ...(scope === "dns" ? {} : { query }),
+      ...(scope === "domain" ? {} : { dnsIds: cached.map(row => row.id) }),
+    }) : [];
     const byId = new Map(cached.map(row => [`${row.provider}:${row.id}:${row.account_id}:${row.full_domain}`, row]));
     const group = (): CatalogSearch["groups"]["dnshe"] => ({ total: 0, items: [] });
     const groups: CatalogSearch["groups"] = {
@@ -113,7 +118,7 @@ export class DomainCatalogService {
     };
     for (const row of rows) {
       const dns = byId.get(`${row.provider}:${row.id}:${row.account_id}:${row.full_domain}`);
-      if (!(scope !== "dns" && catalogMatches(row.full_domain, query)) && !dns) continue;
+      if (!(scope !== "dns" && matcher.matches(row.full_domain)) && !dns) continue;
       const group = groups[row.provider];
       if (!group) continue;
       group.total++;
@@ -137,13 +142,16 @@ export class DomainCatalogService {
     if (query.provider === "custom" && query.status) throw new CatalogQueryError("自定义域名不支持 status 筛选");
     // Unicode partial search needs decoding, unavailable as a D1 SQL function.
     // Only compact names/IDs are scanned; normal paging uses SQL keyset + LIMIT.
-    const [projection, cached] = search || query.focus ? await Promise.all([
-      this.repository.searchProjection(),
-      search && searchIn !== "domain" ? this.dnsMatches(rawSearch, query.provider, query.filter) : [],
-    ]) : [[], []];
+    const matcher = createCatalogMatcher(rawSearch);
+    const cached = search && searchIn !== "domain" ? await this.dnsMatches(rawSearch, query.provider, query.filter) : [];
+    const projection = search || query.focus ? await this.repository.searchProjection({
+      provider: query.provider, accountId: query.filter,
+      ...(search && searchIn !== "dns" ? { query: rawSearch } : {}),
+      ...(search && searchIn !== "domain" ? { dnsIds: cached.map(row => row.id) } : {}),
+    }) : [];
     const dnsIds = new Set(cached.map(row => `${row.id}:${row.account_id}:${row.full_domain}`));
     const names = projection.filter(row => row.provider === query.provider && (!query.filter || row.account_id === query.filter) &&
-      (!search || (searchIn !== "dns" && catalogMatches(row.full_domain, rawSearch)) || dnsIds.has(`${row.id}:${row.account_id}:${row.full_domain}`)));
+      (!search || (searchIn !== "dns" && matcher.matches(row.full_domain)) || dnsIds.has(`${row.id}:${row.account_id}:${row.full_domain}`)));
     const input = { provider: query.provider, filter: query.filter, status: query.status,
       ...(search ? { ids: names.map(row => row.id) } : {}) };
     let ceiling: number, after = -1, focusTarget: number | undefined;

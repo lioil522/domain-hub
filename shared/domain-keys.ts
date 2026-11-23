@@ -59,6 +59,7 @@ export const isRegistrableDomain = (value: string): boolean => {
 export const domainKeyCandidates = (value: string): string[] => {
   const raw = String(value || "");
   const normalized = normalizeDomainKey(raw);
-  const stripped = normalizeDomainKey(raw.replace(/[\u00AD\u200B-\u200F\u2060-\u2064\uFEFF]/g, ""));
+  const clean = raw.replace(/[\u00AD\u200B-\u200F\u2060-\u2064\uFEFF]/g, "");
+  const stripped = clean === raw ? normalized : normalizeDomainKey(clean);
   return stripped === normalized ? [normalized] : [normalized, stripped];
 };

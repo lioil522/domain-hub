@@ -200,6 +200,7 @@ function decodeLabel(input: string): string {
 export function toASCII(domain: string): string {
   if (!domain) return domain;
   const normalized = domain.trim().replace(/[。．｡]/g, ".");
+  if (!NON_ASCII.test(normalized)) return normalized.toLowerCase();
   return normalized
     .split(".")
     .map((label) => (label ? labelToASCII(label) : label))
@@ -222,6 +223,7 @@ export function hasNonASCII(input: string): boolean {
  */
 export function toUnicode(domain: string): string {
   if (!domain) return domain;
+  if (!/(?:^|\.)xn--/i.test(domain)) return domain;
   return domain
     .split(".")
     .map((label) => {

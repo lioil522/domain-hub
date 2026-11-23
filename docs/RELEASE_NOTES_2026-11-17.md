@@ -49,3 +49,4 @@ Docker 修复后再次通过全量验证（192 个用例），并用打包后的
 - [开发工具链审计与升级（2026-11-22）](./TOOLCHAIN_PROGRESS_2026-11-22.md)
 - [Node WAL 启动锁的有界重试（2026-11-22）](./SQLITE_STARTUP_RETRY_PROGRESS_2026-11-22.md)
 - [有效 DNS 缓存内容搜索（2026-11-22）](./DNS_CONTENT_SEARCH_PROGRESS_2026-11-22.md)
+- [大库存摘要与搜索性能（2026-11-23）](./CATALOG_PERFORMANCE_PROGRESS_2026-11-23.md)

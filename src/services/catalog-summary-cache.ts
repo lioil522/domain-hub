@@ -56,9 +56,10 @@ export function initialSummaryDeadline(now: number, offset: number) {
   const nextMonth = Date.UTC(local.getUTCFullYear(), local.getUTCMonth() + 1, 1) + offset * 60_000;
   return Math.min(now + SUMMARY_CACHE_MS, nextMonth);
 }
-export function capSummaryDeadline(deadline: number, raw: unknown, now: number, offset: number) {
+export function capSummaryDeadline(deadline: number, raw: unknown, now: number, offset: number,
+parseTime = (value: string) => parseCatalogDate(value, offset)) {
   if (typeof raw !== "string" || !raw || raw.startsWith("0000")) return deadline;
-  const time = parseCatalogDate(raw, offset);
+  const time = parseTime(raw);
   // Expired uses strict time < now; invalidate one millisecond after the exact instant.
   for (const boundary of [time + 1, time - 90 * 86400000]) {
     if (Number.isFinite(boundary) && boundary > now) deadline = Math.min(deadline, boundary);

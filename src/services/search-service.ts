@@ -8,7 +8,7 @@ import { logSearchResult } from "../search/providers/logs";
 import { DomainCatalogRepository } from "../repositories/domain-catalog-repository";
 import { CachedDnsSearchRepository, dnsSearchNeedles } from "../repositories/cached-dns-search-repository";
 import { SearchRepository } from "../repositories/search-repository";
-import { catalogMatches } from "./domain-catalog-service";
+import { createCatalogMatcher } from "../../shared/catalog-match";
 import { ValidationError } from "../errors";
 
 export class SearchService {
@@ -20,8 +20,9 @@ export class SearchService {
     if (keyword.trim().length > 253 || !Number.isInteger(limit) || limit < 1 || limit > 100) throw new ValidationError("搜索词或结果条数无效");
     const repository = new SearchRepository(this.db);
     const sqlQuery = dnsSearchNeedles(keyword)[0];
+    const matcher = createCatalogMatcher(keyword);
     const [domains, metadata, accounts, dns, logs] = await Promise.all([
-      new DomainCatalogRepository(this.db).searchProjection(),
+      new DomainCatalogRepository(this.db).searchProjection({ query: keyword }),
       repository.domainsByMetadata(sqlQuery, limit),
       repository.accounts(sqlQuery, limit),
       new CachedDnsSearchRepository(this.db).matches(keyword, { eachRecord: true, limit: 400 }),
@@ -37,7 +38,7 @@ export class SearchService {
       bucket.push(result); buckets.set(score, bucket); kept.add(key);
     };
     for (const item of domains) {
-      if (catalogMatches(item.full_domain, keyword)) {
+      if (matcher.matches(item.full_domain)) {
         add(domainSearchResult({ ...item, account_provider: item.provider }));
       }
     }

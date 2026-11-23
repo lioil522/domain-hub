@@ -123,6 +123,8 @@ npm
 
 顶部搜索现在支持八类域名名称与**有效已缓存 DNS 的类型/name/content**，可用 IP、TXT 值定位所属库存；不会为搜索批量回源。未缓存不代表 DNS 不存在，缓存摘要也不是实时全量记录。详见 [DNS 搜索范围与限制](docs/DNS_CONTENT_SEARCH_PROGRESS_2026-11-22.md)。
 
+大库存冷摘要与搜索已增加日期/转换复用、稳定有界明细和 SQL 保守预筛；使用 `npm run benchmark:catalog` 可在隔离 Node/workerd 库复测。实测口径、保留的 Unicode 语义与剩余规模限制见 [性能记录](docs/CATALOG_PERFORMANCE_PROGRESS_2026-11-23.md)；本地耗时不是生产计费 CPU。
+
 ---
 
 ## 项目结构

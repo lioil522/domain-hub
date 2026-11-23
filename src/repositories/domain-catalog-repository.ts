@@ -4,6 +4,7 @@ import { RDAP_CACHE_PREFIX } from "../db";
 import type { CatalogProvider } from "../../shared/domain-catalog";
 import type { SummaryDomain } from "../../shared/dashboard-stats";
 import { CATALOG_REVISION_KEY, CATALOG_CACHE_PREFIX } from "../db/catalog-version";
+import { createCatalogMatcher } from "../../shared/catalog-match";
 
 export interface CatalogRow extends SummaryDomain {
   id: number;
@@ -18,6 +19,7 @@ export interface CatalogCustomRow {
   account_name?: string | null;
 }
 interface SqlPageFilter { provider: CatalogProvider; filter?: number; status?: string; ids?: number[]; }
+interface NameProjectionFilter { query?: string; provider?: CatalogProvider; accountId?: number; dnsIds?: number[]; }
 export class DomainCatalogRepository {
   constructor(private readonly db: DatabaseManager) {}
   cacheBinding() { return this.db.catalogCacheBinding(); }
@@ -54,11 +56,38 @@ export class DomainCatalogRepository {
     return this.db.allRaw<Pick<CatalogCustomRow, "id" | "group_id" | "full_domain" | "expires_at">>(
       "SELECT id,group_id,full_domain,expires_at FROM custom_domains ORDER BY id");
   }
-  searchProjection() {
-    return this.db.allRaw<{ id: number; full_domain: string; account_id: number; provider: CatalogProvider }>(`
-      SELECT d.id,d.full_domain,d.account_id,COALESCE(a.provider,'dnshe') provider FROM domains_cache d
-      LEFT JOIN accounts a ON a.id=d.account_id
-      UNION ALL SELECT id,full_domain,group_id account_id,'custom' provider FROM custom_domains ORDER BY id`);
+  searchProjection(input: NameProjectionFilter = {}) {
+    const parts: string[] = [], binds: (string | number)[] = [];
+    const where = (custom: boolean) => {
+      const conditions: string[] = [];
+      if (input.provider && !custom) { conditions.push("COALESCE(a.provider,'dnshe')=?"); binds.push(input.provider); }
+      if (input.accountId !== undefined) {
+        conditions.push(custom ? "d.group_id=?" : "d.account_id=?"); binds.push(input.accountId);
+      }
+      const matches: string[] = [];
+      if (input.query) {
+        const needles = createCatalogMatcher(input.query).needles;
+        // A conservative superset: SQLite folds ASCII only. Every non-ASCII
+        // name and potential Punycode name stays for the JS Unicode decoder.
+        // Never use LIKE (% and _ are literal), or normalize stored names here.
+        matches.push(`${needles.map(() => "instr(lower(d.full_domain),?)>0").join(" OR ")}
+          OR instr(lower(d.full_domain),'xn--')>0 OR d.full_domain GLOB '*[^ -~]*'
+          OR instr(d.full_domain,char(0))>0`);
+        binds.push(...needles);
+      }
+      if (input.dnsIds !== undefined && !custom) {
+        matches.push("d.id IN (SELECT value FROM json_each(?))"); binds.push(JSON.stringify(input.dnsIds));
+      }
+      if (matches.length) conditions.push(`(${matches.join(" OR ")})`);
+      else if (input.dnsIds !== undefined) conditions.push("0");
+      return conditions.length ? ` WHERE ${conditions.join(" AND ")}` : "";
+    };
+    if (input.provider !== "custom") parts.push(`SELECT d.id AS id,d.full_domain,d.account_id,COALESCE(a.provider,'dnshe') provider
+      FROM domains_cache d LEFT JOIN accounts a ON a.id=d.account_id${where(false)}`);
+    if (!input.provider || input.provider === "custom") parts.push(`SELECT d.id AS id,d.full_domain,d.group_id account_id,'custom' provider
+      FROM custom_domains d${where(true)}`);
+    return this.db.allRaw<{ id: number; full_domain: string; account_id: number; provider: CatalogProvider }>(
+      `${parts.join(" UNION ALL ")} ORDER BY id`, binds);
   }
   private selection(input: SqlPageFilter) {
     const custom = input.provider === "custom";

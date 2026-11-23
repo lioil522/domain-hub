@@ -125,6 +125,8 @@ npm
 
 大库存冷摘要与搜索已增加日期/转换复用、稳定有界明细和 SQL 保守预筛；使用 `npm run benchmark:catalog` 可在隔离 Node/workerd 库复测。实测口径、保留的 Unicode 语义与剩余规模限制见 [性能记录](docs/CATALOG_PERFORMANCE_PROGRESS_2026-11-23.md)；本地耗时不是生产计费 CPU。
 
+后续冷统计已合并重复去重结构，并为有限注册日期提供稳定前六选择；非法日期仍回退历史排序。分配采样及规模边界见 [单遍统计记录](docs/SINGLE_PASS_STATS_PROGRESS_2026-11-23.md)，不把采样分配量当作峰值内存保证。
+
 ---
 
 ## 项目结构

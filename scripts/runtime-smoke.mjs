@@ -98,11 +98,58 @@ async function cachedDnsSearchSmoke(fetcher, headers, run) {
 const base = process.platform === "win32" && process.env.LOCALAPPDATA
   ? path.join(process.env.LOCALAPPDATA, "Temp/opencode") : tmpdir();
 await mkdir(base, { recursive: true });
-// Only this isolated test wrapper exposes a tick endpoint, never the app bundle.
+// Only this isolated wrapper exposes tick/stats test paths, never the app bundle.
 // Keep the module in memory: workerd rejects module paths that escape its
 // starting directory, which is exactly what an absolute temp path can become.
 const harnessOutput = await build({ stdin: { contents: `import worker from "./dist-worker/wrangler-dry-run/index.js";
+  import {computeDashboardStats} from "./shared/dashboard-stats";
+  import {semanticFixture,selectionFixture} from "./tests/helpers/catalog-semantic-fixture";
+  import {normalizeDomainKey} from "./shared/domain-keys";
+  function validateRecent(input,recent) {
+    const first=new Map();
+    const sources=[
+      [input.domains,"DNSHE"],[input.cfZones,"Cloudflare"],[input.dpDomains,"DigitalPlat"],
+      [input.multiProviderDomains.dnspod,"DNSPod"],[input.multiProviderDomains.alidns,"阿里云 DNS"],
+      [input.multiProviderDomains.huaweicloud,"华为云 DNS"],[input.multiProviderDomains.vercel,"Vercel"]
+    ];
+    for(const [rows,source] of sources) for(const row of rows) {
+      const key=normalizeDomainKey(row.full_domain);
+      if(key&&row.created_at&&!first.has(key))
+        first.set(key,{full_domain:row.full_domain,created_at:row.created_at,source,alias:row.account_alias});
+    }
+    if(recent.length!==Math.min(6,first.size)) throw new Error("Recent registration candidate count changed");
+    const seen=new Set();
+    for(const row of recent) {
+      const key=normalizeDomainKey(row.full_domain);
+      if(seen.has(key)||JSON.stringify(row)!==JSON.stringify(first.get(key)))
+        throw new Error("Recent registration lost its first source or produced an invalid candidate");
+      seen.add(key);
+    }
+  }
+  async function statsDigest(fixture,seeds,omitRecent=false) {
+    const parts=[];
+    for(let seed=1;seed<=seeds;seed++) for(const offset of [-480,0,330]) {
+      const input=fixture(seed),result=computeDashboardStats(input,Date.parse("2026-11-23T00:00:00Z"),20,offset);
+      validateRecent(input,result.recent);
+      const {recent,...stable}=result;
+      parts.push(JSON.stringify(omitRecent?stable:result));
+    }
+    const bytes=new TextEncoder().encode(parts.join(""));
+    const digest=await crypto.subtle.digest("SHA-256",bytes);
+    return [...new Uint8Array(digest)].map(value=>value.toString(16).padStart(2,"0")).join("");
+  }
   export default { async fetch(request, env, ctx) {
+    if (new URL(request.url).pathname === "/__test_stats") {
+      const input=semanticFixture(1);
+      input.domains=Array.from({length:10},(_,i)=>({full_domain:"invalid-"+i+".example",expires_at:"0000-00-00",
+        created_at:"invalid",account_alias:"first-owner"}));
+      input.cfZones=[{...input.domains[0],created_at:"2026-11-22",account_alias:"later-owner"}];
+      input.dpDomains=[];input.customDomains=[];input.cfExpiryMap={};
+      input.multiProviderDomains={dnspod:[],alidns:[],huaweicloud:[],vercel:[]};
+      const invalidRecent=computeDashboardStats(input,Date.parse("2026-11-23T00:00:00Z"),20,0).recent;
+      return Response.json({smallStable:await statsDigest(semanticFixture,100,true),
+        large:await statsDigest(selectionFixture,30),invalidRecent});
+    }
     if (new URL(request.url).pathname === "/__test_tick") {
       const pending = [];
       await worker.scheduled({cron:"* * * * *"}, env, {waitUntil(job){pending.push(job)}});
@@ -171,6 +218,15 @@ try {
   await summaryCacheSmoke(fetcher, headers);
   await cachedDnsSearchSmoke(fetcher, headers, (sql, args = []) => sqlite.prepare(sql).bind(...args).run());
   assert.equal(workerDeliveries, 1, "Search must not cause an upstream delivery or provider request");
+  const statsCorpus = await fetcher("/__test_stats");
+  assert.equal(statsCorpus.status, 200, await statsCorpus.clone().text());
+  assert.deepEqual(await statsCorpus.json(), {
+    smallStable: "410783978ba809c5cb0a38e52db555675df46f13a0f091b336eea2392533853b",
+    large: "fbb2dcbb88d3a928e6a33980b952ed1b9a3efd0c141e9edede8954feceef4167",
+    invalidRecent: Array.from({ length: 6 }, (_, i) => ({ full_domain: `invalid-${i}.example`,
+      created_at: "invalid", source: "DNSHE", alias: "first-owner" })),
+  });
+  console.log("[runtime-smoke] workerd 390-case stats digests, legacy NaN comparator, first sources and candidate validity passed");
 }
 finally { await mf.dispose(); }
 

@@ -27,3 +27,23 @@ export function semanticFixture(seed: number): DashboardStatsOptions {
     customGroupList: [{ id: 0, alias: "group-0" }, { id: 1, alias: "group-1" }],
     multiProviderAccounts: { dnspod: [5], alidns: [6], huaweicloud: [7], vercel: [8] }, cfExpiryMap };
 }
+
+/** Larger corpus recorded on 7bfc764 before single-pass changes: delayed expiry/late invalid dates. */
+export function selectionFixture(seed: number, count = 240): DashboardStatsOptions {
+  const input = semanticFixture(seed);
+  const rows = (source: string, sourceIndex: number): SummaryDomain[] => Array.from({ length: count }, (_, i) => {
+    const key = i % 13 === 0 ? (i + sourceIndex) % count : i;
+    const name = key % 17 === 0 ? `测试-${key}.example` : `item-${key}.example`;
+    return {
+      full_domain: sourceIndex % 2 === 0 ? name.toUpperCase() + "." : name,
+      expires_at: (i + sourceIndex + seed) % 5 === 0 ? "0000-00-00" : `2027-0${(i % 8) + 1}-${String(i % 27 + 1).padStart(2, "0")}`,
+      created_at: sourceIndex === 0 && i === count - 2 && seed % 3 === 0 ? "late-invalid" :
+        (i + sourceIndex) % 9 === 0 ? "" : `2026-11-${String((i + seed) % 20 + 1).padStart(2, "0")}T12:00:00Z`,
+      status: (i + sourceIndex) % 29 === 0 ? "已过期" : "active", account_alias: `${source}-${i}`,
+    };
+  });
+  input.domains = rows("dnshe", 0); input.cfZones = rows("cf", 1); input.dpDomains = rows("dp", 2);
+  input.multiProviderDomains = Object.fromEntries(MULTI_PROVIDER_ORDER.map((key, i) => [key, rows(key, i + 3)])) as DashboardStatsOptions["multiProviderDomains"];
+  input.customDomains = rows("custom", 7).map(row => ({ full_domain: row.full_domain, expires_at: row.expires_at, group_id: 1 }));
+  return input;
+}

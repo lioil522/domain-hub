@@ -73,6 +73,17 @@ function profileStats(profile) {
   return { sampledActiveMs: sampledActiveUs / 1000, windowMs: (profile.endTime - profile.startTime) / 1000,
     top: [...totals].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([frame, us]) => ({ frame, ms: us / 1000 })) };
 }
+function allocationStats(profile) {
+  const frames = new Map(); let sampledBytes = 0;
+  const visit = node => {
+    const bytes = node.selfSize || 0, name = node.callFrame.functionName || "(anonymous)";
+    sampledBytes += bytes; frames.set(name, (frames.get(name) || 0) + bytes);
+    for (const child of node.children || []) visit(child);
+  };
+  visit(profile.head);
+  return { sampledAllocatedBytes: sampledBytes,
+    allocationTop: [...frames].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([frame, bytes]) => ({ frame, bytes })) };
+}
 async function connect(url) {
   assert.equal(new URL(url).hostname, "127.0.0.1", "Inspector must be our literal loopback target");
   const ws = new WebSocket(url), pending = new Map(); let id = 0;
@@ -94,9 +105,13 @@ async function connect(url) {
   };
 }
 const scenarios = ["cold", "warm", "force", "ascii-sparse", "ascii-wide", "unicode", "dns-sparse", "dns-wide", "all", "page", "legacy"];
+const selectedScenarios = process.env.PERF_SCENARIOS ? process.env.PERF_SCENARIOS.split(",") : scenarios;
+assert.ok(selectedScenarios.length && selectedScenarios.every(item => scenarios.includes(item)));
+const allocations = process.env.PERF_ALLOCATIONS === "1";
 const report = { node: process.version, platform: process.platform, compatibilityDate, sizes, repeats,
+  scenarios: selectedScenarios, allocations,
   sourceDigest: digest(bundled.outputFiles[0].text),
-  disclaimer: "Isolated service harness, not auth/API E2E or production billed CPU. Returned rows are not D1 rows_read. Heap is before/after, not peak; Node includes this orchestrator. Timings are unprofiled; workerd profiles are separate invocations. Sampled active excludes idle/program/root but timeDeltas can include waits attributed to frames; it is NOT a CPU-time estimator.", runs: [] };
+  disclaimer: "Isolated service harness, not auth/API E2E or production billed CPU. Returned rows are not D1 rows_read. Heap is before/after, not peak; Node includes this orchestrator. Timings are unprofiled; CPU/allocation profiles are separate invocations. Sampled allocations include collected objects, not peak or retained heap. Sampled active excludes idle/program/root but timeDeltas can include waits attributed to frames; it is NOT a CPU-time estimator.", runs: [] };
 console.log(`PERF_OUTPUT=${out}`);
 const hashes = new Map();
 for (const n of sizes) {
@@ -126,7 +141,7 @@ for (const n of sizes) {
         assert.ok(target, "Our exact workerd target was not found"); inspector = await connect(target.webSocketDebuggerUrl);
       }
       await inspector.post("Profiler.enable"); await inspector.post("Profiler.setSamplingInterval", { interval: 100 });
-      for (const scenario of scenarios) {
+      for (const scenario of selectedScenarios) {
         // Warm JIT on the same code path before measured repeated runs. Cold
         // refers to the persisted summary cache, NOT module compilation.
         const invoke = async () => runtime === "node" ? run(db, scenario) : (await mf.dispatchFetch(`http://localhost/${scenario}`)).json();
@@ -138,12 +153,19 @@ for (const n of sizes) {
           const result = await invoke(), wallMs = performance.now() - started;
           const nodeCpu = process.cpuUsage(cpu);
           const after = await inspector.post("Runtime.getHeapUsage");
-          let profile;
+          let profile, allocationProfile;
           if (runtime === "workerd") {
             if (scenario === "cold") await db.prepare("DELETE FROM cache WHERE key LIKE 'catalog_summary:%'").run();
             await inspector.post("Profiler.start");
             await invoke();
             ({ profile } = await inspector.post("Profiler.stop"));
+          }
+          if (allocations) {
+            if (scenario === "cold") await db.prepare("DELETE FROM cache WHERE key LIKE 'catalog_summary:%'").run();
+            await inspector.post("HeapProfiler.startSampling", { samplingInterval: 32768,
+              includeObjectsCollectedByMajorGC: true, includeObjectsCollectedByMinorGC: true });
+            await invoke();
+            ({ profile: allocationProfile } = await inspector.post("HeapProfiler.stopSampling"));
           }
           const hash = digest(result.result), key = `${n}:${scenario}`;
           if (hashes.has(key)) assert.equal(hash, hashes.get(key), `Runtime/repeat semantic mismatch: ${key}`);
@@ -151,9 +173,11 @@ for (const n of sizes) {
           const record = { n, runtime, scenario, repeat, wallMs,
             ...(runtime === "node" ? { processCpuMs: (nodeCpu.user + nodeCpu.system) / 1000 } : {}),
             returnedRows: result.sql.reduce((sum, item) => sum + item.returned, 0), queries: result.sql.length,
-            hash, heapBefore: before.usedSize, heapAfter: after.usedSize, ...(profile ? profileStats(profile) : {}) };
+            hash, heapBefore: before.usedSize, heapAfter: after.usedSize, ...(profile ? profileStats(profile) : {}),
+            ...(allocationProfile ? allocationStats(allocationProfile) : {}) };
           report.runs.push(record);
           if (profile) await writeFile(path.join(out, `${n}-${runtime}-${scenario}-${repeat}.cpuprofile`), JSON.stringify(profile));
+          if (allocationProfile) await writeFile(path.join(out, `${n}-${runtime}-${scenario}-${repeat}.heapprofile`), JSON.stringify(allocationProfile));
           console.log(JSON.stringify(record));
         }
       }

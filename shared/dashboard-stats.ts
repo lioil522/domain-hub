@@ -11,7 +11,7 @@
  * - 到期时间沿用 cfExpiryMap 的优先级链（手动覆盖 > 上游 > RDAP）。
  * - 时间轴同样按域名去重，一个域名只占一个月份格子。
  */
-import { normalizeDomainKey, domainKeyCandidates } from "./domain-keys";
+import { normalizeDomainKey } from "./domain-keys";
 
 export type MultiProviderKey = "dnspod" | "alidns" | "huaweicloud" | "vercel";
 export const MULTI_PROVIDER_ORDER: MultiProviderKey[] = ["dnspod", "alidns", "huaweicloud", "vercel"];
@@ -86,6 +86,15 @@ interface ExpiryEntry {
   alias: string;
   time: number;
 }
+interface DomainAggregate {
+  expired: boolean;
+  permanent: boolean;
+  expiryIndex: number;
+  recentRow: SummaryDomain | undefined;
+  recentSource: string;
+  recentTime: number;
+  recentOrdinal: number;
+}
 
 export function computeDashboardStats({
   domains,
@@ -101,21 +110,15 @@ export function computeDashboardStats({
   cfExpiryMap,
 }: DashboardStatsOptions, now = Date.now(), timelineLimit = Infinity, timezoneOffset = new Date(now).getTimezoneOffset(),
 parseTime = createCatalogDateParser(timezoneOffset)) {
-  const keyCache = new Map<string, string>();
-  const candidateCache = new Map<string, string[]>();
+  // A small conversion memo helps highly duplicated/mixed-case inventories
+  // without restoring a full-sized raw-name cache alongside the canonical map.
+  const keyMemo = new Map<string, string>();
   const keyOf = (raw: string) => {
-    let key = keyCache.get(raw);
-    if (key === undefined) { key = normalizeDomainKey(raw); keyCache.set(raw, key); }
+    const cached = keyMemo.get(raw);
+    if (cached !== undefined) return cached;
+    const key = normalizeDomainKey(raw);
+    if (keyMemo.size < 512) keyMemo.set(raw, key);
     return key;
-  };
-  const candidatesOf = (raw: string) => {
-    let keys = candidateCache.get(raw);
-    if (!keys) {
-      const clean = raw.replace(/[\u00AD\u200B-\u200F\u2060-\u2064\uFEFF]/g, "");
-      keys = clean === raw ? [keyOf(raw)] : domainKeyCandidates(raw);
-      candidateCache.set(raw, keys);
-    }
-    return keys;
   };
   const calendarDate = (time: number) => new Date(time - timezoneOffset * 60_000);
   // 归一到期判断：空/非法/「永久」占位(0000 前缀) → 视为永久（未过期）
@@ -125,26 +128,6 @@ parseTime = createCatalogDateParser(timezoneOffset)) {
     const t = parseTime(expiresAt);
     return !isNaN(t) && t < now;
   };
-
-  // 按归一化域名去重的聚合记录：value 记录「是否过期」；任一来源过期即算过期
-  const seen = new Map<string, boolean>(); // key → 是否过期
-  const record = (fullDomain: string, expiredFlag: boolean) => {
-    const key = keyOf(fullDomain);
-    if (!key) return;
-    // 已存在时：任一来源判定过期则整体算过期（取 OR）
-    seen.set(key, seen.has(key) ? (seen.get(key)! || expiredFlag) : expiredFlag);
-  };
-
-  domains.forEach((d) => record(d.full_domain, isExpired(d.expires_at, d.status)));
-  cfZones.forEach((z) => record(z.full_domain, false)); // CF 恒永久，算未过期
-  dpDomains.forEach((d) => record(d.full_domain, isExpired(d.expires_at, d.status)));
-  customDomains.forEach((d) => record(d.full_domain, isExpired(d.expires_at)));
-
-  for (const key of MULTI_PROVIDER_ORDER) {
-    for (const d of multiProviderDomains[key]) record(d.full_domain, isExpired(d.expires_at, d.status));
-  }
-
-  const total = seen.size;
 
   // 统一取每个域名的「真实到期时间」：按 cfZoneDateInfo 的优先级链
   // （手动覆盖 > DNSHE 上游 > DigitalPlat 上游 > RDAP 自动查询）。
@@ -156,87 +139,112 @@ parseTime = createCatalogDateParser(timezoneOffset)) {
   // 早先统计只读 d.expires_at 才导致「已过期」永远是 0。
   // 自定义域名的归属：CustomDomain 只带 group_id，分组名要从 customGroupList 里反查。
   const groupNameById = new Map(customGroupList.map((g) => [g.id, g.alias]));
-  const resolveExpiry = (fullDomain: string, fallback?: string): string | undefined => {
-    const candidates = candidatesOf(fullDomain);
-    for (const k of candidates) {
-      const entry = cfExpiryMap[k];
-      const manual = entry?.manual ? entry : undefined;
-      const raw = manual ? (manual.expires_at || "0000-00-00") : entry?.expires_at;
-      if (raw) return raw;
+  const expiryAtKey = (key: string) => {
+    const entry = cfExpiryMap[key];
+    return entry?.manual ? (entry.expires_at || "0000-00-00") : entry?.expires_at;
+  };
+  const resolveExpiry = (fullDomain: string, key: string, fallback: string): string | undefined => {
+    const raw = expiryAtKey(key);
+    if (raw) return raw;
+    const clean = fullDomain.replace(/[\u00AD\u200B-\u200F\u2060-\u2064\uFEFF]/g, "");
+    if (clean !== fullDomain) {
+      const stripped = expiryAtKey(keyOf(clean));
+      if (stripped) return stripped;
     }
     // 兜底：来源自身带的到期时间（自定义域名没有 cfExpiryMap 条目，全靠这条）
     return fallback;
   };
 
-  // Visit in the historical source order without full-sized wrapper arrays.
-  const sources: Array<{ rows: SummaryDomain[]; source: string }> = [
-    { rows: domains, source: "DNSHE" }, { rows: cfZones, source: "Cloudflare" }, { rows: dpDomains, source: "DigitalPlat" },
-    ...MULTI_PROVIDER_ORDER.map(key => ({ rows: multiProviderDomains[key], source: MULTI_PROVIDER_META[key].label })),
-  ];
-
-  // 最近注册：跨来源按 created_at 倒序（自定义服务商无 created_at，排除）。
-  // 同名域名去重时优先保留有 created_at 的那条，避免同一域名占多行。
-  const recentByName = new Map<string, { full_domain: string; created_at: string | undefined; source: string; alias: string }>();
-  for (const { rows, source } of sources) for (const d of rows) {
-    if (!d.created_at) continue;
-    const key = keyOf(d.full_domain);
-    if (!key || recentByName.has(key)) continue;
-    recentByName.set(key, { full_domain: d.full_domain, created_at: d.created_at, source, alias: d.account_alias });
-  }
-  const recent = Array.from(recentByName.values())
-    .sort((a, b) => parseTime(b.created_at!) - parseTime(a.created_at!))
-    .slice(0, 6);
-
-  // 到期统计 + 预警共用同一张表：按归一化域名去重，任一来源过期即算过期（取 OR），
-  // 到期时间冲突时保留更紧急的一条（已过期优先，其次剩余天数更少）。
-  const expiredKeys = new Set<string>();
-  // 只是「某个来源声称永久」的候选集合。同一域名可能在 A 来源为永久、
-  // 在 B 来源有真实到期日；最终必须按域名只归一类，否则时间轴会把
-  // permanentCount 与 scheduledTotal 各加一次。
-  const permanentCandidates = new Set<string>();
-  const expiryByKey = new Map<string, ExpiryEntry>();
-  const addExpiry = (full_domain: string, fallback: string, source: string, alias: string) => {
+  // One aggregate per canonical domain replaces the full raw-key/candidate caches,
+  // separate seen/recent/expiry maps and expired/permanent sets.
+  const byKey = new Map<string, DomainAggregate>();
+  // First finite expiry insertion order is NOT canonical-domain insertion
+  // order: a domain may be permanent/invalid in its first source.
+  const expiryEntries: ExpiryEntry[] = [];
+  let recentOrdinal = 0, finiteRecent = true;
+  let selectedRecent: DomainAggregate[] = [];
+  const addDomain = (full_domain: string, fallback: string, source: string, alias: string,
+    status?: string, registration?: SummaryDomain, rawExpiry = true) => {
     const key = keyOf(full_domain);
     if (!key) return;
-    const expires_at = resolveExpiry(full_domain, fallback);
+    let aggregate = byKey.get(key);
+    if (!aggregate) {
+      aggregate = { expired: false, permanent: false, expiryIndex: -1,
+        recentRow: undefined, recentSource: "", recentTime: NaN, recentOrdinal: -1 };
+      byKey.set(key, aggregate);
+    }
+    // Raw status/expiry OR is distinct from the chosen resolved expiry. A raw
+    // expired status with a future resolved date still keeps its timeline row.
+    if (rawExpiry && isExpired(fallback, status)) aggregate.expired = true;
+    // Retain the FIRST truthy created_at, even when it is an invalid date.
+    if (!aggregate.recentRow && registration?.created_at) {
+      aggregate.recentRow = registration; aggregate.recentSource = source;
+      aggregate.recentTime = parseTime(registration.created_at); aggregate.recentOrdinal = recentOrdinal++;
+      finiteRecent &&= Number.isFinite(aggregate.recentTime);
+      if (finiteRecent) insertBounded(selectedRecent, aggregate, 6, (a, b) => b.recentTime - a.recentTime);
+    }
+    const expires_at = resolveExpiry(full_domain, key, fallback);
     // 永久占位（0000 前缀）与空值：不算过期，也不进预警
     const permanent = !expires_at || expires_at.startsWith("0000");
     if (permanent) {
-      permanentCandidates.add(key);
+      aggregate.permanent = true;
       return;
     }
     const time = parseTime(expires_at!);
     if (isNaN(time)) return;
     const daysLeft = (time - now) / 86400000;
     const isExp = daysLeft < 0;
-    if (isExp) expiredKeys.add(key);
-    const prev = expiryByKey.get(key);
+    if (isExp) aggregate.expired = true;
+    const prev = expiryEntries[aggregate.expiryIndex];
     // 去重取更紧急的一条：已过期优先，其次剩余天数更少
     if (prev) {
       if (prev.expired && !isExp) return;
       if (prev.expired === isExp && prev.daysLeft <= daysLeft) return;
     }
-    expiryByKey.set(key, { full_domain, daysLeft, expired: isExp, source, alias: alias || "", time });
+    if (aggregate.expiryIndex < 0) aggregate.expiryIndex = expiryEntries.length;
+    expiryEntries[aggregate.expiryIndex] = { full_domain, daysLeft, expired: isExp, source, alias: alias || "", time };
   };
-  for (let i = 0; i < sources.length; i++) {
-    // Custom sits between DigitalPlat and the four additional providers.
-    if (i === 3) for (const d of customDomains) addExpiry(d.full_domain, d.expires_at, "自定义", groupNameById.get(d.group_id) || "");
-    const { rows, source } = sources[i];
-    for (const d of rows) addExpiry(d.full_domain, d.expires_at, source, d.account_alias);
+  for (const d of domains) addDomain(d.full_domain, d.expires_at, "DNSHE", d.account_alias, d.status, d);
+  // Cloudflare ignores raw status/expiry, but still uses resolved expiry.
+  for (const d of cfZones) addDomain(d.full_domain, d.expires_at, "Cloudflare", d.account_alias, undefined, d, false);
+  for (const d of dpDomains) addDomain(d.full_domain, d.expires_at, "DigitalPlat", d.account_alias, d.status, d);
+  for (const d of customDomains) addDomain(d.full_domain, d.expires_at, "自定义", groupNameById.get(d.group_id) || "");
+  for (const key of MULTI_PROVIDER_ORDER) for (const d of multiProviderDomains[key]) {
+    addDomain(d.full_domain, d.expires_at, MULTI_PROVIDER_META[key].label, d.account_alias, d.status, d);
   }
 
-  // 已过期口径：RDAP/手动链算出的过期域名，并上原有 isExpired 判定的过期域名
-  // （后者覆盖 expires_at 为空但 status 已标过期的场景）。
-  seen.forEach((expiredFlag, key) => {
-    if (expiredFlag) expiredKeys.add(key);
-  });
-  const expired = expiredKeys.size;
+  let recent;
+  if (!finiteRecent) {
+    // NaN makes the historical comparator non-total. Reconstruct FIRST
+    // registration insertion order before applying the original stable sort;
+    // sorting canonical map order here would silently change legacy results.
+    const ordered: DomainAggregate[] = [];
+    for (const item of byKey.values()) if (item.recentRow) ordered[item.recentOrdinal] = item;
+    // Keep both the legacy row shape and date-parsing comparator. Replacing
+    // NaN comparisons with cached numeric fields can select a different V8
+    // sorting path for this non-total comparator, even within the same runtime.
+    recent = Array.from(ordered, item => ({
+      full_domain: item.recentRow!.full_domain, created_at: item.recentRow!.created_at,
+      source: item.recentSource, alias: item.recentRow!.account_alias,
+    })).sort((a, b) => parseTime(b.created_at!) - parseTime(a.created_at!)).slice(0, 6);
+  } else {
+    recent = selectedRecent.map(item => ({
+      full_domain: item.recentRow!.full_domain, created_at: item.recentRow!.created_at,
+      source: item.recentSource, alias: item.recentRow!.account_alias,
+    }));
+  }
+  let expired = 0, permanentCount = 0;
+  for (const aggregate of byKey.values()) {
+    if (aggregate.expired) expired++;
+    if (aggregate.permanent && !aggregate.expired && aggregate.expiryIndex < 0) permanentCount++;
+  }
+  const total = byKey.size;
   const active = Math.max(0, total - expired);
 
   const EXPIRY_WARN_DAYS = 90;
   const expiring: ExpiryEntry[] = [];
   let expiringTotal = 0;
-  for (const x of expiryByKey.values()) {
+  for (const x of expiryEntries) {
     if (!x.expired && x.daysLeft > EXPIRY_WARN_DAYS) continue;
     expiringTotal++;
     insertBounded(expiring, x, 8, (a, b) => a.daysLeft - b.daysLeft);
@@ -245,7 +253,7 @@ parseTime = createCatalogDateParser(timezoneOffset)) {
   /**
    * 未来 12 个月到期分布（时间轴数据源）。
    *
-   * WHY 单独算而不是复用 expiryByKey：预警列表只保留「90 天内或已过期」这一个
+   * WHY 单独算而不是复用预警列表：预警列表只保留「90 天内或已过期」这一个
    * 紧急维度，是**筛选后的**子集；时间轴要回答的是「未来一年的续费压力长什么样」，
    * 需要完整分布。两者的筛选口径不同，共用一张表会让「第 7 个月有 3 个到期」
    * 这类信息被静默丢掉。
@@ -287,9 +295,9 @@ parseTime = createCatalogDateParser(timezoneOffset)) {
   const bucketByKey = new Map(buckets.map((b) => [b.key, b]));
   const boundedTimeline = Number.isInteger(timelineLimit) && timelineLimit >= 0 && Number.isFinite(timelineLimit);
 
-  // NOTE: 迭代已去重的 expiryByKey（含 resolveExpiry 优先级链），而不是原始
-  // expiryRecords —— 后者会把同一域名在多个来源各推一次，导致时间轴计数虚高。
-  for (const r of expiryByKey.values()) {
+  // Iterate canonical entries in FIRST finite expiry insertion order, retaining
+  // the historical stable tie order after a later source replaces its date.
+  for (const r of expiryEntries) {
     if (r.expired) continue; // 已过期 → 走 overdue，不占月桶
     const due = calendarDate(r.time);
     const bucket = bucketByKey.get(monthKeyOf(due));
@@ -312,13 +320,6 @@ parseTime = createCatalogDateParser(timezoneOffset)) {
       b.items = b.items.slice(0, timelineLimit);
     }
   });
-
-  // 按域名归一类：只有当该域名没有任何真实到期日、且没有被判过期时，才算永久。
-  let permanentCount = 0;
-  for (const key of permanentCandidates) {
-    if (expiryByKey.has(key) || expiredKeys.has(key)) continue;
-    permanentCount++;
-  }
 
   return {
     total,

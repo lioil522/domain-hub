@@ -52,3 +52,4 @@ Docker 修复后再次通过全量验证（192 个用例），并用打包后的
 - [大库存摘要与搜索性能（2026-11-23）](./CATALOG_PERFORMANCE_PROGRESS_2026-11-23.md)
 - [冷统计单遍归并与注册排序（2026-11-23）](./SINGLE_PASS_STATS_PROGRESS_2026-11-23.md)
 - [增量持久摘要可行性评估（2026-11-23，尚未接入生产）](./INCREMENTAL_SUMMARY_ASSESSMENT_2026-11-23.md)
+- [隔离贡献投影＋SQL聚合原型（2026-11-24，尚未接入生产）](./CATALOG_PROJECTION_PROTOTYPE_2026-11-24.md)

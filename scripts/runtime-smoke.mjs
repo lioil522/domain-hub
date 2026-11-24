@@ -105,6 +105,11 @@ const harnessOutput = await build({ stdin: { contents: `import worker from "./di
   import {computeDashboardStats} from "./shared/dashboard-stats";
   import {semanticFixture,selectionFixture} from "./tests/helpers/catalog-semantic-fixture";
   import {normalizeDomainKey} from "./shared/domain-keys";
+  import {CatalogProjectionPrototype} from "./tests/prototypes/catalog-projection";
+  import {captureProjectionInput} from "./tests/prototypes/catalog-projection-capture";
+  import {DatabaseManager} from "./src/db";
+  import {DomainCatalogRepository} from "./src/repositories/domain-catalog-repository";
+  import {DomainCatalogService} from "./src/services/domain-catalog-service";
   function validateRecent(input,recent) {
     const first=new Map();
     const sources=[
@@ -139,6 +144,29 @@ const harnessOutput = await build({ stdin: { contents: `import worker from "./di
     return [...new Uint8Array(digest)].map(value=>value.toString(16).padStart(2,"0")).join("");
   }
   export default { async fetch(request, env, ctx) {
+    if (new URL(request.url).pathname === "/__test_projection") {
+      const now=Date.parse("2026-11-24T00:00:00Z");
+      const manager=new DatabaseManager(env.DB),captured=await captureProjectionInput(manager,now);
+      const reference=(await new DomainCatalogService(new DomainCatalogRepository(manager)).summary(now,0)).stats;
+      const staged=await new CatalogProjectionPrototype(env.DB).stage(captured.input,{
+        validatedAt:now,offset:0,revision:captured.revision,sourceValidUntil:captured.sourceValidUntil
+      });
+      const result=await new CatalogProjectionPrototype(env.DB).read(staged.generation,now,0);
+      if(JSON.stringify(result.stats)!==JSON.stringify(reference)) throw new Error("Real D1 projection stats differ");
+      let cases=0;
+      for(const seed of [1,3,18]) for(const offset of [-480,0,330]) {
+        const input=selectionFixture(seed),projection=new CatalogProjectionPrototype(env.DB);
+        const manifest=await projection.stage(input,{validatedAt:now,offset});
+        const actual=await projection.read(manifest.generation,now,offset);
+        const expected=computeDashboardStats(input,now,20,offset);
+        validateRecent(input,actual.stats.recent);
+        const {recent:a,...astable}=actual.stats,{recent:b,...bstable}=expected;
+        if(JSON.stringify(astable)!==JSON.stringify(bstable)) throw new Error("D1 projection corpus counts/order differ");
+        if(actual.recentMode==="sql-top-six"&&JSON.stringify(a)!==JSON.stringify(b)) throw new Error("D1 finite recent selection differs");
+        cases++;
+      }
+      return Response.json({equivalent:true,cases,rows:result.metrics.returnedRows});
+    }
     if (new URL(request.url).pathname === "/__test_stats") {
       const input=semanticFixture(1);
       input.domains=Array.from({length:10},(_,i)=>({full_domain:"invalid-"+i+".example",expires_at:"0000-00-00",
@@ -227,6 +255,13 @@ try {
       created_at: "invalid", source: "DNSHE", alias: "first-owner" })),
   });
   console.log("[runtime-smoke] workerd 390-case stats digests, legacy NaN comparator, first sources and candidate validity passed");
+  const projection = await fetcher("/__test_projection");
+  assert.equal(projection.status, 200, await projection.clone().text());
+  const projectionBody = await projection.json();
+  assert.equal(projectionBody.equivalent, true);
+  assert.equal(projectionBody.cases, 9);
+  assert.equal(projectionBody.rows, 5);
+  console.log("[runtime-smoke] isolated workerd/D1 JSON projection, real repository capture and 9 offset/source cases passed");
 }
 finally { await mf.dispose(); }
 

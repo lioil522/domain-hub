@@ -129,6 +129,8 @@ npm
 
 下一阶段的 [增量持久摘要评估](docs/INCREMENTAL_SUMMARY_ASSESSMENT_2026-11-23.md) 已补跨来源、时区与时间边界反例；增量后台功能尚未接入，现有刷新协议不变。
 
+隔离的 [贡献投影／SQL聚合原型](docs/CATALOG_PROJECTION_PROTOTYPE_2026-11-24.md) 可用 `npm run test:prototype:catalog`／`npm run benchmark:projection` 验证。当前读写成本不适合默认链路，原型仅用于测试，未接入生产。
+
 ---
 
 ## 项目结构

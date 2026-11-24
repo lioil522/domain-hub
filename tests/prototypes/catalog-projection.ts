@@ -1,10 +1,11 @@
 // An isolated fixed-input/fixed-offset projection experiment, NOT a production
 // incremental producer, task executor, lease protocol or cache API.
-import { normalizeDomainKey, domainKeyCandidates } from "../../shared/domain-keys";
+import { domainKeyCandidates } from "../../shared/domain-keys";
 import { createCatalogDateParser, type DashboardStats, type DashboardStatsOptions, type SummaryDomain } from "../../shared/dashboard-stats";
 import { CATALOG_REVISION_KEY } from "../../src/db/catalog-version";
 import { SUMMARY_CACHE_MS } from "../../src/services/catalog-summary-cache";
-import { PROJECTION_CTE, PROJECTION_AUDIT_SQL, PROJECTION_AGGREGATE_SQL, PROJECTION_LEGACY_RECENT_SQL } from "./catalog-projection-sql";
+import { PROJECTION_CTE, PROJECTION_AGGREGATE_SQL, PROJECTION_LEGACY_RECENT_SQL } from "./catalog-projection-sql";
+import * as baseline from "./catalog-projection-sql-baseline";
 
 const PREFIX = "catalog_prototype:1:";
 const MAX_VALUE_BYTES = 524288;
@@ -76,7 +77,7 @@ function months(now: number, offset: number) {
 export class CatalogProjectionPrototype {
   readonly metrics: Metrics = { calls: 0, statements: 0, returnedRows: 0, returnedBytes: 0,
     reportedRowsRead: 0, reportedRowsWritten: 0, reportedDurationMs: 0 };
-  constructor(private readonly db: D1Database) {}
+  constructor(private readonly db: D1Database, private readonly variant: "optimized" | "baseline" = "optimized") {}
   private record<T>(result: D1Result<T>) {
     if (!result.success || !Array.isArray(result.results)) throw new Error("Prototype database result failed");
     this.metrics.returnedRows += result.results.length;
@@ -211,9 +212,9 @@ export class CatalogProjectionPrototype {
     }
   }
 
-  queryScope(generation: string, now: number) {
+  queryScope(generation: string, now: number, expected?: Pick<Manifest, "rows" | "pages" | "encoded_bytes">) {
     validTime(now);
-    const base = `${prefix(generation)}rows:`, context = JSON.stringify({ now, seconds: Math.floor(now / 1000) });
+    const base = `${prefix(generation)}rows:`, context = JSON.stringify({ now, seconds: Math.floor(now / 1000), ...expected });
     return [context, context, base, `${base}\uffff`];
   }
   async read(generation: string, now: number, offset: number) {
@@ -236,17 +237,24 @@ export class CatalogProjectionPrototype {
     if (manifest.encoded_bytes > MAX_GENERATION_BYTES || manifest.rows > 100000 || manifest.pages > 100000)
       throw new Error("Projection manifest exceeds admitted storage scope");
     if (await this.revision() !== manifest.revision) throw new Error("Projection source revision changed");
-    const scope = this.queryScope(generation, now), audit = await this.one<Audit>(PROJECTION_AUDIT_SQL, scope);
+    const scope = this.queryScope(generation, now, manifest), buckets = months(now, offset);
+    let audit: Audit | null, data: Aggregation | null;
+    if (this.variant === "baseline") {
+      audit = await this.one<Audit>(baseline.PROJECTION_AUDIT_SQL, scope);
+      data = null;
+    } else {
+      const combined = await this.one<Audit & Aggregation>(PROJECTION_AGGREGATE_SQL, [...scope, JSON.stringify(buckets)]);
+      audit = combined; data = combined;
+    }
     if (!audit || audit.pages !== manifest.pages || audit.encoded_bytes !== manifest.encoded_bytes ||
       audit.invalid_pages || audit.invalid_rows || audit.rows !== manifest.rows ||
       audit.ordinals !== manifest.rows || (manifest.rows && (audit.first_ordinal !== 0 || audit.last_ordinal !== manifest.rows - 1)))
       throw new Error("Projection pages incomplete or malformed");
-    const buckets = months(now, offset);
-    const data = await this.one<Aggregation>(PROJECTION_AGGREGATE_SQL, [...scope, JSON.stringify(buckets)]);
+    if (this.variant === "baseline") data = await this.one<Aggregation>(baseline.PROJECTION_AGGREGATE_SQL, [...scope, JSON.stringify(buckets)]);
     if (!data) throw new Error("Projection aggregation unavailable");
     let recent = JSON.parse(data.recent) as Recent[];
     if (data.invalid_recent) {
-      recent = await this.all<Recent>(PROJECTION_LEGACY_RECENT_SQL, scope);
+      recent = await this.all<Recent>(this.variant === "baseline" ? baseline.PROJECTION_LEGACY_RECENT_SQL : PROJECTION_LEGACY_RECENT_SQL, scope);
       const parse = createCatalogDateParser(offset);
       recent = recent.map(row => ({ full_domain: row.full_domain, created_at: row.created_at, source: row.source, alias: row.alias }))
         .sort((a, b) => parse(b.created_at!) - parse(a.created_at!)).slice(0, 6);

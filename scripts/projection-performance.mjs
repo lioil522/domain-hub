@@ -80,12 +80,15 @@ for (const n of sizes) for (const runtime of ["node", "workerd"]) {
     await invoke("reference");
     for (let repeat = 0; repeat < repeats; repeat++) {
       let generation, expected;
-      for (const action of ["reference", "stage", "read"]) {
+      // Alternate baseline/optimized order to avoid always favoring the second
+      // query. Both readers consume the exact same sealed generation.
+      const order = repeat % 2 ? ["read", "baseline"] : ["baseline", "read"];
+      for (const action of ["reference", "stage", ...order]) {
         const cpu = process.cpuUsage(), start = performance.now(), value = await invoke(action, generation);
         const wallMs = performance.now() - start, consumed = process.cpuUsage(cpu);
         if (action === "reference") expected = value.stats;
         if (action === "stage") generation = value.manifest.generation;
-        if (action === "read") assert.deepEqual(value.stats, expected);
+        if (action === "read" || action === "baseline") assert.deepEqual(value.stats, expected);
         const hash = value.stats ? createHash("sha256").update(JSON.stringify(value.stats)).digest("hex") : undefined;
         if (hash) {
           if (hashes.has(n)) assert.equal(hash, hashes.get(n), `Cross-runtime/repeat projection result mismatch at ${n}`);

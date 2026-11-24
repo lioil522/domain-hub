@@ -260,7 +260,7 @@ try {
   const projectionBody = await projection.json();
   assert.equal(projectionBody.equivalent, true);
   assert.equal(projectionBody.cases, 9);
-  assert.equal(projectionBody.rows, 5);
+  assert.equal(projectionBody.rows, 4);
   console.log("[runtime-smoke] isolated workerd/D1 JSON projection, real repository capture and 9 offset/source cases passed");
 }
 finally { await mf.dispose(); }

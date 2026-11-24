@@ -11,14 +11,14 @@ export async function run(db: D1Database, action: string, generation = "") {
   if (action === "reference") {
     return { stats: (await new DomainCatalogService(repo).summaryResult(NOW, 0, true)).summary.stats };
   }
-  const projection = new CatalogProjectionPrototype(db);
+  const projection = new CatalogProjectionPrototype(db, action === "baseline" ? "baseline" : "optimized");
   if (action === "stage") {
     const captured = await captureProjectionInput(manager, NOW);
     const manifest = await projection.stage(captured.input, { validatedAt: NOW, offset: 0,
       revision: captured.revision, sourceValidUntil: captured.sourceValidUntil });
     return { manifest, metrics: { ...projection.metrics }, capture: captured.capture };
   }
-  if (action === "read") return projection.read(generation, NOW, 0);
+  if (action === "read" || action === "baseline") return projection.read(generation, NOW, 0);
   throw new Error("Unknown projection probe action");
 }
 export default {

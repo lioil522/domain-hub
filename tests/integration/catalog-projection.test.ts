@@ -49,6 +49,10 @@ test("prototype SQL matches canonical stats for seeded Unicode, date, source and
       const staged = await writer.stage(input, { validatedAt: NOW, offset });
       const result = await new CatalogProjectionPrototype(d1).read(staged.generation, NOW, offset);
       compare(result.stats, computeDashboardStats(input, NOW, 20, offset), result.recentMode, input);
+      if (seed === 1 || seed === 18) {
+        const original = await new CatalogProjectionPrototype(d1, "baseline").read(staged.generation, NOW, offset);
+        compare(result.stats, original.stats, result.recentMode, input);
+      }
     }
   }
 });
@@ -70,8 +74,8 @@ test("finite large inventory readers return bounded aggregate rows without full 
   assert.ok(staged.pages >= 40);
   const reader = new CatalogProjectionPrototype(d1), result = await reader.read(staged.generation, NOW, 0);
   assert.equal(result.recentMode, "sql-top-six");
-  assert.equal(result.metrics.returnedRows, 3, "empty revision reads return no rows");
-  assert.equal(result.metrics.calls, 5);
+  assert.equal(result.metrics.returnedRows, 2, "empty revision reads return no rows");
+  assert.equal(result.metrics.calls, 4);
   assert.equal(result.stats.total, 10000);
   assert.equal(result.stats.timeline.buckets.find(bucket => bucket.key === "2027-01")?.count, 10000);
   assert.equal(result.stats.timeline.buckets.find(bucket => bucket.key === "2027-01")?.items.length, 20);
@@ -106,7 +110,7 @@ test("legacy invalid first registrations keep their first source and explicitly 
   const writer = new CatalogProjectionPrototype(d1), staged = await writer.stage(input, { validatedAt: NOW, offset: 0 });
   const result = await new CatalogProjectionPrototype(d1).read(staged.generation, NOW, 0);
   assert.equal(result.recentMode, "legacy-full-sort");
-  assert.equal(result.metrics.returnedRows, 103);
+  assert.equal(result.metrics.returnedRows, 102);
   assert.deepEqual(result.stats, computeDashboardStats(input, NOW, 20, 0));
   assert.equal(result.stats.recent[0].created_at, "invalid");
   assert.equal(result.stats.recent[0].source, "DNSHE");
@@ -230,4 +234,58 @@ test("false success envelopes fail closed and oversized aggregate output is reje
   const largeStage = await writer.stage(big, { validatedAt: NOW, offset: 0 });
   await assert.rejects(() => writer.read(largeStage.generation, NOW, 0), /summary budget/);
   assert.equal(big.domains[0].account_alias.length, 60000);
+});
+
+test("null-safe optimized audit rejects missing fields even when byte and row counts still match", async t => {
+  const { d1, sqlite } = await testDatabase(t);
+  const input = empty({ domains: [row("one.example", "2027-01-05", "2026-11-23")] });
+  const required = ["canonical", "full_domain", "alias", "source", "table", "raw_expiry", "raw_status",
+    "resolved_expiry", "created_at", "ordinal", "source_rank", "inventory_id", "permanent",
+    "raw_status_expired", "created_present", "raw_time", "resolved_time", "created_time", "account_id", "group_id"];
+  for (const field of required) {
+    const writer = new CatalogProjectionPrototype(d1), staged = await writer.stage(input, { validatedAt: NOW, offset: 0 });
+    const key = `catalog_prototype:1:${staged.generation}:rows:00000000`;
+    const records = JSON.parse(String(sqlite.prepare("SELECT value FROM cache WHERE key=?").get(key)?.value)) as Array<Record<string, unknown>>;
+    delete records[0][field];
+    const changed = JSON.stringify(records), manifestKey = `catalog_prototype:1:${staged.generation}:manifest`;
+    // Match the altered encoded byte size so this tests schema validation,
+    // not merely the separate byte-count fence.
+    const storedManifest = JSON.parse(String(sqlite.prepare("SELECT value FROM cache WHERE key=?").get(manifestKey)?.value)) as Record<string, unknown>;
+    storedManifest.encoded_bytes = Buffer.byteLength(changed);
+    sqlite.prepare("UPDATE cache SET value=? WHERE key=?").run(changed, key);
+    sqlite.prepare("UPDATE cache SET value=? WHERE key=?").run(JSON.stringify(storedManifest), manifestKey);
+    await assert.rejects(() => writer.read(staged.generation, NOW, 0), /malformed/, field);
+    await assert.rejects(() => new CatalogProjectionPrototype(d1, "baseline").read(staged.generation, NOW, 0), /malformed/, field);
+  }
+});
+
+test("invalid audit suppresses derived output before the combined reader rejects the generation", async t => {
+  const { d1, sqlite } = await testDatabase(t);
+  const input = empty({ domains: [row("one.example", "2027-01-05", "2026-11-23")] });
+  const writer = new CatalogProjectionPrototype(d1), staged = await writer.stage(input, { validatedAt: NOW, offset: 0 });
+  const key = `catalog_prototype:1:${staged.generation}:rows:00000000`;
+  sqlite.prepare("UPDATE cache SET value='[]' WHERE key=?").run(key);
+  const scope = writer.queryScope(staged.generation, NOW, staged);
+  const query = sqlite.prepare(PROJECTION_AGGREGATE_SQL).get(...scope, JSON.stringify([]))!;
+  assert.equal(query.valid, 0);
+  assert.equal(query.warnings, "[]"); assert.equal(query.bucket_items, "[]"); assert.equal(query.recent, "[]");
+  await assert.rejects(() => writer.read(staged.generation, NOW, 0), /incomplete/);
+});
+
+test("late display hydration preserves urgency order, same-day first-finite ties and recent source order", async t => {
+  const { d1 } = await testDatabase(t);
+  const input = empty({ domains: [
+    row("a.example", "2027-01-05T23:00:00Z", "2026-11-23"),
+    row("b.example", "2027-01-05T00:00:00Z", "2026-11-23"),
+    row("c.example", "0000-00-00", "2026-11-23"),
+    row("d.example", "2027-01-05T12:00:00Z", "2026-11-23"),
+  ], cfZones: [row("c.example", "2027-01-05T23:00:00Z", "2026-11-23")],
+    dpDomains: [{ ...row("A.example.", "2027-01-05T20:00:00Z", "2026-11-23"), account_alias: "late replacement" }] });
+  const writer = new CatalogProjectionPrototype(d1), staged = await writer.stage(input, { validatedAt: NOW, offset: 0 });
+  const result = await writer.read(staged.generation, NOW, 0);
+  assert.deepEqual(result.stats, computeDashboardStats(input, NOW, 20, 0));
+  assert.deepEqual(result.stats.expiring.map(item => normalizeDomainKey(item.full_domain)), ["b.example", "d.example", "a.example", "c.example"]);
+  assert.deepEqual(result.stats.timeline.buckets.find(bucket => bucket.key === "2027-01")?.items.map(item => normalizeDomainKey(item.full_domain)),
+    ["a.example", "b.example", "d.example", "c.example"]);
+  assert.deepEqual(result.stats.recent.map(item => item.full_domain), ["a.example", "b.example", "c.example", "d.example"]);
 });

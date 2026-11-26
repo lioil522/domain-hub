@@ -54,3 +54,4 @@ Docker 修复后再次通过全量验证（192 个用例），并用打包后的
 - [增量持久摘要可行性评估（2026-11-23，尚未接入生产）](./INCREMENTAL_SUMMARY_ASSESSMENT_2026-11-23.md)
 - [隔离贡献投影＋SQL聚合原型（2026-11-24，尚未接入生产）](./CATALOG_PROJECTION_PROTOTYPE_2026-11-24.md)
 - [隔离投影读端SQL优化（2026-11-24，尚未接入生产）](./CATALOG_SQL_TUNING_2026-11-24.md)
+- [固定时区按域名预先合并：构建和读取成本对照（隔离原型）](./CATALOG_FOLDED_PROJECTION.md)

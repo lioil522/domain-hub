@@ -18,7 +18,7 @@ const sha = "0".repeat(40);
 await createReleaseArtifact(root, release, sha);
 await verifyReleaseArtifact(release, sha);
 const packagedWorker = await readFile(path.join(release, "worker/index.js"), "utf8");
-assert.ok(!packagedWorker.includes("catalog_prototype:1:"),
+assert.ok(!packagedWorker.includes("catalog_prototype:"),
   "Isolated catalog projection prototype must not be imported into the production Worker");
 
 // Reconstruct the download/deploy layout without any application source files.

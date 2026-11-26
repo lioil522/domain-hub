@@ -49,6 +49,11 @@ test("prototype SQL matches canonical stats for seeded Unicode, date, source and
       const staged = await writer.stage(input, { validatedAt: NOW, offset });
       const result = await new CatalogProjectionPrototype(d1).read(staged.generation, NOW, offset);
       compare(result.stats, computeDashboardStats(input, NOW, 20, offset), result.recentMode, input);
+      const fold = new CatalogProjectionPrototype(d1, "folded");
+      const gen = await fold.stage(input, { validatedAt: NOW, offset });
+      const folded = await fold.read(gen.generation, NOW, offset);
+      assert.equal(folded.recentMode, result.recentMode);
+      compare(folded.stats, result.stats, folded.recentMode, input);
       if (seed === 1 || seed === 18) {
         const original = await new CatalogProjectionPrototype(d1, "baseline").read(staged.generation, NOW, offset);
         compare(result.stats, original.stats, result.recentMode, input);
@@ -101,6 +106,69 @@ test("projected times are reevaluated at read time but metadata age, offset and 
   await assert.rejects(() => writer.read(expiringMetadata.generation, NOW + 60000, 0), /validity/);
   sqlite.prepare("INSERT INTO settings(key,value) VALUES('catalog_summary_revision','changed')").run();
   await assert.rejects(() => writer.read(staged.generation, NOW, 0), /revision/);
+});
+
+test("folded rows keep raw expiry OR, winner identity, first-finite order and registration identity across time boundaries", async t => {
+  const { d1, manager } = await testDatabase(t);
+  const start = Date.parse("2027-01-31T23:59:00Z"), at = start + 60000;
+  const near = new Date(at).toISOString(), later = new Date(at + 1000).toISOString();
+  const input = empty({ domains: [
+    row("a.example", "", ""), row("b.example", later, near), row("c.example", near, near),
+    row("cutoff.example", new Date(at + 90*86400000).toISOString()),
+    row("raw-only.example", near, later), row("permanent.example",near),
+  ], cfZones: [row("A.example.", later, later), row("raw-only.example", "", "")],
+    dpDomains: [row("B.example.", near, later), { ...row("status.example", "0000-00-00"), status: "已过期" }],
+    cfExpiryMap: { "permanent.example": { manual: true, found: false }, "raw-only.example": { found: true, expires_at: later } } });
+  const fold = new CatalogProjectionPrototype(d1,"folded");
+  const gen = await fold.stage(input,{ validatedAt:start, offset:0, sourceValidUntil:start+180000 });
+  assert.equal(gen.source_rows, 10);
+  assert.equal(gen.rows, 7);
+  for (const now of [start,at-1,at,at+1,at+1001]) {
+    assert.deepEqual((await fold.read(gen.generation,now,0)).stats,computeDashboardStats(input,now,20,0));
+  }
+  await assert.rejects(() => fold.read(gen.generation,at,-480), /scope/);
+  await assert.rejects(() => fold.read(gen.generation,start+180000,0), /expired/);
+  await manager.executeRaw("INSERT INTO accounts(alias,api_key,api_secret,provider) VALUES('change','test-key','fake','dnshe')");
+  await assert.rejects(() => fold.read(gen.generation,at,0), /revision/);
+});
+
+test("folded storage rejects duplicate canonical rows or missing nested registration positions even at matching byte size", async t => {
+  const { d1, sqlite } = await testDatabase(t);
+  const input = empty({domains:[row("a.example","2027-01-01","invalid"),row("b.example","2027-01-02","2026-01-01")]});
+  for (const corrupt of ["duplicate-domain","duplicate-first-finite","duplicate-registration","missing-registration","missing-page"]) {
+    const fold = new CatalogProjectionPrototype(d1,"folded"), g = await fold.stage(input,{validatedAt:NOW,offset:0});
+    const key = `catalog_prototype:2:${g.generation}:rows:00000000`;
+    const raw = String(sqlite.prepare("SELECT value FROM cache WHERE key=?").get(key)?.value);
+    if (corrupt === "missing-page") sqlite.prepare("DELETE FROM cache WHERE key=?").run(key);
+    else {
+      const [a,b] = JSON.parse(raw);
+      if (corrupt === "duplicate-domain") b.canonical=a.canonical;
+      if (corrupt === "duplicate-first-finite") b.first_finite=a.first_finite;
+      if (corrupt === "duplicate-registration") b.registration.pos=a.registration.pos;
+      if (corrupt === "missing-registration") delete b.registration.pos;
+      const updated = JSON.stringify([a,b]);
+      sqlite.prepare("UPDATE cache SET value=? WHERE key=?").run(updated,key);
+      sqlite.prepare("UPDATE cache SET value=json_set(value,'$.encoded_bytes',?) WHERE key=?")
+        .run(Buffer.byteLength(updated),`catalog_prototype:2:${g.generation}:manifest`);
+    }
+    await assert.rejects(() => fold.read(g.generation,NOW,0), /malformed|incomplete/,corrupt);
+    await assert.rejects(() => new CatalogProjectionPrototype(d1).read(g.generation,NOW,0),/manifest/);
+  }
+});
+
+test("folded builder does not silently approximate extreme dates or admit unlimited discarded source rows", async t => {
+  const { d1 } = await testDatabase(t);
+  const fold = new CatalogProjectionPrototype(d1,"folded");
+  const extreme = empty({domains:[row("extreme.example","+250000-01-01T00:00:00Z")]});
+  await assert.rejects(() => fold.stage(extreme,{validatedAt:NOW,offset:0}), /cannot prove expiry order/);
+  const copies = empty({domains:Array.from({length:80},()=>row("same.example","",""))});
+  await assert.rejects(() => fold.stage(copies,{validatedAt:NOW,offset:0,generationBytes:2048}), /source contribution budget/);
+  assert.equal(copies.domains.length,80);
+  for (const data of [empty(),empty({domains:[row("",new Date(NOW).toISOString(),"invalid")]})]) {
+    const gen = await fold.stage(data,{validatedAt:NOW,offset:0});
+    assert.equal(gen.pages,0);
+    assert.deepEqual((await fold.read(gen.generation,NOW,0)).stats,computeDashboardStats(data,NOW,20,0));
+  }
 });
 
 test("legacy invalid first registrations keep their first source and explicitly use full-sort fallback", async t => {

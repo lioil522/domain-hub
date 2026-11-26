@@ -6,13 +6,15 @@ import { CATALOG_REVISION_KEY } from "../../src/db/catalog-version";
 import { SUMMARY_CACHE_MS } from "../../src/services/catalog-summary-cache";
 import { PROJECTION_CTE, PROJECTION_AGGREGATE_SQL, PROJECTION_LEGACY_RECENT_SQL } from "./catalog-projection-sql";
 import * as baseline from "./catalog-projection-sql-baseline";
+import { FoldedContributions } from "./folded-contributions";
+import { FOLDED_AGGREGATE_SQL, FOLDED_LEGACY_RECENT_SQL } from "./folded-contributions-sql";
 
 const PREFIX = "catalog_prototype:1:";
 const MAX_VALUE_BYTES = 524288;
 const MAX_GENERATION_BYTES = 64 * 1024 * 1024;
 const encoder = new TextEncoder();
 interface Manifest {
-  format: 1; generation: string; status: "building" | "ready" | "failed";
+  format: 1 | 2; generation: string; status: "building" | "ready" | "failed"; source_rows?: number;
   revision: string | null; offset: number; validated_at: number; valid_until: number;
   rows: number; pages: number; accounts: number; encoded_bytes: number;
 }
@@ -58,9 +60,9 @@ function unicode(value: string) {
     } else if (code >= 0xdc00 && code <= 0xdfff) throw new Error("Unsupported projection UTF-16 field");
   }
 }
-function prefix(generation: string) {
+function prefix(generation: string, folded = false) {
   if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(generation)) throw new Error("Invalid prototype generation");
-  return `${PREFIX}${generation}:`;
+  return `${folded ? "catalog_prototype:2:" : PREFIX}${generation}:`;
 }
 function months(now: number, offset: number) {
   const local = new Date(now - offset * 60000);
@@ -77,7 +79,8 @@ function months(now: number, offset: number) {
 export class CatalogProjectionPrototype {
   readonly metrics: Metrics = { calls: 0, statements: 0, returnedRows: 0, returnedBytes: 0,
     reportedRowsRead: 0, reportedRowsWritten: 0, reportedDurationMs: 0 };
-  constructor(private readonly db: D1Database, private readonly variant: "optimized" | "baseline" = "optimized") {}
+  constructor(private readonly db: D1Database, private readonly variant: "optimized" | "baseline" | "folded" = "optimized") {}
+  private prefix(generation: string) { return prefix(generation, this.variant === "folded"); }
   private record<T>(result: D1Result<T>) {
     if (!result.success || !Array.isArray(result.results)) throw new Error("Prototype database result failed");
     this.metrics.returnedRows += result.results.length;
@@ -105,7 +108,7 @@ export class CatalogProjectionPrototype {
     const result = await this.all(`INSERT INTO cache(key,value,expires_at)
       SELECT ?,?,? WHERE (SELECT value FROM settings WHERE key=?) IS ?
       ON CONFLICT(key) DO UPDATE SET value=excluded.value,expires_at=excluded.expires_at RETURNING key`,
-      [`${prefix(manifest.generation)}manifest`, value, manifest.valid_until / 1000, CATALOG_REVISION_KEY, manifest.revision]);
+      [`${this.prefix(manifest.generation)}manifest`, value, manifest.valid_until / 1000, CATALOG_REVISION_KEY, manifest.revision]);
     if (result.length !== 1) throw new Error("Projection source revision changed");
   }
 
@@ -121,8 +124,9 @@ export class CatalogProjectionPrototype {
     if (revision !== current) throw new Error("Projection source revision changed");
     const validUntil = Math.floor(Math.min(options.sourceValidUntil ?? options.validatedAt + SUMMARY_CACHE_MS,
       options.validatedAt + SUMMARY_CACHE_MS) / 1000) * 1000;
-    if (validUntil <= options.validatedAt) throw new Error("Projection source validity expired");
-    const manifest: Manifest = { format: 1, generation: crypto.randomUUID(), status: "building", revision,
+    if (!Number.isSafeInteger(validUntil) || validUntil <= options.validatedAt) throw new Error("Projection source validity expired");
+    const folded = this.variant === "folded" ? new FoldedContributions(options.validatedAt) : null;
+    const manifest: Manifest = { format: folded ? 2 : 1, generation: crypto.randomUUID(), status: "building", revision,
       offset: options.offset, validated_at: options.validatedAt, valid_until: validUntil, rows: 0, pages: 0,
       encoded_bytes: 0, accounts: input.dnsheAccounts.length + input.cfAccountList.length + input.dpAccountList.length +
         input.customGroupList.length + Object.values(input.multiProviderAccounts).reduce((sum, rows) => sum + rows.length, 0) };
@@ -144,19 +148,25 @@ export class CatalogProjectionPrototype {
       if (!parts.length) return;
       if (manifest.encoded_bytes + bytes > generationBytes) throw new Error("Prototype generation storage budget exceeded");
       const value = `[${parts.join(",")}]`;
-      const key = `${prefix(manifest.generation)}rows:${String(manifest.pages).padStart(8, "0")}`;
+      const key = `${this.prefix(manifest.generation)}rows:${String(manifest.pages).padStart(8, "0")}`;
       pending.push(this.db.prepare(`INSERT INTO cache(key,value,expires_at)
         SELECT ?,?,? WHERE (SELECT value FROM settings WHERE key=?) IS ?`).bind(key, value, validUntil / 1000, CATALOG_REVISION_KEY, revision));
       manifest.pages++; manifest.encoded_bytes += bytes;
       parts = []; bytes = 2;
       if (pending.length === 40) await flushWrites();
     };
+    let sourceRows = 0, sourceBytes = 2;
+    const writeRow = async (value: string, size: number) => {
+      if (size + 2 > bytesPerPage) throw new Error("Projection row exceeds encoded page budget; no truncation permitted");
+      if (parts.length >= rowsPerPage || bytes + size + (parts.length ? 1 : 0) > bytesPerPage) await flushPage();
+      bytes += size + (parts.length ? 1 : 0); parts.push(value); manifest.rows++;
+    };
     const append = async (domain: SummaryDomain, source: string, rank: number, alias: string,
       inventoryId: number, accountId: number | null, groupId: number | null = null) => {
       if (typeof domain.full_domain !== "string" || typeof domain.expires_at !== "string" || typeof alias !== "string")
         throw new Error("Invalid projection business field");
       if (rank !== 3 && domain.created_at != null && typeof domain.created_at !== "string") throw new Error("Invalid projection registration field");
-      if (manifest.rows >= 100000) throw new Error("Prototype inventory admission budget exceeded");
+      if (sourceRows >= 100000) throw new Error("Prototype inventory admission budget exceeded");
       const candidates = domainKeyCandidates(domain.full_domain), canonical = candidates[0];
       let resolved = domain.expires_at;
       for (const candidate of candidates) {
@@ -170,16 +180,21 @@ export class CatalogProjectionPrototype {
       if (typeof status !== "string") throw new Error("Invalid projection status field");
       for (const value of [domain.full_domain, domain.expires_at, alias, resolved, created, status]) unicode(value);
       const rawTime = rank === 1 || !domain.expires_at || domain.expires_at.startsWith("0000") ? null : finite(parse(domain.expires_at));
-      const value = JSON.stringify({ table: rank === 3 ? "custom" : "managed", inventory_id: inventoryId,
-        account_id: accountId, group_id: groupId, ordinal: manifest.rows, source_rank: rank, source, canonical, candidate_keys: candidates,
+      const contribution = { table: rank === 3 ? "custom" : "managed", inventory_id: inventoryId,
+        account_id: accountId, group_id: groupId, ordinal: sourceRows++, source_rank: rank, source, canonical, candidate_keys: candidates,
         full_domain: domain.full_domain, alias, raw_expiry: domain.expires_at, raw_status: status, resolved_expiry: resolved,
         raw_time: rawTime, raw_status_expired: rank !== 1 && rank !== 3 && domain.status === "已过期" ? 1 : 0,
         resolved_time: permanent ? null : finite(parse(resolved)), permanent: permanent ? 1 : 0,
-        created_at: created, created_present: created ? 1 : 0, created_time: created ? finite(parse(created)) : null });
+        created_at: created, created_present: created ? 1 : 0, created_time: created ? finite(parse(created)) : null };
+      const value = JSON.stringify(contribution);
       const size = encoder.encode(value).byteLength;
-      if (size + 2 > bytesPerPage) throw new Error("Projection row exceeds encoded page budget; no truncation permitted");
-      if (parts.length >= rowsPerPage || bytes + size + (parts.length ? 1 : 0) > bytesPerPage) await flushPage();
-      bytes += size + (parts.length ? 1 : 0); parts.push(value); manifest.rows++;
+      if (folded) {
+        if (size + 2 > bytesPerPage) throw new Error("Projection source row exceeds encoded page budget");
+        // Bound even discarded duplicates and original fields.
+        sourceBytes += size + 2;
+        if (sourceBytes > generationBytes) throw new Error("Prototype source contribution budget exceeded");
+        folded.add(contribution);
+      } else await writeRow(value, size);
     };
     try {
       const sources = [
@@ -202,6 +217,13 @@ export class CatalogProjectionPrototype {
       for (const [index, provider] of (["dnspod", "alidns", "huaweicloud", "vercel"] as const).entries()) {
         await managed(input.multiProviderDomains[provider], ["DNSPod", "阿里云 DNS", "华为云 DNS", "Vercel"][index], index + 4);
       }
+      if (folded) {
+        manifest.source_rows = sourceRows;
+        for (const item of folded.rows()) {
+          const value = JSON.stringify(item);
+          await writeRow(value, encoder.encode(value).byteLength);
+        }
+      }
       await flushPage(); await flushWrites();
       manifest.status = "ready"; await this.writeManifest(manifest);
       return { ...manifest };
@@ -212,24 +234,28 @@ export class CatalogProjectionPrototype {
     }
   }
 
-  queryScope(generation: string, now: number, expected?: Pick<Manifest, "rows" | "pages" | "encoded_bytes">) {
+  queryScope(generation: string, now: number, expected?: Pick<Manifest, "rows" | "pages" | "encoded_bytes" | "source_rows">) {
     validTime(now);
-    const base = `${prefix(generation)}rows:`, context = JSON.stringify({ now, seconds: Math.floor(now / 1000), ...expected });
+    const base = `${this.prefix(generation)}rows:`, context = JSON.stringify({ now, seconds: Math.floor(now / 1000), ...expected });
     return [context, context, base, `${base}\uffff`];
   }
   async read(generation: string, now: number, offset: number) {
     validTime(now); validOffset(offset);
-    const row = await this.one<{ value: string }>("SELECT value FROM cache WHERE key=? AND length(CAST(value AS BLOB))<=524288", [`${prefix(generation)}manifest`]);
+    const row = await this.one<{ value: string }>("SELECT value FROM cache WHERE key=? AND length(CAST(value AS BLOB))<=524288", [`${this.prefix(generation)}manifest`]);
     if (!row) throw new Error("Projection manifest unavailable");
     const value: unknown = JSON.parse(row.value);
     if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("Invalid projection manifest");
     const raw = value as Record<string, unknown>;
-    if (raw.format !== 1 || raw.generation !== generation || raw.status !== "ready" || raw.offset !== offset ||
+    const folded = this.variant === "folded";
+    if (raw.format !== (folded ? 2 : 1) || raw.generation !== generation || raw.status !== "ready" || raw.offset !== offset ||
       !(raw.revision === null || typeof raw.revision === "string") ||
       !["validated_at", "valid_until", "rows", "pages", "accounts", "encoded_bytes"].every(key =>
         typeof raw[key] === "number" && Number.isSafeInteger(raw[key]) && (raw[key] as number) >= 0))
       throw new Error("Projection manifest not ready or scope mismatch");
-    const manifest: Manifest = { format: 1, generation, status: "ready", revision: raw.revision as string | null, offset,
+    if (folded && !(typeof raw.source_rows === "number" && Number.isSafeInteger(raw.source_rows) &&
+      raw.source_rows >= (raw.rows as number) && raw.source_rows <= 100000)) throw new Error("Invalid folded source row count");
+    const manifest: Manifest = { format: folded ? 2 : 1, ...(folded ? {source_rows: raw.source_rows as number} : {}),
+      generation, status: "ready", revision: raw.revision as string | null, offset,
       validated_at: raw.validated_at as number, valid_until: raw.valid_until as number,
       rows: raw.rows as number, pages: raw.pages as number, accounts: raw.accounts as number, encoded_bytes: raw.encoded_bytes as number };
     if (manifest.validated_at > now || manifest.valid_until <= now ||
@@ -243,7 +269,7 @@ export class CatalogProjectionPrototype {
       audit = await this.one<Audit>(baseline.PROJECTION_AUDIT_SQL, scope);
       data = null;
     } else {
-      const combined = await this.one<Audit & Aggregation>(PROJECTION_AGGREGATE_SQL, [...scope, JSON.stringify(buckets)]);
+      const combined = await this.one<Audit & Aggregation>(folded ? FOLDED_AGGREGATE_SQL : PROJECTION_AGGREGATE_SQL, [...scope, JSON.stringify(buckets)]);
       audit = combined; data = combined;
     }
     if (!audit || audit.pages !== manifest.pages || audit.encoded_bytes !== manifest.encoded_bytes ||
@@ -254,7 +280,9 @@ export class CatalogProjectionPrototype {
     if (!data) throw new Error("Projection aggregation unavailable");
     let recent = JSON.parse(data.recent) as Recent[];
     if (data.invalid_recent) {
-      recent = await this.all<Recent>(this.variant === "baseline" ? baseline.PROJECTION_LEGACY_RECENT_SQL : PROJECTION_LEGACY_RECENT_SQL, scope);
+      recent = await this.all<Recent>(this.variant === "baseline" ? baseline.PROJECTION_LEGACY_RECENT_SQL :
+        folded ? FOLDED_LEGACY_RECENT_SQL : PROJECTION_LEGACY_RECENT_SQL, scope);
+      if (recent.length < data.invalid_recent) throw new Error("Projection legacy candidates incomplete");
       const parse = createCatalogDateParser(offset);
       recent = recent.map(row => ({ full_domain: row.full_domain, created_at: row.created_at, source: row.source, alias: row.alias }))
         .sort((a, b) => parse(b.created_at!) - parse(a.created_at!)).slice(0, 6);

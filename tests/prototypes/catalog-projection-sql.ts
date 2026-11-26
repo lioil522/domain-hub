@@ -84,7 +84,9 @@ const display = (record: string) => [
   `'alias',json_extract(${record},'$.alias')`,
 ].join(",");
 
-export const PROJECTION_AGGREGATE_SQL = `${PROJECTION_CTE}, months AS MATERIALIZED (
+export function aggregateSql(cte: string, folded = false) {
+  const registration = folded ? "json_extract(x.record,'$.registration')" : "x.record";
+  return `${cte}, months AS MATERIALIZED (
   SELECT json_extract(value,'$.slot') slot,json_extract(value,'$.start') start,json_extract(value,'$.end') end
   FROM json_each(?5)
 ), bucketed AS MATERIALIZED (
@@ -98,7 +100,7 @@ export const PROJECTION_AGGREGATE_SQL = `${PROJECTION_CTE}, months AS MATERIALIZ
 ), month_selected AS MATERIALIZED (
   SELECT ordinal,resolved_time,slot,day,first_finite FROM month_ranked WHERE position<=20 ORDER BY slot,day,first_finite
 ), recent_selected AS MATERIALIZED (
-  SELECT ordinal,created_time FROM recent_first WHERE (SELECT invalid_recent FROM recent_info)=0 ORDER BY created_time DESC,ordinal LIMIT 6
+  SELECT ordinal,created_time,${folded ? "registration_pos" : "ordinal"} tie FROM recent_first WHERE (SELECT invalid_recent FROM recent_info)=0 ORDER BY created_time DESC,tie LIMIT 6
 )
 SELECT a.*,s.*,i.invalid_recent,
   (SELECT json_group_array(json_object(${display("x.record")},'time',x.resolved_time))
@@ -107,10 +109,12 @@ SELECT a.*,s.*,i.invalid_recent,
     FROM (SELECT slot,COUNT(*) n FROM bucketed GROUP BY slot ORDER BY slot)) bucket_counts,
   (SELECT json_group_array(json_object(${display("x.record")},'time',x.resolved_time,'slot',x.slot,'day',x.day))
     FROM (SELECT m.*,b.record FROM month_selected m JOIN records b ON b.ordinal=m.ordinal ORDER BY m.slot,m.day,m.first_finite) x) bucket_items,
-  (SELECT json_group_array(json_object('full_domain',json_extract(x.record,'$.full_domain'),
-      'created_at',json_extract(x.record,'$.created_at'),'source',json_extract(x.record,'$.source'),'alias',json_extract(x.record,'$.alias')))
-    FROM (SELECT r.*,b.record FROM recent_selected r JOIN records b ON b.ordinal=r.ordinal ORDER BY r.created_time DESC,r.ordinal) x) recent
+  (SELECT json_group_array(json_object('full_domain',json_extract(${registration},'$.full_domain'),
+      'created_at',json_extract(${registration},'$.created_at'),'source',json_extract(${registration},'$.source'),'alias',json_extract(${registration},'$.alias')))
+    FROM (SELECT r.*,b.record FROM recent_selected r JOIN records b ON b.ordinal=r.ordinal ORDER BY r.created_time DESC,r.tie) x) recent
 FROM audit a CROSS JOIN canonical_counts s CROSS JOIN recent_info i`;
+}
+export const PROJECTION_AGGREGATE_SQL = aggregateSql(PROJECTION_CTE);
 
 export const PROJECTION_LEGACY_RECENT_SQL = `${PROJECTION_CTE}
 SELECT json_extract(b.record,'$.full_domain') full_domain,json_extract(b.record,'$.created_at') created_at,

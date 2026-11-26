@@ -163,6 +163,13 @@ const harnessOutput = await build({ stdin: { contents: `import worker from "./di
         const {recent:a,...astable}=actual.stats,{recent:b,...bstable}=expected;
         if(JSON.stringify(astable)!==JSON.stringify(bstable)) throw new Error("D1 projection corpus counts/order differ");
         if(actual.recentMode==="sql-top-six"&&JSON.stringify(a)!==JSON.stringify(b)) throw new Error("D1 finite recent selection differs");
+        const fold=new CatalogProjectionPrototype(env.DB,"folded");
+        const built=await fold.stage(input,{validatedAt:now,offset});
+        const later=now+120001,merged=await fold.read(built.generation,later,offset);
+        validateRecent(input,merged.stats.recent);
+        const {recent:mr,...ms}=merged.stats,{recent:er,...es}=computeDashboardStats(input,later,20,offset);
+        if(JSON.stringify(ms)!==JSON.stringify(es)||(merged.recentMode==="sql-top-six"&&JSON.stringify(mr)!==JSON.stringify(er)))
+          throw new Error("D1 folded projection/time comparison differs");
         cases++;
       }
       return Response.json({equivalent:true,cases,rows:result.metrics.returnedRows});
@@ -261,7 +268,7 @@ try {
   assert.equal(projectionBody.equivalent, true);
   assert.equal(projectionBody.cases, 9);
   assert.equal(projectionBody.rows, 4);
-  console.log("[runtime-smoke] isolated workerd/D1 JSON projection, real repository capture and 9 offset/source cases passed");
+  console.log("[runtime-smoke] isolated workerd/D1 JSON and folded projection, real repository capture and 9 offset/source cases passed");
 }
 finally { await mf.dispose(); }
 

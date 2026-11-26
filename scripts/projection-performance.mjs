@@ -79,16 +79,18 @@ for (const n of sizes) for (const runtime of ["node", "workerd"]) {
     };
     await invoke("reference");
     for (let repeat = 0; repeat < repeats; repeat++) {
-      let generation, expected;
-      // Alternate baseline/optimized order to avoid always favoring the second
-      // query. Both readers consume the exact same sealed generation.
-      const order = repeat % 2 ? ["read", "baseline"] : ["baseline", "read"];
-      for (const action of ["reference", "stage", ...order]) {
-        const cpu = process.cpuUsage(), start = performance.now(), value = await invoke(action, generation);
+      let generation, foldedGeneration, expected;
+      // Rotate read order. Both v1 readers use the same generation; the v2
+      // folded reader uses a separate generation built from the same fixture.
+      const orders = [["stage","folded-stage","baseline","read","folded-read"],
+        ["folded-stage","stage","read","folded-read","baseline"], ["stage","folded-stage","folded-read","baseline","read"]];
+      for (const action of ["reference", ...orders[repeat % orders.length]]) {
+        const cpu = process.cpuUsage(), start = performance.now(), value = await invoke(action, action === "folded-read" ? foldedGeneration : generation);
         const wallMs = performance.now() - start, consumed = process.cpuUsage(cpu);
         if (action === "reference") expected = value.stats;
         if (action === "stage") generation = value.manifest.generation;
-        if (action === "read" || action === "baseline") assert.deepEqual(value.stats, expected);
+        if (action === "folded-stage") foldedGeneration = value.manifest.generation;
+        if (action === "read" || action === "baseline" || action === "folded-read") assert.deepEqual(value.stats, expected);
         const hash = value.stats ? createHash("sha256").update(JSON.stringify(value.stats)).digest("hex") : undefined;
         if (hash) {
           if (hashes.has(n)) assert.equal(hash, hashes.get(n), `Cross-runtime/repeat projection result mismatch at ${n}`);
@@ -97,7 +99,8 @@ for (const n of sizes) for (const runtime of ["node", "workerd"]) {
         const record = { n, runtime, action, repeat, wallMs,
           ...(runtime === "node" ? { processCpuMs: (consumed.user + consumed.system) / 1000 } : {}),
           ...(value.metrics ? { metrics: value.metrics } : {}),
-          ...(action === "stage" ? { pages: value.manifest.pages, sourceRows: value.manifest.rows, encodedPageBytes: value.manifest.encoded_bytes } : {}),
+          ...(value.capture ? { pages: value.manifest.pages, sourceRows: value.capture.inventoryRows, storedRows: value.manifest.rows,
+            encodedPageBytes: value.manifest.encoded_bytes } : {}),
           ...(value.capture ? { capture: value.capture } : {}),
           ...(value.stats ? { responseBytes: Buffer.byteLength(JSON.stringify(value.stats)),
             hash } : {}) };

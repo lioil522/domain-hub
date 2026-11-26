@@ -55,3 +55,4 @@ Docker 修复后再次通过全量验证（192 个用例），并用打包后的
 - [隔离贡献投影＋SQL聚合原型（2026-11-24，尚未接入生产）](./CATALOG_PROJECTION_PROTOTYPE_2026-11-24.md)
 - [隔离投影读端SQL优化（2026-11-24，尚未接入生产）](./CATALOG_SQL_TUNING_2026-11-24.md)
 - [固定时区按域名预先合并：构建和读取成本对照（隔离原型）](./CATALOG_FOLDED_PROJECTION.md)
+- [按受影响域名重算：改名、删除与日期依赖（内存实验）](./CATALOG_AFFECTED_KEYS.md)

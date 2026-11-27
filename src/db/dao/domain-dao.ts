@@ -147,31 +147,68 @@ export function buildDomainUpsert(
   );
 }
 
-/** Bounded statement count for an entire persisted snapshot or CF page. */
+type JsonSource = { from: string; json: string; where: string; bindings: unknown[];
+  known?: { sql: string; bindings: unknown[] } };
+type WriteGuard = { sql: string; bindings: unknown[] };
+// An operator's persistent triggers may observe the UPDATE column list or
+// count same-second observations. In that case use the original wide update.
+const hasDomainTrigger = "EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND tbl_name='domains_cache' COLLATE NOCASE)";
+
+/** One wide UPSERT for CF pages. Persisted snapshots additionally have a timestamp-only path. */
 export function buildDomainJsonUpsert(
-  db: D1Database,
-  accountId: number,
-  source: { from: string; json: string; where: string; bindings: unknown[];
-    known?: { sql: string; bindings: unknown[] } },
-  guard: { sql: string; bindings: unknown[] },
+  db: D1Database, accountId: number, source: JsonSource, guard: WriteGuard,
 ): D1PreparedStatement {
+  return jsonUpsert(db, accountId, source, guard);
+}
+
+function jsonUpsert(db: D1Database, accountId: number, source: JsonSource, guard: WriteGuard, observedAt?: string) {
   const field = (name: string) => `json_extract(${source.json},'$.${name}')`;
   const known = source.known || { sql: "1", bindings: [] };
+  // Drive SET and the null-safe change predicate from the same effective
+  // values. Unknown DNS must not overwrite existing state.
+  const values = {
+    account_id: "excluded.account_id", expires_at: "excluded.expires_at",
+    remote_id: "COALESCE(excluded.remote_id,domains_cache.remote_id)",
+    provider_account_id: "COALESCE(excluded.provider_account_id,domains_cache.provider_account_id)",
+    created_at: "COALESCE(NULLIF(excluded.created_at,''),domains_cache.created_at)",
+  };
+  const dns = { status: "excluded.status", has_dns: "excluded.has_dns",
+    dns_provider: "COALESCE(excluded.dns_provider,domains_cache.dns_provider)" };
+  const differs = (fields: Record<string, string>) => Object.entries(fields)
+    .map(([col, expr]) => `domains_cache.${col} IS NOT ${expr}`).join(" OR ");
+  const where = observedAt ? `WHERE ${hasDomainTrigger} OR ${differs(values)}
+    OR ((${differs(dns)}) AND ${known.sql})` : "";
+  const timestamp = observedAt ? `CASE WHEN ${hasDomainTrigger} THEN CURRENT_TIMESTAMP ELSE ? END` : "CURRENT_TIMESTAMP";
   return db.prepare(`INSERT INTO domains_cache
     (id,account_id,subdomain,rootdomain,full_domain,status,created_at,expires_at,has_dns,dns_provider,provider_account_id,remote_id,updated_at)
     SELECT ${field("id")},?,COALESCE(${field("subdomain")},''),COALESCE(${field("rootdomain")},''),${field("full_domain")},
       CASE WHEN ${field("dns_state_known")}=1 OR ${field("status")} IN ('已解析','已委派','未解析') THEN COALESCE(${field("status")},'未解析') ELSE '未解析' END,
       COALESCE(${field("created_at")},''),COALESCE(${field("expires_at")},''),COALESCE(${field("has_dns")},1),
-      ${field("dns_provider")},CAST(${field("provider_account_id")} AS TEXT),${field("remote_id")},CURRENT_TIMESTAMP
+      ${field("dns_provider")},CAST(${field("provider_account_id")} AS TEXT),${field("remote_id")},${timestamp}
     FROM ${source.from} WHERE ${source.where} AND ${guard.sql}
-    ON CONFLICT(id) DO UPDATE SET account_id=excluded.account_id,
-      status=CASE WHEN ${known.sql} THEN excluded.status ELSE domains_cache.status END,
-      has_dns=CASE WHEN ${known.sql} THEN excluded.has_dns ELSE domains_cache.has_dns END,
-      dns_provider=CASE WHEN ${known.sql} THEN COALESCE(excluded.dns_provider,domains_cache.dns_provider) ELSE domains_cache.dns_provider END,
-      created_at=COALESCE(NULLIF(excluded.created_at,''),domains_cache.created_at),
-      expires_at=excluded.expires_at,provider_account_id=COALESCE(excluded.provider_account_id,domains_cache.provider_account_id),
-      remote_id=COALESCE(excluded.remote_id,domains_cache.remote_id),updated_at=excluded.updated_at`)
-    .bind(accountId, ...source.bindings, ...guard.bindings, ...known.bindings, ...known.bindings, ...known.bindings);
+    ON CONFLICT(id) DO UPDATE SET ${Object.entries(values).map(([col, expr]) => `${col}=${expr}`).join(",")},
+      ${Object.entries(dns).map(([col, expr]) => `${col}=CASE WHEN ${known.sql} THEN ${expr} ELSE domains_cache.${col} END`).join(",")},
+      updated_at=excluded.updated_at ${where}`)
+    .bind(accountId, ...(observedAt ? [observedAt] : []), ...source.bindings, ...guard.bindings,
+      ...known.bindings, ...known.bindings, ...known.bindings, ...(observedAt ? known.bindings : []));
+}
+
+/** Commit both statements in the checkpoint batch. Avoid listing indexed
+ * columns in SET merely to record the observation time of unchanged rows. */
+export function stagedDomainWrites(db: D1Database, accountId: number, jobId: string, guard: WriteGuard) {
+  // Same UTC/second format as SQLite CURRENT_TIMESTAMP. Use one observation
+  // for the whole snapshot even if the two statements straddle a second.
+  const observedAt = new Date().toISOString().slice(0, 19).replace("T", " ");
+  const source: JsonSource = { from: "sync_rows r", json: "r.payload", where: "r.job_id=?", bindings: [jobId],
+    known: { sql: "EXISTS(SELECT 1 FROM sync_rows WHERE job_id=? AND domain_id=excluded.id AND json_extract(payload,'$.dns_state_known')=1)",
+      bindings: [jobId] } };
+  return [
+    jsonUpsert(db, accountId, source, guard, observedAt),
+    db.prepare(`UPDATE domains_cache SET updated_at=?
+      WHERE id IN (SELECT json_extract(payload,'$.id') FROM sync_rows WHERE job_id=?) AND account_id=?
+      AND updated_at IS NOT ? AND NOT ${hasDomainTrigger} AND ${guard.sql}`)
+      .bind(observedAt, jobId, accountId, observedAt, ...guard.bindings),
+  ];
 }
 
 /**

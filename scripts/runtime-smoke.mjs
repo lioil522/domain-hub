@@ -111,6 +111,7 @@ const harnessOutput = await build({ stdin: { contents: `import worker from "./di
   import {DatabaseManager} from "./src/db";
   import {DomainCatalogRepository} from "./src/repositories/domain-catalog-repository";
   import {DomainCatalogService} from "./src/services/domain-catalog-service";
+  import {seedSnapshotFixture} from "./tests/helpers/snapshot-write-fixture";
   function validateRecent(input,recent) {
     const first=new Map();
     const sources=[
@@ -145,6 +146,16 @@ const harnessOutput = await build({ stdin: { contents: `import worker from "./di
     return [...new Uint8Array(digest)].map(value=>value.toString(16).padStart(2,"0")).join("");
   }
   export default { async fetch(request, env, ctx) {
+    if (new URL(request.url).pathname === "/__test_snapshot_write") {
+      const manager=new DatabaseManager(env.SNAPSHOT_DB);
+      if (!await manager.ensureTables()) throw new Error("Snapshot fixture unavailable");
+      await seedSnapshotFixture(env.SNAPSHOT_DB,100);
+      await manager.executeRaw("UPDATE sync_rows SET payload=json_set(payload,'$.expires_at','2028-01-01') WHERE domain_id=1");
+      const queue=manager.syncQueue(), work=(await queue.jobs("test"))[0];
+      await queue.writeDomains(work,{phase:"renew",total:100});
+      const result=await manager.firstRaw("SELECT COUNT(*) n,SUM(updated_at='2000-01-01 00:00:00') stale,SUM(expires_at='2028-01-01') changed FROM domains_cache");
+      return Response.json({...result,phase:JSON.parse((await queue.jobs("test"))[0].cursor).phase});
+    }
     if (new URL(request.url).pathname === "/__test_capture") {
       if (!await new DatabaseManager(env.CAPTURE_DB).ensureTables()) throw new Error("Capture fixture schema unavailable");
       return Response.json(await measureCapture(env.CAPTURE_DB,100,true));
@@ -223,7 +234,7 @@ let workerDeliveries = 0;
 let mockError = "";
 const mf = new Miniflare(convertV4MiniflareOptions({
   modules: true, script: harnessScript,
-  compatibilityDate: date, d1Databases: ["DB", "CAPTURE_DB", "DIRTY_DB"], bindings: { AES_KEY: key, SETUP_TOKEN: setupToken },
+  compatibilityDate: date, d1Databases: ["DB", "CAPTURE_DB", "DIRTY_DB", "SNAPSHOT_DB"], bindings: { AES_KEY: key, SETUP_TOKEN: setupToken },
   outboundService: async request => {
     try {
       assert.equal(new URL(request.url).hostname, "notification-smoke.invalid", "Runtime smoke must never contact a real provider");
@@ -302,6 +313,10 @@ try {
   assert.equal(dirty.status, 200, await dirty.clone().text());
   assert.deepEqual(await dirty.json(), { first: 2, stale: 0, accepted: 2 });
   console.log("[runtime-smoke] isolated workerd/D1 dirty-key claim and re-dirty fence passed");
+  const snapshotWrite = await fetcher("/__test_snapshot_write");
+  assert.equal(snapshotWrite.status, 200, await snapshotWrite.clone().text());
+  assert.deepEqual(await snapshotWrite.json(), { n: 100, stale: 0, changed: 1, phase: "renew" });
+  console.log("[runtime-smoke] workerd/D1 snapshot payload, observation times and atomic checkpoint passed");
 }
 finally { await mf.dispose(); }
 

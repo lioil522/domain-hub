@@ -2,7 +2,7 @@ import { ConflictError, ValidationError, NotFoundError } from "../../errors";
 import { canonicalJson } from "../../../shared/restore-wire";
 import { sha256Hex } from "../crypto";
 import type { UpstreamSubdomain } from "../types";
-import { buildDomainJsonUpsert } from "./domain-dao";
+import { stagedDomainWrites } from "./domain-dao";
 
 export const SYNC_LEASE_MS = 90000;
 export const SYNC_MAX_FAILURES = 5;
@@ -112,8 +112,7 @@ export class SyncWorkQueue {
     return { sql: `EXISTS(SELECT 1 FROM sync_work WHERE id=? AND status='running' AND lease_token=? AND lease_until>?)`,
       bindings: [work.id, work.lease_token, this.now()] };
   }
-  async checkpoint(work: SyncWork, cursor: SyncCursor, statements: D1PreparedStatement[] = []) {
-    const guard = this.guard(work);
+  async checkpoint(work: SyncWork, cursor: SyncCursor, statements: D1PreparedStatement[] = [], guard = this.guard(work)) {
     const results = await this.db.batch([...statements, this.db.prepare(`UPDATE sync_work SET cursor=?,updated_at=?,failures=0 WHERE id=? AND ${guard.sql}`)
       .bind(JSON.stringify(cursor), this.now(), work.id, ...guard.bindings)]);
     if (results[results.length - 1].meta.changes !== 1) throw new ConflictError("同步租约已失效，未推进检查点", "sync_lease_expired");
@@ -145,13 +144,11 @@ export class SyncWorkQueue {
   async writeDomains(work: SyncWork, next: SyncCursor) {
     const guard = this.guard(work);
     await this.checkpoint(work, next, [
-      buildDomainJsonUpsert(this.db, work.account_id, { from: "sync_rows r", json: "r.payload", where: "r.job_id=?",
-        bindings: [work.id], known: { sql: "EXISTS(SELECT 1 FROM sync_rows WHERE job_id=? AND domain_id=excluded.id AND json_extract(payload,'$.dns_state_known')=1)",
-          bindings: [work.id] } }, guard),
+      ...stagedDomainWrites(this.db, work.account_id, work.id, guard),
       this.db.prepare(`DELETE FROM domains_cache WHERE account_id=? AND id IN (SELECT domain_id FROM sync_candidates WHERE job_id=?)
         AND id NOT IN(SELECT domain_id FROM sync_rows WHERE job_id=?) AND ${guard.sql}`)
         .bind(work.account_id, work.id, work.id, ...guard.bindings),
-    ]);
+    ], guard); // A second clock sample must not admit rows but reject their cursor.
   }
   async finish(work: SyncWork, status: "queued" | "completed" | "failed", error: string | null = null, delayMs = 1200, failure = false) {
     const guard = this.guard(work), now = this.now();

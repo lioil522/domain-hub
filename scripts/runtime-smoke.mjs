@@ -106,7 +106,7 @@ const harnessOutput = await build({ stdin: { contents: `import worker from "./di
   import {semanticFixture,selectionFixture} from "./tests/helpers/catalog-semantic-fixture";
   import {normalizeDomainKey} from "./shared/domain-keys";
   import {CatalogProjectionPrototype} from "./tests/prototypes/catalog-projection";
-  import {measureCapture} from "./tests/prototypes/catalog-write-capture";
+  import {measureCapture,installCapture,seedCaptureFixture,claimDirty,ackDirty} from "./tests/prototypes/catalog-write-capture";
   import {captureProjectionInput} from "./tests/prototypes/catalog-projection-capture";
   import {DatabaseManager} from "./src/db";
   import {DomainCatalogRepository} from "./src/repositories/domain-catalog-repository";
@@ -148,6 +148,20 @@ const harnessOutput = await build({ stdin: { contents: `import worker from "./di
     if (new URL(request.url).pathname === "/__test_capture") {
       if (!await new DatabaseManager(env.CAPTURE_DB).ensureTables()) throw new Error("Capture fixture schema unavailable");
       return Response.json(await measureCapture(env.CAPTURE_DB,100,true));
+    }
+    if (new URL(request.url).pathname === "/__test_dirty") {
+      const db=env.DIRTY_DB;
+      if (!await new DatabaseManager(db).ensureTables()) throw new Error("Dirty fixture schema unavailable");
+      await seedCaptureFixture(db,10);
+      await installCapture(db,"dirty");
+      const update=date=>db.prepare("UPDATE domains_cache SET expires_at=? WHERE id=1").bind(date).run();
+      await update("2027-02-01");
+      const [a,b]=await Promise.all([claimDirty(db,0),claimDirty(db,0)]);
+      const first=a.keys.length?a:b;
+      await update("2027-03-01");
+      const second=await claimDirty(db,1);
+      const stale=await ackDirty(db,1,first), accepted=await ackDirty(db,1,second);
+      return Response.json({first:a.keys.length+b.keys.length,stale:stale.removed,accepted:accepted.removed});
     }
     if (new URL(request.url).pathname === "/__test_projection") {
       const now=Date.parse("2026-11-24T00:00:00Z");
@@ -209,7 +223,7 @@ let workerDeliveries = 0;
 let mockError = "";
 const mf = new Miniflare(convertV4MiniflareOptions({
   modules: true, script: harnessScript,
-  compatibilityDate: date, d1Databases: ["DB", "CAPTURE_DB"], bindings: { AES_KEY: key, SETUP_TOKEN: setupToken },
+  compatibilityDate: date, d1Databases: ["DB", "CAPTURE_DB", "DIRTY_DB"], bindings: { AES_KEY: key, SETUP_TOKEN: setupToken },
   outboundService: async request => {
     try {
       assert.equal(new URL(request.url).hostname, "notification-smoke.invalid", "Runtime smoke must never contact a real provider");
@@ -284,6 +298,10 @@ try {
   assert.equal(costs.cascadeReplay.events, 102);
   assert.equal(costs.cascadeReplay.changes, 100);
   console.log("[runtime-smoke] isolated workerd/D1 change journal and dependency write accounting passed");
+  const dirty = await fetcher("/__test_dirty");
+  assert.equal(dirty.status, 200, await dirty.clone().text());
+  assert.deepEqual(await dirty.json(), { first: 2, stale: 0, accepted: 2 });
+  console.log("[runtime-smoke] isolated workerd/D1 dirty-key claim and re-dirty fence passed");
 }
 finally { await mf.dispose(); }
 

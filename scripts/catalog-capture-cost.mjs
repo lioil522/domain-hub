@@ -11,11 +11,15 @@ const schema = await readFile(new URL("../schema.sql", import.meta.url), "utf8")
 const statements = schema.replace(/^\s*--[^\r\n]*/gm, "").split(";").map(sql => sql.trim()).filter(Boolean);
 const bundled = async contents => (await build({ stdin: { contents, resolveDir: root }, bundle: true, write: false,
   platform: "neutral", format: "esm", target: "es2022" })).outputFiles[0].text;
-const entry = `import {measureCapture} from "./tests/prototypes/catalog-write-capture";`;
+const dirty = process.argv[2] === "--dirty";
+assert.ok(process.argv.length === (dirty ? 3 : 2), "Usage: catalog-capture-cost.mjs [--dirty]");
+const entry = `import {measureCapture,measureDirtyQueue} from "./tests/prototypes/catalog-write-capture";`;
 const nodeEntry = await bundled(`${entry}
   import {createD1FromSqlite} from "./server/d1-sqlite";
-  export function run(sqlite,n,enabled){return measureCapture(createD1FromSqlite(sqlite),n,enabled);}`);
-const { run } = await import(`data:text/javascript;base64,${Buffer.from(nodeEntry).toString("base64")}`);
+  export function run(sqlite,n,enabled){return measureCapture(createD1FromSqlite(sqlite),n,enabled);}
+  export function dirtyRun(sqlite,n,mode){return measureDirtyQueue(createD1FromSqlite(sqlite),n,mode);}
+  export {measureDirtyQueue};`);
+const { run, dirtyRun, measureDirtyQueue } = await import(`data:text/javascript;base64,${Buffer.from(nodeEntry).toString("base64")}`);
 const script = await bundled(`${entry}
   export default {async fetch(request,env){
     const query=new URL(request.url).searchParams;
@@ -24,7 +28,32 @@ const script = await bundled(`${entry}
 const config = await readFile(new URL("../wrangler.toml", import.meta.url), "utf8");
 const compatibilityDate = config.match(/^compatibility_date\s*=\s*"([^"]+)"/m)?.[1];
 assert.ok(compatibilityDate);
-for (const n of [100, 1000, 10000]) for (const captured of [false, true]) {
+async function runDirtyBenchmark() {
+  // Run across the local binding from the harness so the 10k drain does not
+  // masquerade as fitting in one Worker invocation.
+  for (const n of [100, 1000, 10000]) {
+    const checked = new Map();
+    for (const mode of ["journal", "dirty"]) {
+      const sqlite = new DatabaseSync(":memory:");
+      const mf = new Miniflare(convertV4MiniflareOptions({ name: "local-dirty-cost", modules: true, compatibilityDate,
+        script: "export default {fetch() { return new Response(null, {status:404}) }}", d1Databases: ["DB"] }));
+      try {
+        sqlite.exec(schema);
+        const db = await mf.getD1Database("DB");
+        for (let i = 0; i < statements.length; i += 40) await db.batch(statements.slice(i, i + 40).map(sql => db.prepare(sql)));
+        for (const [runtime, result] of [["node", await dirtyRun(sqlite, n, mode)], ["local-d1", await measureDirtyQueue(db, n, mode)]]) {
+          for (const phase of ["sync", "hot", "cascade"]) {
+            if (checked.has(phase)) assert.equal(result[phase].digest, checked.get(phase), `${n} ${runtime} ${mode} ${phase}`);
+            else checked.set(phase, result[phase].digest);
+          }
+          console.log(JSON.stringify({ runtime, ...result }));
+        }
+      } finally { sqlite.close(); await mf.dispose(); }
+    }
+  }
+}
+if (dirty) await runDirtyBenchmark();
+else for (const n of [100, 1000, 10000]) for (const captured of [false, true]) {
   const sqlite = new DatabaseSync(":memory:");
   try {
     sqlite.exec(schema);

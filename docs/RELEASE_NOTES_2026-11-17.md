@@ -57,3 +57,4 @@ Docker 修复后再次通过全量验证（192 个用例），并用打包后的
 - [固定时区按域名预先合并：构建和读取成本对照（隔离原型）](./CATALOG_FOLDED_PROJECTION.md)
 - [按受影响域名重算：改名、删除与日期依赖（内存实验）](./CATALOG_AFFECTED_KEYS.md)
 - [事务内变更捕获与依赖索引写入成本（隔离实验）](./CATALOG_WRITE_CAPTURE.md)
+- [追加日志与脏键表：写入成本和过期确认对照（隔离实验）](./CATALOG_DIRTY_KEYS.md)

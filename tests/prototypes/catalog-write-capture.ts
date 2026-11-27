@@ -5,6 +5,7 @@ import { RDAP_CACHE_PREFIX } from "../../src/db/types";
 
 const journal = "test_catalog_journal";
 const projection = "test_catalog_dependencies";
+const queue = "test_catalog_dirty";
 const tables = [
   { table: "domains_cache", key: "id", name: "full_domain", fields: ["account_id", "full_domain", "rootdomain", "has_dns", "created_at", "expires_at", "status"] },
   { table: "custom_domains", key: "id", name: "full_domain", fields: ["group_id", "full_domain", "expires_at"] },
@@ -13,7 +14,7 @@ const tables = [
   { table: "cache", key: "key", name: "key", fields: ["value", "expires_at"] },
 ] as const;
 
-function triggerSql() {
+function triggerSql(mode: "journal" | "dirty") {
   return tables.flatMap(({ table, key, name, fields }) => (["INSERT", "UPDATE", "DELETE"] as const).map(op => {
     const from = op !== "INSERT", to = op !== "DELETE";
     const matches = (ref: string) => `substr(${ref}.key,1,${RDAP_CACHE_PREFIX.length})='${RDAP_CACHE_PREFIX}'`;
@@ -23,10 +24,19 @@ function triggerSql() {
     ];
     const project = (ref: string, present: boolean) => !present || !name ? "NULL" :
       table === "cache" ? `CASE WHEN ${matches(ref)} THEN substr(${ref}.key,${RDAP_CACHE_PREFIX.length + 1}) END` : `${ref}.${name}`;
+    const oldId = from ? `old.${key}` : "NULL", newId = to ? `new.${key}` : "NULL";
+    const dirty = (kind: string, before: string, after: string) => `INSERT INTO ${queue}(kind,key)
+      SELECT '${kind}',key FROM (SELECT ${before} key UNION SELECT ${after}) WHERE key IS NOT NULL
+      ON CONFLICT(kind,key) DO UPDATE SET claim=NULL,lease_until=NULL WHERE claim IS NOT NULL;`;
+    const body = mode === "journal" ? `INSERT INTO ${journal}(entity,op,old_id,new_id,old_name,new_name)
+      VALUES('${table}','${op}',${oldId},${newId},${project("old", from)},${project("new", to)});` :
+      table === "accounts" ? dirty("owner", oldId, newId) :
+      table === "domain_date_overrides" || table === "cache" ? dirty("date", project("old", from), project("new", to)) :
+      // Old/new raw names cannot be recovered by looking up the current ID
+      // after a second rename or deletion. SQLite does not do our IDN folding.
+      dirty(table, oldId, newId) + dirty("name", project("old", from), project("new", to));
     return `CREATE TRIGGER test_capture_${table}_${op.toLowerCase()} AFTER ${op} ON ${table}
-      ${guard.length ? "WHEN " + guard.join(" AND ") : ""} BEGIN
-      INSERT INTO ${journal}(entity,op,old_id,new_id,old_name,new_name)
-      VALUES('${table}','${op}',${from ? `old.${key}` : "NULL"},${to ? `new.${key}` : "NULL"},${project("old", from)},${project("new", to)});
+      ${guard.length ? "WHEN " + guard.join(" AND ") : ""} BEGIN ${body}
       END`;
   }));
 }
@@ -42,11 +52,13 @@ async function batch(db: D1Database, statements: D1PreparedStatement[]) {
   return result;
 }
 
-export async function installCapture(db: D1Database) {
+export async function installCapture(db: D1Database, mode: "journal" | "dirty" = "journal") {
   await batch(db, [
-    `CREATE TABLE ${journal}(seq INTEGER PRIMARY KEY AUTOINCREMENT, entity TEXT NOT NULL, op TEXT NOT NULL,
-      old_id, new_id, old_name TEXT, new_name TEXT)`,
-    ...triggerSql(),
+    mode === "journal" ? `CREATE TABLE ${journal}(seq INTEGER PRIMARY KEY AUTOINCREMENT, entity TEXT NOT NULL, op TEXT NOT NULL,
+      old_id, new_id, old_name TEXT, new_name TEXT)` :
+      `CREATE TABLE ${queue}(kind TEXT NOT NULL,key NOT NULL,claim TEXT,lease_until INTEGER,
+        PRIMARY KEY(kind,key)) WITHOUT ROWID`,
+    ...triggerSql(mode),
   ].map(sql => db.prepare(sql)));
 }
 
@@ -57,6 +69,48 @@ export interface CaptureEvent {
 export function readJournal(db: D1Database, after = 0, limit = 256) {
   if (!Number.isSafeInteger(after) || after < 0 || !Number.isInteger(limit) || limit < 1 || limit > 256) throw new Error("Invalid journal range");
   return all<CaptureEvent>(db, `SELECT * FROM ${journal} WHERE seq>? ORDER BY seq LIMIT ?`, [after, limit]);
+}
+
+type DirtyKey = { kind: "domains_cache" | "custom_domains" | "name" | "owner" | "date"; key: number | string };
+interface Claim { token: string; keys: DirtyKey[]; writes: number }
+const PAGE = 256;
+const LEASE_MS = 30_000;
+function checkTime(now: number) {
+  if (!Number.isSafeInteger(now) || now < 0 || now > Number.MAX_SAFE_INTEGER - LEASE_MS) throw new Error("Invalid claim time");
+}
+export async function claimDirty(db: D1Database, now: number, limit = PAGE): Promise<Claim> {
+  checkTime(now);
+  if (!Number.isInteger(limit) || limit < 1 || limit > PAGE) throw new Error("Invalid claim limit");
+  const token = crypto.randomUUID();
+  const result = await db.prepare(`UPDATE ${queue} SET claim=?,lease_until=?
+    WHERE (kind,key) IN (SELECT kind,key FROM ${queue}
+      WHERE claim IS NULL OR lease_until<=? ORDER BY kind,key LIMIT ?)
+    RETURNING kind,key`).bind(token, now + LEASE_MS, now, limit).all<DirtyKey>();
+  if (!result.success || !Array.isArray(result.results) || result.results.length > limit) throw new Error("Fixture claim failed");
+  return { token, keys: result.results, writes: result.meta.rows_written };
+}
+export async function ackDirty(db: D1Database, now: number, claim: Claim) {
+  checkTime(now);
+  if (claim.keys.length > PAGE) throw new Error("Invalid claim size");
+  const [result] = await batch(db, [db.prepare(`DELETE FROM ${queue}
+    WHERE claim=? AND lease_until>? AND (kind,key) IN
+    (SELECT json_extract(value,'$[0]'),json_extract(value,'$[1]') FROM json_each(?))`)
+    .bind(claim.token, now, JSON.stringify(claim.keys.map(({ kind, key }) => [kind, key])))]);
+  return { removed: result.meta.changes, writes: result.meta.rows_written };
+}
+
+// Equality is for the raw invalidation set only, not event ordering or a
+// materialized summary. A consumer still resolves canonical/candidate keys.
+export function eventKeys(event: CaptureEvent): DirtyKey[] {
+  const keys: DirtyKey[] = [];
+  const push = (kind: DirtyKey["kind"], value: DirtyKey["key"] | null) => { if (value !== null) keys.push({ kind, key: value }); };
+  for (const id of [event.old_id, event.new_id]) {
+    if (event.entity === "accounts") push("owner", id);
+    else if (event.entity === "domains_cache" || event.entity === "custom_domains") push(event.entity, id);
+  }
+  const kind = event.entity === "domain_date_overrides" || event.entity === "cache" ? "date" : "name";
+  for (const name of [event.old_name, event.new_name]) push(kind, name);
+  return keys;
 }
 
 type Scope = "domains_cache" | "custom_domains";
@@ -192,4 +246,48 @@ export async function measureCapture(db: D1Database, n: number, captured: boolea
   const cascade = await timed(() => batch(db, [db.prepare("DELETE FROM accounts WHERE id=1")]));
   const cascadeReplay = await replay();
   return { n, captured, bootstrapMs, sync, syncReplay, repeat, repeatReplay, date, dateReplay, cascade, cascadeReplay };
+}
+
+// Separate benchmark: compare queue bookkeeping only. Both sides consume and
+// remove work while the fixture is quiescent. No dependency or result writes.
+export async function measureDirtyQueue(db: D1Database, n: number, mode: "journal" | "dirty") {
+  await seedCaptureFixture(db, n);
+  await installCapture(db, mode);
+  const phase = async (write: () => Promise<D1Result<unknown>[]>) => {
+    const results = await write();
+    const queued = (await all<{ n: number }>(db, `SELECT COUNT(*) n FROM ${mode === "dirty" ? queue : journal}`))[0].n;
+    const keys = new Set<string>();
+    const add = ({ kind, key }: DirtyKey) => keys.add(JSON.stringify([kind, key]));
+    let deleted = 0, claimWrites = 0, ackWrites = 0;
+    while (deleted < queued) {
+      if (mode === "dirty") {
+        const claim = await claimDirty(db, 0);
+        if (!claim.keys.length) throw new Error("Dirty fixture drain stalled");
+        claim.keys.forEach(add);
+        claimWrites += claim.writes;
+        const ack = await ackDirty(db, 1, claim);
+        deleted += ack.removed;
+        ackWrites += ack.writes;
+        if (ack.removed !== claim.keys.length) throw new Error("Dirty fixture ack incomplete");
+      } else {
+        const events = await readJournal(db);
+        if (!events.length) throw new Error("Journal fixture drain stalled");
+        for (const event of events) eventKeys(event).forEach(add);
+        const [ack] = await batch(db, [db.prepare(`DELETE FROM ${journal} WHERE seq<=?`).bind(events.at(-1)!.seq)]);
+        if (ack.meta.changes !== events.length) throw new Error("Journal fixture ack incomplete");
+        deleted += ack.meta.changes;
+        ackWrites += ack.meta.rows_written;
+      }
+    }
+    const bytes = new TextEncoder().encode([...keys].sort().join("\n"));
+    const digest = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map(b => b.toString(16).padStart(2, "0")).join("");
+    return { queued, distinctKeys: keys.size, digest,
+      writeRows: results.reduce((sum, r) => sum + r.meta.rows_written, 0), claimWrites, ackWrites };
+  };
+  const sync = await phase(() => fixtureSync(db, n));
+  const hot = await phase(() => batch(db, Array.from({ length: 25 }, (_, i) => db.prepare(
+    "UPDATE domains_cache SET expires_at=? WHERE account_id=1 AND id IN (SELECT id FROM domains_cache WHERE account_id=1 ORDER BY id LIMIT 20)"
+  ).bind(i % 2 ? "2027-07-02" : "2027-07-03"))));
+  const cascade = await phase(() => batch(db, [db.prepare("DELETE FROM accounts WHERE id=1")]));
+  return { n, mode, sync, hot, cascade };
 }

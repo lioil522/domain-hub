@@ -6,6 +6,7 @@ import { RDAP_CACHE_PREFIX } from "../../src/db/types";
 import {
   installCapture, installDependencies, bootstrapDependencies, readJournal, refreshDependencies,
   findDateDependents, findOwnerDependents, fixtureSync, seedCaptureFixture,
+  claimDirty, ackDirty, eventKeys, measureDirtyQueue,
 } from "../prototypes/catalog-write-capture";
 
 test("actual JSON upsert plus difference deletion captures only relevant row changes", async t => {
@@ -118,4 +119,80 @@ test("REPLACE with recursive triggers off demonstrates a missing tombstone; it i
   assert.equal(events.length, 1);
   assert.equal(events[0].old_name, null, "the implicit deletion did not run the delete trigger");
   assert.equal(events[0].new_name, "replacement.example");
+});
+
+test("an in-flight old claim cannot acknowledge a re-dirtied key, even after it is claimed again", async t => {
+  const { d1 } = await testDatabase(t);
+  await seedCaptureFixture(d1, 10);
+  await installCapture(d1, "dirty");
+  const update = (date: string) => d1.prepare("UPDATE domains_cache SET expires_at=? WHERE id=1").bind(date).run();
+  await update("2027-02-01");
+  const first = await claimDirty(d1, 0);
+  assert.equal(first.keys.length, 2);
+  assert.equal((await claimDirty(d1, 1)).keys.length, 0);
+  await update("2027-03-01");
+  assert.equal((await ackDirty(d1, 2, first)).removed, 0);
+  const second = await claimDirty(d1, 3);
+  assert.deepEqual(second.keys, first.keys);
+  assert.notEqual(first.token, second.token);
+  assert.equal((await ackDirty(d1, 4, first)).removed, 0);
+  assert.equal((await ackDirty(d1, 5, second)).removed, 2);
+  await update("2027-04-01");
+  const third = await claimDirty(d1, 6);
+  assert.equal((await ackDirty(d1, 7, second)).removed, 0, "delete and re-insert must not resurrect an old claim");
+  assert.equal((await ackDirty(d1, 30_006, third)).removed, 0, "expired claims cannot ack");
+  const recovered = await claimDirty(d1, 30_006);
+  assert.deepEqual(recovered.keys, third.keys);
+  assert.equal((await ackDirty(d1, 30_007, recovered)).removed, 2);
+});
+
+test("rollback preserves the previously claimed work and does not leak new raw keys or date scopes", async t => {
+  const { d1 } = await testDatabase(t);
+  await seedCaptureFixture(d1, 10);
+  await installCapture(d1, "dirty");
+  await d1.prepare("UPDATE domains_cache SET expires_at='2027-02-01' WHERE id=1").run();
+  const claim = await claimDirty(d1, 0);
+  await assert.rejects(() => d1.batch([
+    d1.prepare("UPDATE domains_cache SET full_domain='never-commit.example' WHERE id=1"),
+    d1.prepare("UPDATE domain_date_overrides SET full_domain='never-commit.example' WHERE id=1"),
+    d1.prepare("UPDATE domains_cache SET account_id=-1 WHERE id=2"),
+  ]), /FOREIGN KEY/);
+  assert.equal((await claimDirty(d1, 1)).keys.length, 0);
+  assert.equal((await ackDirty(d1, 2, claim)).removed, 2);
+  assert.equal((await claimDirty(d1, 3)).keys.length, 0);
+});
+
+test("coalescing preserves all raw rename and cascade keys even when no intermediate row survives", async t => {
+  const journal = await testDatabase(t), dirty = await testDatabase(t);
+  for (const [db, mode] of [[journal.d1, "journal"], [dirty.d1, "dirty"]] as const) {
+    await seedCaptureFixture(db, 10);
+    await installCapture(db, mode);
+    await db.batch([
+      db.prepare("UPDATE domains_cache SET full_domain='intermediate.example' WHERE id=1"),
+      db.prepare("UPDATE domains_cache SET id=101,full_domain='new.example' WHERE id=1"),
+      db.prepare("UPDATE domain_date_overrides SET full_domain='new.example' WHERE id=1"),
+      db.prepare("INSERT INTO cache(key,value,expires_at) VALUES(?,'fixture',1)").bind(`${RDAP_CACHE_PREFIX}新.example`),
+      db.prepare("UPDATE cache SET key='api_cache:dns:1' WHERE key=?").bind(`${RDAP_CACHE_PREFIX}新.example`),
+      db.prepare("DELETE FROM accounts WHERE id=1"),
+    ]);
+  }
+  const set = (keys: ReturnType<typeof eventKeys>) => [...new Set(keys.map(({ kind, key }) => JSON.stringify([kind,key])))].sort();
+  const claim = await claimDirty(dirty.d1, 0);
+  assert.deepEqual(set(claim.keys), set((await readJournal(journal.d1)).flatMap(eventKeys)));
+  assert.ok(claim.keys.some(row => row.kind === "name" && row.key === "intermediate.example"));
+  assert.ok(claim.keys.some(row => row.kind === "domains_cache" && row.key === 101));
+  assert.ok(claim.keys.some(row => row.kind === "date" && row.key === "新.example"));
+});
+
+test("bounded dirty claims and log pages deliver the same keys at different backlog sizes", async t => {
+  const journal = await testDatabase(t), dirty = await testDatabase(t);
+  const a = await measureDirtyQueue(journal.d1, 300, "journal");
+  const b = await measureDirtyQueue(dirty.d1, 300, "dirty");
+  for (const phase of ["sync", "hot", "cascade"] as const) {
+    assert.equal(a[phase].digest, b[phase].digest);
+    assert.equal(a[phase].distinctKeys, b[phase].distinctKeys);
+  }
+  assert.equal(a.hot.queued, 500);
+  assert.equal(b.hot.queued, 40);
+  assert.ok(b.cascade.queued > a.cascade.queued, "ID and name keys can amplify low-duplication work");
 });

@@ -106,6 +106,7 @@ const harnessOutput = await build({ stdin: { contents: `import worker from "./di
   import {semanticFixture,selectionFixture} from "./tests/helpers/catalog-semantic-fixture";
   import {normalizeDomainKey} from "./shared/domain-keys";
   import {CatalogProjectionPrototype} from "./tests/prototypes/catalog-projection";
+  import {measureCapture} from "./tests/prototypes/catalog-write-capture";
   import {captureProjectionInput} from "./tests/prototypes/catalog-projection-capture";
   import {DatabaseManager} from "./src/db";
   import {DomainCatalogRepository} from "./src/repositories/domain-catalog-repository";
@@ -144,6 +145,10 @@ const harnessOutput = await build({ stdin: { contents: `import worker from "./di
     return [...new Uint8Array(digest)].map(value=>value.toString(16).padStart(2,"0")).join("");
   }
   export default { async fetch(request, env, ctx) {
+    if (new URL(request.url).pathname === "/__test_capture") {
+      if (!await new DatabaseManager(env.CAPTURE_DB).ensureTables()) throw new Error("Capture fixture schema unavailable");
+      return Response.json(await measureCapture(env.CAPTURE_DB,100,true));
+    }
     if (new URL(request.url).pathname === "/__test_projection") {
       const now=Date.parse("2026-11-24T00:00:00Z");
       const manager=new DatabaseManager(env.DB),captured=await captureProjectionInput(manager,now);
@@ -204,7 +209,7 @@ let workerDeliveries = 0;
 let mockError = "";
 const mf = new Miniflare(convertV4MiniflareOptions({
   modules: true, script: harnessScript,
-  compatibilityDate: date, d1Databases: ["DB"], bindings: { AES_KEY: key, SETUP_TOKEN: setupToken },
+  compatibilityDate: date, d1Databases: ["DB", "CAPTURE_DB"], bindings: { AES_KEY: key, SETUP_TOKEN: setupToken },
   outboundService: async request => {
     try {
       assert.equal(new URL(request.url).hostname, "notification-smoke.invalid", "Runtime smoke must never contact a real provider");
@@ -269,6 +274,16 @@ try {
   assert.equal(projectionBody.cases, 9);
   assert.equal(projectionBody.rows, 4);
   console.log("[runtime-smoke] isolated workerd/D1 JSON and folded projection, real repository capture and 9 offset/source cases passed");
+  const capture = await fetcher("/__test_capture");
+  assert.equal(capture.status, 200, await capture.clone().text());
+  const costs = await capture.json();
+  assert.equal(costs.syncReplay.events, 30);
+  assert.equal(costs.syncReplay.changes, 20);
+  assert.equal(costs.repeatReplay.events, 0);
+  assert.equal(costs.dateReplay.events, 1);
+  assert.equal(costs.cascadeReplay.events, 102);
+  assert.equal(costs.cascadeReplay.changes, 100);
+  console.log("[runtime-smoke] isolated workerd/D1 change journal and dependency write accounting passed");
 }
 finally { await mf.dispose(); }
 

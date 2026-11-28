@@ -293,9 +293,9 @@ export class DatabaseManager {
     if (fingerprint) await this.checkCloudflareFingerprint(accountId, fingerprint);
     return cloudflareSyncDao.claimCloudflareSync(this.db, accountId, fingerprint);
   }
-  async commitCloudflareSyncPage(accountId: number, lease: cloudflareSyncDao.CloudflareSyncLease, domains: UpstreamSubdomain[], page: { hasMore: boolean; nextPage: number }, guard?: { sql: string; bindings: unknown[] }): Promise<void> {
+  async commitCloudflareSyncPage(accountId: number, lease: cloudflareSyncDao.CloudflareSyncLease, domains: UpstreamSubdomain[], page: { hasMore: boolean; nextPage: number }, planJob?: cloudflareSyncDao.CloudflareJobCheckpoint): Promise<void> {
     if (lease.fingerprint) await this.checkCloudflareFingerprint(accountId, lease.fingerprint);
-    return cloudflareSyncDao.commitCloudflareSyncPage(this.db, accountId, lease, domains, page, guard);
+    return cloudflareSyncDao.commitCloudflareSyncPage(this.db, accountId, lease, domains, page, planJob);
   }
   async releaseCloudflareSync(accountId: number, lease: cloudflareSyncDao.CloudflareSyncLease): Promise<void> {
     return cloudflareSyncDao.releaseCloudflareSync(this.db, accountId, lease);

@@ -112,6 +112,7 @@ const harnessOutput = await build({ stdin: { contents: `import worker from "./di
   import {DomainCatalogRepository} from "./src/repositories/domain-catalog-repository";
   import {DomainCatalogService} from "./src/services/domain-catalog-service";
   import {seedSnapshotFixture} from "./tests/helpers/snapshot-write-fixture";
+  import {exercisePageCheckpoint} from "./tests/helpers/queued-cf-page-smoke";
   function validateRecent(input,recent) {
     const first=new Map();
     const sources=[
@@ -146,6 +147,9 @@ const harnessOutput = await build({ stdin: { contents: `import worker from "./di
     return [...new Uint8Array(digest)].map(value=>value.toString(16).padStart(2,"0")).join("");
   }
   export default { async fetch(request, env, ctx) {
+    if (new URL(request.url).pathname === "/__test_page_checkpoint") {
+      return Response.json(await exercisePageCheckpoint(env.SNAPSHOT_DB));
+    }
     if (new URL(request.url).pathname === "/__test_snapshot_write") {
       const manager=new DatabaseManager(env.SNAPSHOT_DB);
       if (!await manager.ensureTables()) throw new Error("Snapshot fixture unavailable");
@@ -317,6 +321,10 @@ try {
   assert.equal(snapshotWrite.status, 200, await snapshotWrite.clone().text());
   assert.deepEqual(await snapshotWrite.json(), { n: 100, stale: 0, changed: 1, phase: "renew" });
   console.log("[runtime-smoke] workerd/D1 snapshot payload, observation times and atomic checkpoint passed");
+  const queuePage = await fetcher("/__test_page_checkpoint");
+  assert.equal(queuePage.status, 200, await queuePage.clone().text());
+  assert.deepEqual(await queuePage.json(), { phase: "done", total: 1, page: 3 });
+  console.log("[runtime-smoke] workerd/D1 CF page, outer job cursor, rollback and retry passed");
 }
 finally { await mf.dispose(); }
 

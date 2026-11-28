@@ -232,6 +232,24 @@ test("quota cache refresh updates only its account and never gates domain progre
   assert.equal(values.find((row: { account_id: number }) => row.account_id === 1).available, 9);
 });
 
+test("losing the work lease after journaling but before renewal prevents the outbound POST", async t => {
+  const data = await fixture(t, [1], 1);
+  const client = data.clients.get(1)!;
+  const expires_at = new Date(Date.now() + 86400000).toISOString();
+  client.listSubdomains = async () => ({ success: true, subdomains: [{ ...domain(10000), expires_at }], total: 1 });
+  let posts = 0;
+  client.renewSubdomain = async () => { posts++; return { success: false, message: "must not send" }; };
+  const action = await data.queue.enqueue({ label: "renew lease", accountIds: [1], renew: true });
+  const check = data.queue.ownsRenewalAttempt.bind(data.queue);
+  t.mock.method(data.queue, "ownsRenewalAttempt", async (...args: Parameters<typeof check>) => {
+    await data.queue.control(action, "pause"); // a separate committed transaction
+    return check(...args);
+  });
+  assert.equal((await data.drain(action)).status, "paused");
+  assert.equal(posts, 0);
+  assert.equal(data.sqlite.prepare("SELECT status FROM sync_renew_journal").get()?.status, "attempting");
+});
+
 test("job deadline ends permanently queued work instead of reserving an account forever", async t => {
   const { queue, advance, actions } = await fixture(t);
   const id = await queue.enqueue({ label: "deadline", accountIds: [1] });
@@ -276,6 +294,88 @@ test("progress checkpoints reset transient failure streaks instead of accumulati
   assert.equal(second.failures, 1);
   await queue.checkpoint(second, { phase: "list", page: 2, total: 25 });
   assert.equal((await queue.jobs(id))[0].failures, 0);
+});
+
+test("a staged page and its cursor cannot split at the lease boundary", async t => {
+  const { queue, d1, sqlite } = await fixture(t);
+  await queue.enqueue({ label: "page boundary", accountIds: [1] });
+  const work = (await queue.claim())!;
+  let at = work.lease_until - 1;
+  const edge = new SyncWorkQueue(d1, () => at++);
+  let rejected = false;
+  try { await edge.stage(work, [domain(17)], { phase: "dns", page: 2, total: 1 }, false); }
+  catch { rejected = true; }
+  const staged = sqlite.prepare("SELECT COUNT(*) AS n FROM sync_rows WHERE job_id=?").get(work.id)?.n;
+  const saved = JSON.parse((await queue.jobs(work.action_id))[0].cursor);
+  assert.deepEqual({ staged, phase: saved.phase }, rejected ? { staged: 0, phase: "start" } : { staged: 1, phase: "dns" });
+  assert.equal(rejected, false, "the admission sample is one millisecond before expiry");
+});
+
+test("queued Cloudflare final-page inventory and generation cleanup roll back if the outer job cursor cannot commit", async t => {
+  const { queue, manager, sqlite, step, advance, actions } = await fixture(t);
+  await manager.executeRaw("UPDATE accounts SET provider='cloudflare' WHERE id=1");
+  const client = new CloudflareClient("fixture");
+  const requests: number[] = [];
+  client.listZones = async ({ startPage = 1 } = {}) => {
+    requests.push(startPage);
+    return { zones: [{ id: `atomic-${startPage}`, name: `atomic-${startPage}.example`, status: "active" }],
+      hasMore: startPage === 1, nextPage: startPage + 1 };
+  };
+  manager.getClientForAccount = async () => ({ client, alias: "fixture", provider: "cloudflare" });
+  await manager.upsertDomain(1, domain(42));
+  const action = await queue.enqueue({ label: "atomic CF page", accountIds: [1] });
+  await step(); // start -> cf
+  await step(); // page 1 commits both cursors
+  sqlite.exec(`CREATE TRIGGER fail_outer_cursor BEFORE UPDATE OF cursor ON sync_work
+    WHEN json_extract(NEW.cursor,'$.phase')='done' BEGIN SELECT RAISE(ABORT,'fixture outer cursor failure'); END`);
+  await step();
+  assert.deepEqual(JSON.parse((await queue.jobs(action))[0].cursor), { phase: "cf", page: 2, total: 1 });
+  assert.deepEqual(sqlite.prepare("SELECT full_domain FROM domains_cache ORDER BY full_domain").all().map(row => row.full_domain), ["atomic-1.example", "d42.us.ci"]);
+  assert.equal(sqlite.prepare("SELECT next_page FROM cf_sync_state WHERE account_id=1").get()?.next_page, 2);
+  assert.equal(sqlite.prepare("SELECT seen FROM cf_sync_seen WHERE domain_id=42").get()?.seen, 0);
+  sqlite.exec("DROP TRIGGER fail_outer_cursor");
+  advance(60001); await step();
+  assert.deepEqual(requests, [1, 2, 2]);
+  assert.equal((await actions.get(action))?.status, "completed");
+  assert.equal(sqlite.prepare("SELECT COUNT(*) n FROM cf_sync_state").get()?.n, 0);
+  assert.deepEqual(sqlite.prepare("SELECT full_domain FROM domains_cache ORDER BY full_domain").all().map(row => row.full_domain),
+    ["atomic-1.example", "atomic-2.example"]);
+});
+
+test("CF page fetched across queue lease expiry is rejected while its CF generation still has a valid lease", async t => {
+  const { queue, manager, sqlite, step, advance } = await fixture(t);
+  await manager.executeRaw("UPDATE accounts SET provider='cloudflare' WHERE id=1");
+  const client = new CloudflareClient("fixture");
+  client.listZones = async () => {
+    advance(SYNC_LEASE_MS);
+    return { zones: [], hasMore: false, nextPage: 2 };
+  };
+  manager.getClientForAccount = async () => ({ client, alias: "fixture", provider: "cloudflare" });
+  await manager.upsertDomain(1, domain(42));
+  const action = await queue.enqueue({ label: "expired while fetching", accountIds: [1] });
+  await step(); await step();
+  assert.equal(sqlite.prepare("SELECT COUNT(*) n FROM domains_cache WHERE id=42").get()?.n, 1);
+  assert.equal(sqlite.prepare("SELECT next_page FROM cf_sync_state WHERE account_id=1").get()?.next_page, 1);
+  assert.equal(JSON.parse((await queue.jobs(action))[0].cursor).phase, "cf");
+});
+
+test("four DNS observations and their low-water mark commit together on the last eligible tick", async t => {
+  const data = await fixture(t, [1], 4);
+  const action = await data.queue.enqueue({ label: "dns clock edge", accountIds: [1] });
+  await data.step(); await data.step(); // begin, then stage authoritative list
+  data.advance(2000); // next slice is due
+  const at = data.now();
+  let edge: number | undefined;
+  data.clients.get(1)!.listDnsRecords = async () => {
+    edge = at + SYNC_LEASE_MS - 1;
+    return { success: true, records: [] };
+  };
+  const queue = new SyncWorkQueue(data.d1, () => edge === undefined ? at : edge++);
+  await runOneSyncSlice(data.manager, { queue });
+  const job = (await queue.jobs(action))[0];
+  assert.equal(JSON.parse(job.cursor).checked, 4);
+  assert.equal(data.sqlite.prepare("SELECT COUNT(*) n FROM sync_rows WHERE enriched=1 AND dns_attempts=1").get()?.n, 4);
+  assert.equal(data.sqlite.prepare("SELECT COUNT(*) n FROM cache WHERE key LIKE 'api_cache:dns:%'").get()?.n, 4);
 });
 
 test("paused work restarts its snapshot if credentials changed before resume", async t => {

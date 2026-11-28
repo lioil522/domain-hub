@@ -16,6 +16,12 @@ export interface SyncWork {
   lease_token: string | null; lease_until: number; not_before: number; deadline_at: number; error: string | null;
 }
 export type SyncWorkOptions = { label: string; accountIds: number[]; renew?: boolean; scheduled?: boolean };
+export interface SyncFence { sql: string; bindings: unknown[] }
+export interface SyncCheckpoint {
+  guard: SyncFence;
+  statement(db: D1Database, guard?: SyncFence): D1PreparedStatement;
+  committed(): void;
+}
 export const credentialFingerprint = (account: { provider: string; api_key: string; api_secret: string }) =>
   sha256Hex(canonicalJson([account.provider || "dnshe", account.api_key, account.api_secret]));
 
@@ -108,20 +114,29 @@ export class SyncWorkQueue {
         ORDER BY w.updated_at,w.id LIMIT 1) AND status='queued' RETURNING *`)
       .bind(token, now + SYNC_LEASE_MS, now, now, now).first<SyncWork>();
   }
-  guard(work: SyncWork) {
+  private guard(work: SyncWork, at: number): SyncFence {
     return { sql: `EXISTS(SELECT 1 FROM sync_work WHERE id=? AND status='running' AND lease_token=? AND lease_until>?)`,
-      bindings: [work.id, work.lease_token, this.now()] };
+      bindings: [work.id, work.lease_token, at] };
   }
-  async checkpoint(work: SyncWork, cursor: SyncCursor, statements: D1PreparedStatement[] = [], guard = this.guard(work)) {
-    const results = await this.db.batch([...statements, this.db.prepare(`UPDATE sync_work SET cursor=?,updated_at=?,failures=0 WHERE id=? AND ${guard.sql}`)
-      .bind(JSON.stringify(cursor), this.now(), work.id, ...guard.bindings)]);
-    if (results[results.length - 1].meta.changes !== 1) throw new ConflictError("同步租约已失效，未推进检查点", "sync_lease_expired");
-    work.cursor = JSON.stringify(cursor);
-    work.failures = 0;
+  // Create only after upstream I/O and any async preparation. Every write in
+  // this batch checks the live token against the SAME admission timestamp.
+  planCheckpoint(work: SyncWork, cursor: SyncCursor): SyncCheckpoint {
+    const serialized = JSON.stringify(cursor), at = this.now(), guard = this.guard(work, at);
+    return {
+      guard,
+      statement: (db, fence = guard) => db.prepare(`UPDATE sync_work SET cursor=?,updated_at=?,failures=0 WHERE id=? AND ${fence.sql}`)
+        .bind(serialized, at, work.id, ...fence.bindings),
+      committed() { work.cursor = serialized; work.failures = 0; },
+    };
+  }
+  async checkpoint(work: SyncWork, cursor: SyncCursor, writes?: (guard: SyncFence) => D1PreparedStatement[]) {
+    const plan = this.planCheckpoint(work, cursor);
+    const results = await this.db.batch([...(writes?.(plan.guard) ?? []), plan.statement(this.db)]);
+    if (results.at(-1)?.meta.changes !== 1) throw new ConflictError("同步租约已失效，未推进检查点", "sync_lease_expired");
+    plan.committed();
   }
   async begin(work: SyncWork, phase: string) {
-    const guard = this.guard(work);
-    await this.checkpoint(work, { phase, page: 1, total: 0 }, [
+    await this.checkpoint(work, { phase, page: 1, total: 0 }, guard => [
       this.db.prepare(`DELETE FROM sync_rows WHERE job_id=? AND ${guard.sql}`).bind(work.id, ...guard.bindings),
       this.db.prepare(`DELETE FROM sync_candidates WHERE job_id=? AND ${guard.sql}`).bind(work.id, ...guard.bindings),
       this.db.prepare(`INSERT INTO sync_candidates(job_id,domain_id) SELECT ?,id FROM domains_cache WHERE account_id=? AND ${guard.sql}`)
@@ -129,9 +144,8 @@ export class SyncWorkQueue {
     ]);
   }
   async stage(work: SyncWork, rows: UpstreamSubdomain[], cursor: SyncCursor, enriched: boolean) {
-    const guard = this.guard(work);
     if ((cursor.total || 0) > 10000) throw new ValidationError("单账号同步超过 10,000 行预算，未执行差集删除");
-    await this.checkpoint(work, cursor, [
+    await this.checkpoint(work, cursor, guard => [
       this.db.prepare(`INSERT INTO sync_rows(job_id,domain_id,payload,enriched)
         SELECT ?,json_extract(value,'$.id'),value,? FROM json_each(?) WHERE ${guard.sql}`)
         .bind(work.id, enriched ? 1 : 0, JSON.stringify(rows), ...guard.bindings),
@@ -141,17 +155,23 @@ export class SyncWorkQueue {
     return (await this.db.prepare("SELECT domain_id,payload,dns_attempts FROM sync_rows WHERE job_id=? AND enriched=0 ORDER BY domain_id LIMIT 4")
       .bind(work.id).all<{ domain_id: number; payload: string; dns_attempts: number }>()).results;
   }
+  async ownsRenewalAttempt(work: SyncWork, domain: UpstreamSubdomain) {
+    const fence = this.guard(work, this.now());
+    return !!await this.db.prepare(`SELECT 1 FROM sync_renew_journal
+      WHERE account_id=? AND domain_id=? AND full_domain=? AND original_expiry=? AND status='attempting'
+        AND request_token=? AND ${fence.sql}`)
+      .bind(work.account_id, domain.id, domain.full_domain, domain.expires_at || "", work.lease_token, ...fence.bindings).first();
+  }
   async writeDomains(work: SyncWork, next: SyncCursor) {
-    const guard = this.guard(work);
-    await this.checkpoint(work, next, [
+    await this.checkpoint(work, next, guard => [
       ...stagedDomainWrites(this.db, work.account_id, work.id, guard),
       this.db.prepare(`DELETE FROM domains_cache WHERE account_id=? AND id IN (SELECT domain_id FROM sync_candidates WHERE job_id=?)
         AND id NOT IN(SELECT domain_id FROM sync_rows WHERE job_id=?) AND ${guard.sql}`)
         .bind(work.account_id, work.id, work.id, ...guard.bindings),
-    ], guard); // A second clock sample must not admit rows but reject their cursor.
+    ]);
   }
   async finish(work: SyncWork, status: "queued" | "completed" | "failed", error: string | null = null, delayMs = 1200, failure = false) {
-    const guard = this.guard(work), now = this.now();
+    const now = this.now(), guard = this.guard(work, now);
     const failures = work.failures + (failure ? 1 : 0);
     if (failure && failures >= SYNC_MAX_FAILURES) status = "failed";
     await this.db.prepare(`UPDATE sync_work SET status=?,failures=?,error=?,lease_token=NULL,lease_until=0,not_before=?,updated_at=?

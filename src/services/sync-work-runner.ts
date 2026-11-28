@@ -5,7 +5,7 @@ import { DigitalPlatClient, mapDomainToUpstream } from "../digitalplat";
 import { listUpstreamDomains } from "../cron/jobs/upstream-sync";
 import { computeDnsState } from "../dns-provider";
 import { syncCloudflareSlice } from "./cloudflare-sync-service";
-import { SyncWorkQueue, credentialFingerprint, type SyncWork, type SyncCursor } from "../db/dao/sync-work-dao";
+import { SyncWorkQueue, credentialFingerprint, type SyncWork, type SyncCursor, type SyncFence } from "../db/dao/sync-work-dao";
 import { ConflictError, NotFoundError, UpstreamRateLimitError, ValidationError } from "../errors";
 import type { WebhookType } from "../cron/notification";
 import { notificationTargets } from "./notification-service";
@@ -36,7 +36,6 @@ async function executeSlice(db: DatabaseManager, queue: SyncWorkQueue, work: Syn
   const { client, provider } = await db.getClientForAccount(work.account_id);
   client.requestSignal = signal;
   const cursor = JSON.parse(work.cursor) as SyncCursor;
-  const guard = () => queue.guard(work);
   const active = () => { if (signal.aborted) throw signal.reason; };
   if (provider === "custom") { await queue.checkpoint(work, { phase: "skipped", total: 0 }); return "completed" as const; }
   if (cursor.phase === "start") {
@@ -56,8 +55,7 @@ async function executeSlice(db: DatabaseManager, queue: SyncWorkQueue, work: Syn
               : { account_id: work.account_id, alias: work.alias, error: quota.message || "配额读取失败" };
           } catch { entry = { account_id: work.account_id, alias: work.alias, error: "配额请求失败，请手动刷新" }; }
           active();
-          const fence = guard();
-          await queue.checkpoint(work, JSON.parse(work.cursor) as SyncCursor, [
+          await queue.checkpoint(work, JSON.parse(work.cursor) as SyncCursor, fence => [
             queue.statement(`UPDATE cache SET value=(SELECT json_group_array(json(value)) FROM
               (SELECT value FROM json_each(cache.value) WHERE json_extract(value,'$.account_id')<>? UNION ALL SELECT ?))
               WHERE key='api_cache:quota' AND ${fence.sql}`, [work.account_id, JSON.stringify(entry), ...fence.bindings]),
@@ -68,9 +66,10 @@ async function executeSlice(db: DatabaseManager, queue: SyncWorkQueue, work: Syn
     return "queued" as const;
   }
   if (cursor.phase === "cf" && client instanceof CloudflareClient) {
-    const page = await syncCloudflareSlice(db, work.account_id, client, 1, guard());
-    active();
-    await queue.checkpoint(work, { phase: page.completed ? "done" : "cf", page: page.nextPage, total: page.totalSynced });
+    const page = await syncCloudflareSlice(db, work.account_id, client, 1, progress => {
+      active();
+      return queue.planCheckpoint(work, { phase: progress.completed ? "done" : "cf", page: progress.nextPage, total: progress.totalSynced });
+    });
     return page.completed ? "completed" as const : "queued" as const;
   }
   if (cursor.phase === "collect") {
@@ -120,22 +119,23 @@ async function executeSlice(db: DatabaseManager, queue: SyncWorkQueue, work: Syn
       }
     }));
     active();
-    const statements: D1PreparedStatement[] = [];
-    for (const result of results) {
-      const row = JSON.parse(result.row.payload) as UpstreamSubdomain, fence = guard();
+    const checked = (cursor.checked || 0) + results.filter(result => result.records || result.row.dns_attempts + 1 >= 3).length;
+    await queue.checkpoint(work, { ...cursor, checked }, fence => results.flatMap(result => {
+      const row = JSON.parse(result.row.payload) as UpstreamSubdomain;
       const attempts = result.row.dns_attempts + 1;
       if (result.records) {
         const payload = { ...row, ...computeDnsState(result.records) };
-        statements.push(queue.statement(`INSERT INTO cache(key,value,expires_at) SELECT ?,?,? WHERE ${fence.sql}
-          ON CONFLICT(key) DO UPDATE SET value=excluded.value,expires_at=excluded.expires_at`,
-          [`api_cache:dns:${row.id}`, JSON.stringify(result.records), Math.floor(Date.now() / 1000) + 366 * 86400, ...fence.bindings]));
-        statements.push(queue.statement(`UPDATE sync_rows SET payload=?,enriched=1,error=NULL,dns_attempts=? WHERE job_id=? AND domain_id=? AND ${fence.sql}`,
-          [JSON.stringify(payload), attempts, work.id, row.id, ...fence.bindings]));
-      } else statements.push(queue.statement(`UPDATE sync_rows SET enriched=?,error=?,dns_attempts=? WHERE job_id=? AND domain_id=? AND ${fence.sql}`,
-        [attempts >= 3 ? 1 : 0, result.error, attempts, work.id, row.id, ...fence.bindings]));
-    }
-    await queue.checkpoint(work, { ...cursor, checked: (cursor.checked || 0) +
-      results.filter(result => result.records || result.row.dns_attempts + 1 >= 3).length }, statements);
+        return [
+          queue.statement(`INSERT INTO cache(key,value,expires_at) SELECT ?,?,? WHERE ${fence.sql}
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value,expires_at=excluded.expires_at`,
+            [`api_cache:dns:${row.id}`, JSON.stringify(result.records), Math.floor(Date.now() / 1000) + 366 * 86400, ...fence.bindings]),
+          queue.statement(`UPDATE sync_rows SET payload=?,enriched=1,error=NULL,dns_attempts=? WHERE job_id=? AND domain_id=? AND ${fence.sql}`,
+            [JSON.stringify(payload), attempts, work.id, row.id, ...fence.bindings]),
+        ];
+      }
+      return [queue.statement(`UPDATE sync_rows SET enriched=?,error=?,dns_attempts=? WHERE job_id=? AND domain_id=? AND ${fence.sql}`,
+        [attempts >= 3 ? 1 : 0, result.error, attempts, work.id, row.id, ...fence.bindings])];
+    }));
     return "queued" as const;
   }
   if (cursor.phase === "write") {
@@ -162,8 +162,7 @@ async function executeSlice(db: DatabaseManager, queue: SyncWorkQueue, work: Syn
         if (journal?.status === "confirmed" && Date.parse(journal.new_expiry || "") > Date.parse(journal.original_expiry)) {
           nextExpiry = journal.new_expiry!;
         } else if (pending.renew_state === "none" && !journal) {
-          const fence = guard();
-          await queue.checkpoint(work, cursor, [
+          await queue.checkpoint(work, cursor, fence => [
             queue.statement(`INSERT INTO sync_renew_journal(account_id,domain_id,full_domain,original_expiry,status,updated_at,request_token)
               SELECT ?,?,?,?,'attempting',?,? WHERE ${fence.sql} ON CONFLICT DO UPDATE SET
                 status='attempting',updated_at=excluded.updated_at,request_token=excluded.request_token
@@ -173,10 +172,8 @@ async function executeSlice(db: DatabaseManager, queue: SyncWorkQueue, work: Syn
               [work.id, sub.id, ...fence.bindings]),
           ]);
           active();
-          const claimed = await db.firstRaw<{ request_token: string }>(`SELECT request_token FROM sync_renew_journal
-            WHERE account_id=? AND domain_id=? AND full_domain=? AND original_expiry=? AND status='attempting'`,
-            [work.account_id, sub.id, sub.full_domain, sub.expires_at || ""]);
-          if (claimed?.request_token !== work.lease_token) return "queued" as const;
+          if (!await queue.ownsRenewalAttempt(work, sub)) return "queued" as const;
+          active(); // A timeout can arrive during the ownership read.
           const response = await client.renewSubdomain(sub.id);
           active();
           if (response.success && Date.parse(response.new_expires_at || "") > Date.parse(sub.expires_at || "")) nextExpiry = response.new_expires_at!;
@@ -191,16 +188,17 @@ async function executeSlice(db: DatabaseManager, queue: SyncWorkQueue, work: Syn
           else throw new Error("续期结果尚未确认，只读核对中；不会重复发送续期请求");
         }
       }
-      const fence = guard();
-      const statements = [queue.statement(`UPDATE sync_rows SET renew_state=? WHERE job_id=? AND domain_id=? AND ${fence.sql}`,
-        [state, work.id, sub.id, ...fence.bindings])];
-      statements.push(queue.statement(`UPDATE sync_renew_journal SET status=?,updated_at=?,new_expiry=COALESCE(?,new_expiry)
-        WHERE account_id=? AND domain_id=? AND full_domain=? AND status='attempting' AND ${fence.sql}`,
-        [nextExpiry ? "confirmed" : state === "failed" || state === "deferred" ? "failed" : "attempting",
-          Date.now(), nextExpiry || null, work.account_id, sub.id, sub.full_domain, ...fence.bindings]));
-      if (nextExpiry) statements.push(queue.statement(`UPDATE domains_cache SET expires_at=?,last_renewed_at=CURRENT_TIMESTAMP
-        WHERE id=? AND account_id=? AND ${fence.sql}`, [nextExpiry, sub.id, work.account_id, ...fence.bindings]));
-      await queue.checkpoint(work, cursor, statements);
+      await queue.checkpoint(work, cursor, fence => {
+        const statements = [queue.statement(`UPDATE sync_rows SET renew_state=? WHERE job_id=? AND domain_id=? AND ${fence.sql}`,
+          [state, work.id, sub.id, ...fence.bindings])];
+        statements.push(queue.statement(`UPDATE sync_renew_journal SET status=?,updated_at=?,new_expiry=COALESCE(?,new_expiry)
+          WHERE account_id=? AND domain_id=? AND full_domain=? AND status='attempting' AND ${fence.sql}`,
+          [nextExpiry ? "confirmed" : state === "failed" || state === "deferred" ? "failed" : "attempting",
+            Date.now(), nextExpiry || null, work.account_id, sub.id, sub.full_domain, ...fence.bindings]));
+        if (nextExpiry) statements.push(queue.statement(`UPDATE domains_cache SET expires_at=?,last_renewed_at=CURRENT_TIMESTAMP
+          WHERE id=? AND account_id=? AND ${fence.sql}`, [nextExpiry, sub.id, work.account_id, ...fence.bindings]));
+        return statements;
+      });
       return "queued" as const;
     }
   }
@@ -211,16 +209,16 @@ async function executeSlice(db: DatabaseManager, queue: SyncWorkQueue, work: Syn
   if (cursor.phase === "notify") {
     const renewals = await db.firstRaw<{ failed: number; count: number }>(
       "SELECT SUM(renew_state='failed') failed,COUNT(*) count FROM sync_rows WHERE job_id=? AND renew_state IN ('done','failed','deferred')", [work.id]);
-    const statements: D1PreparedStatement[] = [];
+    let writes: ((fence: SyncFence) => D1PreparedStatement[]) | undefined;
     if (renewals?.count) {
       const cfg = await db.getAllAppSettings();
       const text = `【域名同步与续期报告】账号 [${work.alias}]：同步 ${cursor.total || 0} 个域名；续期失败 ${renewals.failed || 0} 个。`;
-      statements.push(...await db.notificationOutbox().prepare([{ key: `sync-renew:${work.id}`, message: text }],
-        notificationTargets(cfg, options), guard));
+      writes = await db.notificationOutbox().prepareWrites([{ key: `sync-renew:${work.id}`, message: text }],
+        notificationTargets(cfg, options));
     }
     active();
     // A cancelled/expired sync executor cannot enqueue or advance the checkpoint.
-    await queue.checkpoint(work, { phase: "done", total: cursor.total }, statements);
+    await queue.checkpoint(work, { phase: "done", total: cursor.total }, writes);
     return "queued" as const;
   }
   if (cursor.phase === "done") {

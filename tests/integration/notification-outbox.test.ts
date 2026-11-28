@@ -194,6 +194,30 @@ test("scan checkpoint failure leaves no outbox rows and the same page is safely 
   assert.equal((await data.manager.firstRaw<{ last_id: number }>("SELECT last_id FROM notification_scans"))?.last_id, 0);
   assert.equal(await runExpiryReminderSlice(data.manager, { outbox: data.outbox, now: data.now }), 3);
 });
+
+test("expiry scan uses one post-encryption lease sample for encrypted events and its cursor", async t => {
+  const data = await expiryData(t);
+  const start = data.now(); let calls = 0;
+  const clock = () => calls++ === 0 ? start : start + NOTIFICATION_LEASE_MS - 1 + (calls - 2);
+  assert.equal(await runExpiryReminderSlice(data.manager, { outbox: data.outbox, now: clock }), 3);
+  assert.equal((await data.outbox.list()).length, 3);
+  assert.equal((await data.manager.firstRaw<{ completed: number }>("SELECT completed FROM notification_scans"))?.completed, 1);
+});
+
+test("encryption finishing at lease expiry cannot enqueue or complete the scan; the next collector can retry", async t => {
+  const data = await expiryData(t);
+  const prepare = data.outbox.prepareWrites.bind(data.outbox);
+  const delay = t.mock.method(data.outbox, "prepareWrites", async (...args: Parameters<typeof prepare>) => {
+    const writes = await prepare(...args);
+    data.advance(NOTIFICATION_LEASE_MS);
+    return writes;
+  });
+  await assert.rejects(() => runExpiryReminderSlice(data.manager, { outbox: data.outbox, now: data.now }), /租约/);
+  assert.equal((await data.outbox.list()).length, 0);
+  assert.equal((await data.manager.firstRaw<{ completed: number }>("SELECT completed FROM notification_scans"))?.completed, 0);
+  delay.mock.restore();
+  assert.equal(await runExpiryReminderSlice(data.manager, { outbox: data.outbox, now: data.now }), 3);
+});
 test("config read/decryption failure cannot mark the day complete or overwrite settings", async t => {
   const data = await expiryData(t);
   const failing = new DatabaseManager(failDatabaseOperation(data.d1, sql => sql.includes("WHERE key LIKE 'cfg_%'"), "all"), TEST_AES_KEY);

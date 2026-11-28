@@ -43,7 +43,12 @@ export class NotificationOutbox {
   statement(sql: string, bindings: unknown[] = []) { return this.db.prepare(sql).bind(...bindings); }
 
   async prepare(events: NotificationEvent[], targets: NotificationTarget[], fence?: NotificationFence | (() => NotificationFence)): Promise<D1PreparedStatement[]> {
-    if (!events.length || !targets.length) return [];
+    const writes = await this.prepareWrites(events, targets);
+    return writes(typeof fence === "function" ? fence() : fence);
+  }
+  /** Encrypt first; bind a producer's lease only when assembling its checkpoint. */
+  async prepareWrites(events: NotificationEvent[], targets: NotificationTarget[]): Promise<(fence?: NotificationFence) => D1PreparedStatement[]> {
+    if (!events.length || !targets.length) return () => [];
     if (events.length > 100 || targets.length > 2) throw new ValidationError("通知入队超出切片预算");
     targets.forEach(validateNotificationTarget);
     const ids = await Promise.all(targets.map(notificationTargetId));
@@ -73,19 +78,18 @@ export class NotificationOutbox {
         }
       }
     }
-    const statements: D1PreparedStatement[] = [];
-    const currentFence = typeof fence === "function" ? fence() : fence;
     // Limit JSON parameters and statement count, even for multi-part events.
+    const chunks: string[] = [];
     for (let offset = 0; offset < rows.length; offset += 10) {
-      statements.push(this.statement(`INSERT INTO notification_outbox
+      chunks.push(JSON.stringify(rows.slice(offset, offset + 10)));
+    }
+    if (chunks.length > 30) throw new ValidationError("通知分片过多，请缩小生产批次");
+    return fence => chunks.map(chunk => this.statement(`INSERT INTO notification_outbox
         (id,event_key,channel,target_id,payload_cipher,status,not_before,deadline_at,created_at,updated_at)
         SELECT json_extract(value,'$.id'),json_extract(value,'$.event'),json_extract(value,'$.channel'),
           json_extract(value,'$.target'),json_extract(value,'$.cipher'),'queued',?,json_extract(value,'$.deadline'),?,?
-        FROM json_each(?) WHERE ${currentFence?.sql || "1=1"} ON CONFLICT(id) DO NOTHING`,
-        [now, now, now, JSON.stringify(rows.slice(offset, offset + 10)), ...(currentFence?.bindings || [])]));
-    }
-    if (statements.length > 30) throw new ValidationError("通知分片过多，请缩小生产批次");
-    return statements;
+        FROM json_each(?) WHERE ${fence?.sql || "1=1"} ON CONFLICT(id) DO NOTHING`,
+        [now, now, now, chunk, ...(fence?.bindings || [])]));
   }
   async enqueue(events: NotificationEvent[], targets: NotificationTarget[], additional: D1PreparedStatement[] = [], fence?: NotificationFence) {
     const statements = [...additional, ...await this.prepare(events, targets, fence)];

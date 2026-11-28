@@ -70,15 +70,17 @@ export async function runExpiryReminderSlice(db: DatabaseManager, options: Notif
         deadlineAt: now + 2 * 86400000,
       });
     }
+    const writes = await outbox.prepareWrites(events, targets);
     if (options.signal?.aborted) throw new Error("到期检查已中断");
-    const fence = () => ({ sql: "EXISTS(SELECT 1 FROM notification_scans WHERE id='expiry' AND lease_token=? AND lease_until>?)",
-      bindings: [token, clock()] });
+    const at = clock();
+    const owned = "id='expiry' AND lease_token=? AND lease_until>?";
+    const fence = { sql: `EXISTS(SELECT 1 FROM notification_scans WHERE ${owned})`, bindings: [token, at] };
     const last = batch.at(-1), complete = candidates.length <= EXPIRY_SCAN_BATCH;
     const results = await outbox.commit([
-      ...await outbox.prepare(events, targets, fence),
+      ...writes(fence),
       outbox.statement(`UPDATE notification_scans SET last_kind=?,last_id=?,completed=?,lease_until=0,updated_at=?
-        WHERE id='expiry' AND lease_token=? AND lease_until>?`,
-        [last?.kind || state.last_kind, last?.id || state.last_id, complete ? 1 : 0, clock(), token, clock()]),
+        WHERE ${owned}`,
+        [last?.kind || state.last_kind, last?.id || state.last_id, complete ? 1 : 0, at, ...fence.bindings]),
     ]);
     if (results.at(-1)?.meta.changes !== 1) throw new ConflictError("到期扫描租约失效，未推进检查点");
     if (events.length) await db.writeLog("info", "renew", `到期检查已持久化 ${events.length} 条提醒事件（通道独立去重与投递），本轮检查 ${batch.length} 条`);

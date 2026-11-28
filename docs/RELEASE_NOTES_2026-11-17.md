@@ -59,3 +59,4 @@ Docker 修复后再次通过全量验证（192 个用例），并用打包后的
 - [事务内变更捕获与依赖索引写入成本（隔离实验）](./CATALOG_WRITE_CAPTURE.md)
 - [追加日志与脏键表：写入成本和过期确认对照（隔离实验）](./CATALOG_DIRTY_KEYS.md)
 - [持久同步快照：保留观察时间，减少未变库存的索引写入](./SYNC_SNAPSHOT_WRITES.md)
+- [同步租约边界：页写入、Cloudflare 分页和通知检查点的原子提交](./SYNC_CHECKPOINT_ATOMICITY.md)

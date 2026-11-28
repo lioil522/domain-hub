@@ -11,6 +11,8 @@ import { ActionService } from "../../src/services/action-service";
 import { providerFetch } from "../../src/providers/provider-fetch";
 import { mapZoneToUpstream } from "../../src/cloudflare";
 import { getClientForAccount } from "../../src/db/dao/account-dao";
+import { DatabaseManager } from "../../src/db";
+import { VercelClient } from "../../src/vercel";
 import worker from "../../src/index";
 
 const domain = (id: number) => ({ id, subdomain: `d${id}`, rootdomain: "us.ci", full_domain: `d${id}.us.ci`, status: "active", expires_at: "2035-01-01" });
@@ -205,6 +207,185 @@ test("Cloudflare queue follows shared durable pages through one action", async t
   assert.equal((await drain(id)).status, "completed");
   assert.equal((await manager.getDomains("", "", 1, "cloudflare")).length, 4);
 });
+
+test("account rotation itself revokes the old lease before a replacement is enqueued", async t => {
+  const { queue, manager, clients } = await fixture(t);
+  t.mock.method(DNSHEClient.prototype, "getQuota", clients.get(1)!.getQuota);
+  const action = await queue.enqueue({ label: "rotation", accountIds: [1] });
+  const work = (await queue.claim())!;
+  await manager.upsertDomain(1, domain(42));
+  await queue.begin(work, "list");
+  await queue.stage(work, [domain(99)], { phase: "write", total: 1 }, true);
+  await manager.updateAccount(1, "", "replacement-key", "replacement-secret");
+  const job = (await queue.jobs(action))[0];
+  assert.deepEqual({ status: job.status, lease: job.lease_token === null, cursor: job.cursor,
+    inventory: (await manager.getDomains()).map(row => row.id) },
+  { status: "cancelled", lease: true, cursor: work.cursor, inventory: [42] });
+  await assert.rejects(() => queue.writeDomains(work, { phase: "done" }), /租约/);
+  const fresh = await queue.enqueue({ label: "replacement", accountIds: [1] });
+  const owner = (await queue.claim())!;
+  await queue.finish(work, "completed");
+  assert.equal((await queue.jobs(fresh))[0].lease_token, owner.lease_token);
+  assert.deepEqual((await manager.getDomains()).map(row => row.id), [42]);
+});
+
+for (const change of ["rotate", "delete", "rename", "stored binding"] as const) {
+  test(`DNS response crossing ${change} respects the committed account binding`, async t => {
+    const { queue, manager, clients, step, sqlite } = await fixture(t, [1], 1);
+    const action = await queue.enqueue({ label: "DNS", accountIds: [1] });
+    await step(); await step();
+    const before = (await queue.jobs(action))[0].cursor;
+    const started = deferred<void>(), release = deferred<void>();
+    clients.get(1)!.listDnsRecords = async () => { started.resolve(); await release.promise; return { success: true, records: [] }; };
+    const pending = step();
+    await started.promise;
+    if (change === "delete") await manager.deleteAccount(1);
+    if (change === "rename") await manager.updateAccount(1, "renamed");
+    if (change === "stored binding") await manager.executeRaw("UPDATE accounts SET api_secret='plain:Zml4dHVyZQ==' WHERE id=1");
+    if (change === "rotate") {
+      t.mock.method(DNSHEClient.prototype, "getQuota", clients.get(1)!.getQuota);
+      await manager.updateAccount(1, "", "changed", "fixture");
+    }
+    if (change !== "delete") await manager.setCache("api_cache:dns:10000", '["sentinel"]');
+    release.resolve(); await pending;
+    const job = (await queue.jobs(action))[0];
+    assert.equal(job.status, change === "rename" ? "queued" : "cancelled");
+    assert.equal(await manager.getCache("api_cache:dns:10000"), change === "rename" ? "[]" : change === "delete" ? null : '["sentinel"]');
+    assert.equal(sqlite.prepare("SELECT enriched FROM sync_rows WHERE job_id=?").get(job.id)?.enriched, change === "rename" ? 1 : 0);
+    if (change === "rename") assert.equal(JSON.parse(job.cursor).checked, 1);
+    else assert.equal(job.cursor, before);
+  });
+}
+
+test("a slower credential edit cannot undo the winner or revoke its lease; omitted alias preserves a concurrent rename", async t => {
+  const { manager, clients, queue } = await fixture(t);
+  const started = deferred<void>(), release = deferred<void>();
+  let calls = 0;
+  t.mock.method(DNSHEClient.prototype, "getQuota", async () => {
+    if (++calls === 1) { started.resolve(); await release.promise; }
+    return clients.get(1)!.getQuota();
+  });
+  const slow = manager.updateAccount(1, "", "slow-key", "slow-secret");
+  await started.promise;
+  const fast = manager.updateAccount(1, "", "winning-key", "winning-secret");
+  await manager.updateAccount(1, "winning alias");
+  await fast;
+  const action = await queue.enqueue({ label: "winner", accountIds: [1] });
+  const work = (await queue.claim())!;
+  release.resolve();
+  await assert.rejects(slow, /绑定已改变/);
+  const row = (await manager.getAccounts())[0];
+  assert.deepEqual([row.alias, row.api_key], ["winning alias", "winning-key"]);
+  assert.equal((await queue.jobs(action))[0].lease_token, work.lease_token);
+  assert.doesNotMatch(JSON.stringify(await queue.jobs(action)), /winning-key|winning-secret/);
+});
+
+test("failed credential replacement rolls back queue, DNS, quota, generation and catalog revision", async t => {
+  const { queue, manager, clients, sqlite } = await fixture(t, [1, 2], 1);
+  t.mock.method(DNSHEClient.prototype, "getQuota", clients.get(1)!.getQuota);
+  const action = await queue.enqueue({ label: "rollback", accountIds: [1] });
+  const work = (await queue.claim())!;
+  await manager.upsertDomain(1, domain(42));
+  await manager.setCache("api_cache:dns:42", "[]");
+  await manager.setCache("api_cache:quota", '[{"account_id":1},{"account_id":2}]');
+  const lease = await manager.claimCloudflareSync(1);
+  const rev = () => sqlite.prepare("SELECT value FROM settings WHERE key='catalog_summary_revision'").get()?.value;
+  const version = rev();
+  await assert.rejects(() => manager.updateAccount(1, "", "key-2", "new"), /其他账号/);
+  assert.equal(rev(), version);
+  assert.equal((await queue.jobs(action))[0].lease_token, work.lease_token);
+  assert.equal(await manager.getCache("api_cache:dns:42"), "[]");
+  assert.equal(await manager.getCache("api_cache:quota"), '[{"account_id":1},{"account_id":2}]');
+  assert.equal(sqlite.prepare("SELECT lease_token FROM cf_sync_state WHERE account_id=1").get()?.lease_token, lease.token);
+  assert.equal(sqlite.prepare("SELECT seen FROM cf_sync_seen WHERE domain_id=42").get()?.seen, 0);
+});
+
+test("Vercel secret-only edit verifies the replacement and schedules fresh work through the account route", async t => {
+  const { manager, d1, queue } = await fixture(t);
+  await manager.executeRaw("UPDATE accounts SET provider='vercel' WHERE id=1");
+  t.mock.method(VercelClient.prototype, "verifyToken", async () => ({ id: "fixture-user", username: "fixture" }));
+  t.mock.method(VercelClient.prototype, "listDomains", async () => []);
+  const old = await queue.enqueue({ label: "old", accountIds: [1] });
+  const token = await manager.createSession(), tasks: Promise<unknown>[] = [];
+  const res = await worker.fetch(new Request("http://localhost/api/accounts/1", { method: "PUT",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify({ api_secret: "local-fixture-token" }) }),
+  { DB: d1, AES_KEY: TEST_AES_KEY }, { waitUntil: (p: Promise<unknown>) => tasks.push(p), props: {} } as unknown as ExecutionContext);
+  const text = await res.text();
+  await Promise.allSettled(tasks);
+  assert.equal(res.status, 200, text);
+  assert.ok(JSON.parse(text).action_id);
+  assert.doesNotMatch(text, /local-fixture-token|api_secret|api_key/);
+  assert.equal((await queue.jobs(old))[0].status, "cancelled");
+  assert.equal((await manager.getAccounts())[0].api_key, "vercel:fixture-user");
+});
+
+for (const operation of ["enqueue", "retry"] as const) {
+  test(`stale ${operation} cannot cancel the replacement or reset its staged rows`, async t => {
+    const { d1, queue, manager, clients, sqlite } = await fixture(t);
+    t.mock.method(DNSHEClient.prototype, "getQuota", clients.get(1)!.getQuota);
+    const old = await queue.enqueue({ label: "initial", accountIds: [1] });
+    await queue.control(old, "pause");
+    const read = deferred<void>(), resume = deferred<void>();
+    const stale = new SyncWorkQueue(new Proxy(d1, { get(target, key) {
+      if (key === "prepare") return (sql: string) => {
+        const stmt = target.prepare(sql);
+        if (!/^SELECT id,(alias,)?provider,api_key,api_secret FROM accounts/.test(sql)) return stmt;
+        return { bind: (...args: unknown[]) => ({ all: async () => {
+          const result = await stmt.bind(...args).all();
+          read.resolve(); await resume.promise; return result;
+        } }) };
+      };
+      const value = Reflect.get(target, key);
+      return typeof value === "function" ? value.bind(target) : value;
+    } }));
+    const pending = operation === "enqueue" ? stale.enqueue({ label: "stale", accountIds: [1] }) : stale.control(old, "retry");
+    await read.promise;
+    await manager.updateAccount(1, "", "new-owner", "fixture");
+    const fresh = await queue.enqueue({ label: "fresh", accountIds: [1] });
+    const owner = (await queue.claim())!;
+    await queue.stage(owner, [domain(42)], { phase: "write" }, true);
+    resume.resolve();
+    await assert.rejects(pending, /绑定已改变/);
+    assert.equal((await queue.jobs(old))[0].status, "cancelled");
+    assert.equal((await queue.jobs(fresh))[0].lease_token, owner.lease_token);
+    assert.equal(sqlite.prepare("SELECT domain_id FROM sync_rows WHERE job_id=?").get(owner.id)?.domain_id, 42);
+    assert.equal(sqlite.prepare("SELECT COUNT(*) n FROM actions").get()?.n, 2);
+  });
+}
+
+// Switch the stored row after the manager has validated the JS hash, but
+// before SQLite executes the targeted statement. No timing or upstream needed.
+for (const operation of ["claim", "commit"] as const) {
+  test(`standalone CF ${operation} checks the same binding inside SQL`, async t => {
+    const { d1, manager, sqlite } = await fixture(t);
+    await manager.executeRaw("UPDATE accounts SET provider='cloudflare' WHERE id=1");
+    await manager.upsertDomain(1, domain(42));
+    const client = (await getClientForAccount(d1, TEST_AES_KEY, 1)).client as CloudflareClient;
+    const fp = client.credentialFingerprint!;
+    const lease = operation === "commit" ? await manager.claimCloudflareSync(1, fp) : null;
+    const pattern = operation === "claim" ? /INSERT INTO cf_sync_state/ : /INSERT INTO domains_cache/;
+    let changed = false;
+    const interleaved = new DatabaseManager(new Proxy(d1, { get(target, key) {
+      if (key === "prepare") return (sql: string) => {
+        if (!changed && pattern.test(sql)) { sqlite.exec("UPDATE accounts SET api_secret='plain:Y2hhbmdlZA==' WHERE id=1"); changed = true; }
+        return target.prepare(sql);
+      };
+      const value = Reflect.get(target, key);
+      return typeof value === "function" ? value.bind(target) : value;
+    } }), TEST_AES_KEY);
+    await assert.rejects(() => lease
+      ? interleaved.commitCloudflareSyncPage(1, lease, [domain(99)], { hasMore: false, nextPage: 2 })
+      : interleaved.claimCloudflareSync(1, fp), /同步|租约/);
+    assert.equal(changed, true);
+    assert.deepEqual((await manager.getDomains("", "", 1, "cloudflare")).map(row => row.id), [42]);
+    assert.equal(sqlite.prepare("SELECT next_page FROM cf_sync_state").get()?.next_page, lease ? 1 : undefined);
+    const freshClient = (await getClientForAccount(d1, TEST_AES_KEY, 1)).client as CloudflareClient;
+    const fresh = await manager.claimCloudflareSync(1, freshClient.credentialFingerprint);
+    assert.equal(fresh.nextPage, 1);
+    if (lease) await manager.releaseCloudflareSync(1, lease);
+    assert.equal(sqlite.prepare("SELECT lease_token FROM cf_sync_state").get()?.lease_token, fresh.token);
+  });
+}
 
 test("unknown renewal result is reconciled with GET and never blindly POSTed again", async t => {
   const { clients, queue, manager, drain } = await fixture(t, [1], 1);

@@ -1,6 +1,6 @@
 import { ConflictError, ValidationError, NotFoundError } from "../../errors";
 import { canonicalJson } from "../../../shared/restore-wire";
-import { sha256Hex } from "../crypto";
+import { bindingFence, bindingSetFence, credentialFingerprint, type AccountClientRow } from "../account-binding";
 import type { UpstreamSubdomain } from "../types";
 import { stagedDomainWrites } from "./domain-dao";
 
@@ -22,11 +22,10 @@ export interface SyncCheckpoint {
   statement(db: D1Database, guard?: SyncFence): D1PreparedStatement;
   committed(): void;
 }
-export const credentialFingerprint = (account: { provider: string; api_key: string; api_secret: string }) =>
-  sha256Hex(canonicalJson([account.provider || "dnshe", account.api_key, account.api_secret]));
 
 /** SQL-only work queue: no serialized callback, credential or session token. */
 export class SyncWorkQueue {
+  private readonly accountFences = new WeakMap<SyncWork, SyncFence>();
   constructor(private readonly db: D1Database, private readonly now = Date.now) {}
   statement(sql: string, bindings: unknown[] = []) { return this.db.prepare(sql).bind(...bindings); }
   async nextWake() {
@@ -39,38 +38,41 @@ export class SyncWorkQueue {
     const accounts = await this.db.prepare("SELECT id,alias,provider,api_key,api_secret FROM accounts WHERE id IN (SELECT value FROM json_each(?))")
       .bind(JSON.stringify(ids)).all<{ id: number; alias: string; provider: string; api_key: string; api_secret: string }>();
     if (accounts.results.length !== ids.length) throw new NotFoundError("部分账号已删除，未创建同步任务");
+    const current = bindingSetFence(accounts.results);
     const fingerprints = await Promise.all(accounts.results.map(async account => ({ id: account.id, fingerprint: await credentialFingerprint(account) })));
     await this.db.prepare(`UPDATE sync_work SET status='cancelled',lease_token=NULL,lease_until=0,error='账号凭据改变，旧同步已取消',updated_at=?
       WHERE status IN ('queued','running','paused') AND account_id IN(SELECT json_extract(value,'$.id') FROM json_each(?))
-      AND fingerprint<>(SELECT json_extract(value,'$.fingerprint') FROM json_each(?) WHERE json_extract(value,'$.id')=sync_work.account_id)`)
-      .bind(this.now(), JSON.stringify(fingerprints), JSON.stringify(fingerprints)).run();
+      AND fingerprint<>(SELECT json_extract(value,'$.fingerprint') FROM json_each(?) WHERE json_extract(value,'$.id')=sync_work.account_id)
+      AND ${current.sql}`).bind(this.now(), JSON.stringify(fingerprints), JSON.stringify(fingerprints), current.binding).run();
     await this.refreshActions();
     const active = await this.db.prepare(`SELECT action_id,renew,scheduled FROM sync_work WHERE account_id IN (SELECT value FROM json_each(?))
-      AND status IN ('queued','running','paused')`).bind(JSON.stringify(ids)).all<{ action_id: string; renew: number; scheduled: number }>();
+      AND status IN ('queued','running','paused') AND ${current.sql}`).bind(JSON.stringify(ids), current.binding).all<{ action_id: string; renew: number; scheduled: number }>();
     if (active.results.length) {
       const actions = [...new Set(active.results.map(row => row.action_id))];
       if (actions.length === 1) {
-        const existing = await this.db.prepare("SELECT account_id FROM sync_work WHERE action_id=? ORDER BY account_id")
-          .bind(actions[0]).all<{ account_id: number }>();
+        const existing = await this.db.prepare(`SELECT account_id,fingerprint,status FROM sync_work WHERE action_id=? AND ${current.sql} ORDER BY account_id`)
+          .bind(actions[0], current.binding).all<{ account_id: number; fingerprint: string; status: string }>();
         if (canonicalJson(existing.results.map(row => row.account_id)) === canonicalJson(ids) &&
+            existing.results.every(row => row.status !== "cancelled" && fingerprints.find(f => f.id === row.account_id)?.fingerprint === row.fingerprint) &&
             active.results.every(row => row.renew === (options.renew ? 1 : 0) && row.scheduled === (options.scheduled ? 1 : 0))) return actions[0];
       }
       throw new ConflictError("部分账号已有排队、运行或暂停任务，请在操作中心继续或取消原任务", "sync_in_progress");
     }
     const actionId = crypto.randomUUID(), now = this.now();
-    const jobs = await Promise.all(accounts.results.map(async account => ({
-      id: crypto.randomUUID(), account_id: account.id, alias: account.alias, fingerprint: await credentialFingerprint(account),
-    })));
+    const jobs = accounts.results.map((account, i) => ({
+      id: crypto.randomUUID(), account_id: account.id, alias: account.alias, fingerprint: fingerprints[i].fingerprint,
+    }));
     try {
-      await this.db.batch([
-        this.db.prepare(`INSERT INTO actions(id,type,status,progress,started_at,metadata) VALUES(?,'sync','queued',0,?,?)`)
+      const [created] = await this.db.batch([
+        this.db.prepare(`INSERT INTO actions(id,type,status,progress,started_at,metadata) SELECT ?,'sync','queued',0,?,? WHERE ${current.sql}`)
           .bind(actionId, new Date(now).toISOString(), JSON.stringify({ label: options.label, accountIds: ids,
-            renew: options.renew === true, scheduled: options.scheduled === true, durable: true })),
+            renew: options.renew === true, scheduled: options.scheduled === true, durable: true }), current.binding),
         this.db.prepare(`INSERT INTO sync_work(id,action_id,account_id,alias,fingerprint,renew,scheduled,status,cursor,deadline_at,created_at,updated_at)
           SELECT json_extract(value,'$.id'),?,json_extract(value,'$.account_id'),json_extract(value,'$.alias'),
-            json_extract(value,'$.fingerprint'),?,?,'queued','{"phase":"start"}',?,?,? FROM json_each(?)`)
-          .bind(actionId, options.renew ? 1 : 0, options.scheduled ? 1 : 0, now + 86400000, now, now, JSON.stringify(jobs)),
+            json_extract(value,'$.fingerprint'),?,?,'queued','{"phase":"start"}',?,?,? FROM json_each(?) WHERE EXISTS(SELECT 1 FROM actions WHERE id=?)`)
+          .bind(actionId, options.renew ? 1 : 0, options.scheduled ? 1 : 0, now + 86400000, now, now, JSON.stringify(jobs), actionId),
       ]);
+      if (!created.meta.changes) throw new ConflictError("账号绑定已改变，请重新同步", "sync_credentials_changed");
     } catch (error) {
       if (error instanceof Error && /UNIQUE constraint/i.test(error.message)) throw new ConflictError("账号同步创建竞争，请查看已有任务", "sync_in_progress");
       throw error;
@@ -114,9 +116,16 @@ export class SyncWorkQueue {
         ORDER BY w.updated_at,w.id LIMIT 1) AND status='queued' RETURNING *`)
       .bind(token, now + SYNC_LEASE_MS, now, now, now).first<SyncWork>();
   }
+  async bindAccount(work: SyncWork, row: AccountClientRow) {
+    if (row.id !== work.account_id || await credentialFingerprint(row) !== work.fingerprint) {
+      throw new ValidationError("账号凭据已改变，请重试以重新建立同步快照");
+    }
+    this.accountFences.set(work, bindingFence(row.id, row));
+  }
   private guard(work: SyncWork, at: number): SyncFence {
-    return { sql: `EXISTS(SELECT 1 FROM sync_work WHERE id=? AND status='running' AND lease_token=? AND lease_until>?)`,
-      bindings: [work.id, work.lease_token, at] };
+    const account = this.accountFences.get(work);
+    return { sql: `EXISTS(SELECT 1 FROM sync_work WHERE id=? AND status='running' AND lease_token=? AND lease_until>?)
+      ${account ? ` AND ${account.sql}` : ""}`, bindings: [work.id, work.lease_token, at, ...(account?.bindings ?? [])] };
   }
   // Create only after upstream I/O and any async preparation. Every write in
   // this batch checks the live token against the SAME admission timestamp.
@@ -174,12 +183,22 @@ export class SyncWorkQueue {
     const now = this.now(), guard = this.guard(work, now);
     const failures = work.failures + (failure ? 1 : 0);
     if (failure && failures >= SYNC_MAX_FAILURES) status = "failed";
-    await this.db.prepare(`UPDATE sync_work SET status=?,failures=?,error=?,lease_token=NULL,lease_until=0,not_before=?,updated_at=?
+    const result = await this.db.prepare(`UPDATE sync_work SET status=?,failures=?,error=?,lease_token=NULL,lease_until=0,not_before=?,updated_at=?
       WHERE id=? AND ${guard.sql}`).bind(status, failures, error, now + delayMs, now, work.id, ...guard.bindings).run();
+    const binding = this.accountFences.get(work);
+    if (!result.meta.changes && binding) {
+      // Also close work invalidated by a business restore, without waiting for lease recovery.
+      await this.db.prepare(`UPDATE sync_work SET status='cancelled',error='账号绑定已改变',lease_token=NULL,lease_until=0,updated_at=?
+        WHERE id=? AND status='running' AND lease_token=? AND lease_until>? AND NOT ${binding.sql}`)
+        .bind(now, work.id, work.lease_token, now, ...binding.bindings).run();
+    }
     await this.refreshActions();
   }
   async refreshActions() {
-    await this.db.prepare(`UPDATE actions SET
+    await this.actionRefresh().run();
+  }
+  actionRefresh(scope?: SyncFence) {
+    return this.db.prepare(`UPDATE actions SET
       status=CASE
         WHEN EXISTS(SELECT 1 FROM sync_work WHERE action_id=actions.id AND status='running') THEN 'running'
         WHEN EXISTS(SELECT 1 FROM sync_work WHERE action_id=actions.id AND status='queued') THEN 'queued'
@@ -198,7 +217,8 @@ export class SyncWorkQueue {
         ,'checked',json_extract(cursor,'$.checked')
         )) FROM sync_work WHERE action_id=actions.id),'[]'))),
       updated_at=CURRENT_TIMESTAMP
-      WHERE type='sync' AND status IN ('queued','running','paused') AND EXISTS(SELECT 1 FROM sync_work WHERE action_id=actions.id)`).run();
+      WHERE type='sync' AND status IN ('queued','running','paused') AND EXISTS(SELECT 1 FROM sync_work WHERE action_id=actions.id)
+      ${scope ? ` AND ${scope.sql}` : ""}`).bind(...(scope?.bindings ?? []));
   }
   async hasAction(id: string) {
     return !!await this.db.prepare("SELECT id FROM sync_work WHERE action_id=? LIMIT 1").bind(id).first();
@@ -207,26 +227,29 @@ export class SyncWorkQueue {
     if (!await this.hasAction(id)) throw new NotFoundError("任务没有持久同步工作项");
     const now = this.now();
     if (operation === "retry") {
-      const rows = await this.db.prepare("SELECT id,account_id,status,fingerprint FROM sync_work WHERE action_id=?").bind(id)
-        .all<{ id: string; account_id: number; status: string; fingerprint: string }>();
+      const rows = await this.db.prepare("SELECT status FROM sync_work WHERE action_id=?").bind(id).all<{ status: string }>();
       if (rows.results.every(row => row.status === "completed")) throw new ConflictError("任务已经完成，请发起新同步");
       const accounts = await this.db.prepare("SELECT id,provider,api_key,api_secret FROM accounts WHERE id IN (SELECT account_id FROM sync_work WHERE action_id=?)")
         .bind(id).all<{ id: number; provider: string; api_key: string; api_secret: string }>();
       const fingerprints = await Promise.all(accounts.results.map(async account => ({ id: account.id, fingerprint: await credentialFingerprint(account) })));
       if (accounts.results.length !== rows.results.length) throw new NotFoundError("重试账号已删除");
-      const resetIds = JSON.stringify(rows.results.filter(row => ["failed", "cancelled"].includes(row.status) ||
-        row.fingerprint !== fingerprints.find(account => account.id === row.account_id)?.fingerprint).map(row => row.id));
+      const current = bindingSetFence(accounts.results), hashes = JSON.stringify(fingerprints);
+      const retryable = `action_id=? AND status IN ('failed','cancelled','paused') AND ${current.sql}`;
+      const hash = "(SELECT json_extract(value,'$.fingerprint') FROM json_each(?) WHERE json_extract(value,'$.id')=sync_work.account_id)";
+      const reset = `(status IN ('failed','cancelled') OR fingerprint<>${hash})`;
+      const resetJobs = `SELECT id FROM sync_work WHERE ${retryable} AND ${reset}`;
       try {
-        await this.db.batch([
-          this.db.prepare("DELETE FROM sync_rows WHERE job_id IN(SELECT value FROM json_each(?))").bind(resetIds),
-          this.db.prepare("DELETE FROM sync_candidates WHERE job_id IN(SELECT value FROM json_each(?))").bind(resetIds),
-          this.db.prepare(`UPDATE sync_work SET cursor=CASE WHEN id IN(SELECT value FROM json_each(?)) THEN '{"phase":"start"}' ELSE cursor END,
-            fingerprint=(SELECT json_extract(value,'$.fingerprint') FROM json_each(?) WHERE json_extract(value,'$.id')=sync_work.account_id),
+        const results = await this.db.batch([
+          this.db.prepare(`DELETE FROM sync_rows WHERE job_id IN(${resetJobs})`).bind(id, current.binding, hashes),
+          this.db.prepare(`DELETE FROM sync_candidates WHERE job_id IN(${resetJobs})`).bind(id, current.binding, hashes),
+          this.db.prepare(`UPDATE sync_work SET cursor=CASE WHEN ${reset} THEN '{"phase":"start"}' ELSE cursor END,
+            fingerprint=${hash},
             status='queued',failures=0,lease_token=NULL,lease_until=0,not_before=0,deadline_at=?,error=NULL,updated_at=?
-            WHERE action_id=? AND status IN ('failed','cancelled','paused')`)
-            .bind(resetIds, JSON.stringify(fingerprints), now + 86400000, now, id),
-          this.db.prepare("UPDATE actions SET status='queued',error=NULL,finished_at=NULL WHERE id=? AND status IN ('failed','cancelled','paused')").bind(id),
+            WHERE ${retryable}`).bind(hashes, hashes, now + 86400000, now, id, current.binding),
+          this.db.prepare(`UPDATE actions SET status='queued',error=NULL,finished_at=NULL WHERE id=? AND status IN ('failed','cancelled','paused')
+            AND ${current.sql} AND EXISTS(SELECT 1 FROM sync_work WHERE action_id=? AND status='queued')`).bind(id, current.binding, id),
         ]);
+        if (!results[2].meta.changes) throw new ConflictError("没有可重试的工作或账号绑定已改变，请刷新任务");
       } catch (error) {
         if (error instanceof Error && /UNIQUE constraint/i.test(error.message)) throw new ConflictError("该账号已有另一同步任务，请先取消或完成它", "sync_in_progress");
         throw error;

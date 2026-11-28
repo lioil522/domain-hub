@@ -219,11 +219,11 @@ export async function removeAccountFromQuotaCache(db: D1Database, accountId: num
  * 仅改别名：就地改写缓存里的别名
  */
 export async function renameAccountInQuotaCache(db: D1Database, accountId: number, alias: string): Promise<void> {
-  const cached = await readQuotaCache(db);
-  if (cached === null) return;
-  if (!cached.some((q) => Number(q.account_id) === accountId)) return;
-  await writeQuotaCache(
-    db,
-    cached.map((q) => (Number(q.account_id) === accountId ? { ...q, alias } : q))
-  );
+  // A rename racing a quota refresh or unbind must not restore an older array.
+  await db.prepare(`UPDATE cache SET value=(SELECT json_group_array(json(CASE
+    WHEN CAST(json_extract(value,'$.account_id') AS INTEGER)=? THEN json_set(value,'$.alias',?) ELSE value END))
+    FROM json_each(cache.value)) WHERE key=? AND json_valid(value) AND json_type(value)='array'
+    AND NOT EXISTS(SELECT 1 FROM json_each(cache.value) WHERE type<>'object')
+    AND EXISTS(SELECT 1 FROM accounts WHERE id=? AND alias=?)`)
+    .bind(accountId, alias, QUOTA_CACHE_KEY, accountId, alias).run();
 }

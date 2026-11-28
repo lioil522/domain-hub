@@ -35,7 +35,7 @@ import { ensureDatabaseSchema } from "./schema-migrations";
 import { StagedRestore } from "./dao/restore-dao";
 import { SyncWorkQueue } from "./dao/sync-work-dao";
 import { NotificationOutbox } from "./dao/notification-dao";
-import { sha256Hex } from "./crypto";
+import { bindingFence, credentialFingerprint, type AccountBinding, type AccountClientRow } from "./account-binding";
 import { ConflictError } from "../errors";
 import { versionedCatalogDatabase } from "./catalog-version";
 
@@ -261,8 +261,8 @@ export class DatabaseManager {
   async deleteAccount(id: number): Promise<void> {
     return accountDao.deleteAccount(this.db, id);
   }
-  async getClientForAccount(id: number): Promise<{ client: UpstreamClient; alias: string; provider: AccountProvider }> {
-    return accountDao.getClientForAccount(this.db, this.aesKey, id);
+  async getClientForAccount(id: number, snapshot?: AccountClientRow): Promise<{ client: UpstreamClient; alias: string; provider: AccountProvider }> {
+    return accountDao.getClientForAccount(this.db, this.aesKey, id, snapshot);
   }
 
   // ===== Domain DAO 委托 =====
@@ -282,20 +282,22 @@ export class DatabaseManager {
   async upsertAccountDomains(accountId: number, subdomains: UpstreamSubdomain[]): Promise<void> {
     return domainDao.upsertAccountDomains(this.db, accountId, subdomains);
   }
+  async readSyncAccount(id: number) { return accountDao.readClientRow(this.db, id); }
   private async checkCloudflareFingerprint(accountId: number, expected: string) {
     const row = await this.db.prepare("SELECT provider,api_key,api_secret FROM accounts WHERE id=?").bind(accountId)
-      .first<{ provider: string; api_key: string; api_secret: string }>();
-    if (!row || await sha256Hex(JSON.stringify([row.provider, row.api_key, row.api_secret])) !== expected) {
+      .first<AccountBinding>();
+    if (!row || await credentialFingerprint(row) !== expected) {
       throw new ConflictError("Cloudflare 凭据已改变，旧同步不可继续提交", "sync_credentials_changed");
     }
+    return bindingFence(accountId, row);
   }
   async claimCloudflareSync(accountId: number, fingerprint?: string) {
-    if (fingerprint) await this.checkCloudflareFingerprint(accountId, fingerprint);
-    return cloudflareSyncDao.claimCloudflareSync(this.db, accountId, fingerprint);
+    const fence = fingerprint ? await this.checkCloudflareFingerprint(accountId, fingerprint) : undefined;
+    return cloudflareSyncDao.claimCloudflareSync(this.db, accountId, fingerprint, fence);
   }
   async commitCloudflareSyncPage(accountId: number, lease: cloudflareSyncDao.CloudflareSyncLease, domains: UpstreamSubdomain[], page: { hasMore: boolean; nextPage: number }, planJob?: cloudflareSyncDao.CloudflareJobCheckpoint): Promise<void> {
-    if (lease.fingerprint) await this.checkCloudflareFingerprint(accountId, lease.fingerprint);
-    return cloudflareSyncDao.commitCloudflareSyncPage(this.db, accountId, lease, domains, page, planJob);
+    const fence = lease.fingerprint ? await this.checkCloudflareFingerprint(accountId, lease.fingerprint) : undefined;
+    return cloudflareSyncDao.commitCloudflareSyncPage(this.db, accountId, lease, domains, page, planJob, fence);
   }
   async releaseCloudflareSync(accountId: number, lease: cloudflareSyncDao.CloudflareSyncLease): Promise<void> {
     return cloudflareSyncDao.releaseCloudflareSync(this.db, accountId, lease);

@@ -1,7 +1,7 @@
 import type { UpstreamSubdomain } from "../types";
 import { buildDomainJsonUpsert } from "./domain-dao";
 import { ConflictError } from "../../errors";
-import type { SyncCheckpoint } from "./sync-work-dao";
+import type { SyncCheckpoint, SyncFence } from "./sync-work-dao";
 
 const LEASE_SECONDS = 60;
 const CYCLE_TTL_SECONDS = 3 * 24 * 3600;
@@ -17,12 +17,12 @@ export type CloudflareProgress = { completed: boolean; totalSynced: number; next
 export type CloudflareJobCheckpoint = (progress: CloudflareProgress) => SyncCheckpoint;
 
 /** Claim one account, retaining its durable checkpoint unless the cycle expired. */
-export async function claimCloudflareSync(db: D1Database, accountId: number, fingerprint?: string): Promise<CloudflareSyncLease> {
+export async function claimCloudflareSync(db: D1Database, accountId: number, fingerprint?: string, account?: SyncFence): Promise<CloudflareSyncLease> {
   const now = Math.floor(Date.now() / 1000);
   const token = crypto.randomUUID();
   const row = await db.prepare(`
     INSERT INTO cf_sync_state (account_id, generation, next_page, total_synced, lease_token, lease_until, updated_at,credential_fingerprint)
-    VALUES (?, ?, 1, 0, ?, ?, ?,?)
+     SELECT ?, ?, 1, 0, ?, ?, ?,? WHERE ${account?.sql ?? "1"}
     ON CONFLICT(account_id) DO UPDATE SET
       generation=CASE WHEN cf_sync_state.updated_at <= ? OR credential_fingerprint IS NOT excluded.credential_fingerprint THEN excluded.generation ELSE cf_sync_state.generation END,
       next_page=CASE WHEN cf_sync_state.updated_at <= ? OR credential_fingerprint IS NOT excluded.credential_fingerprint THEN 1 ELSE cf_sync_state.next_page END,
@@ -30,7 +30,7 @@ export async function claimCloudflareSync(db: D1Database, accountId: number, fin
       lease_token=excluded.lease_token, lease_until=excluded.lease_until, updated_at=excluded.updated_at,credential_fingerprint=excluded.credential_fingerprint
     WHERE cf_sync_state.lease_until <= ? OR credential_fingerprint IS NOT excluded.credential_fingerprint
     RETURNING generation, next_page, total_synced
-   `).bind(accountId, crypto.randomUUID(), token, now + LEASE_SECONDS, now, fingerprint || null,
+   `).bind(accountId, crypto.randomUUID(), token, now + LEASE_SECONDS, now, fingerprint || null, ...(account?.bindings ?? []),
     now - CYCLE_TTL_SECONDS, now - CYCLE_TTL_SECONDS, now - CYCLE_TTL_SECONDS, now)
     .first<{ generation: string; next_page: number; total_synced: number }>();
   if (!row) throw new ConflictError("该 Cloudflare 账号正在同步，请稍后重试", "sync_in_progress");
@@ -62,6 +62,7 @@ export async function commitCloudflareSyncPage(
   domains: UpstreamSubdomain[],
   page: { hasMore: boolean; nextPage: number },
   planJob?: CloudflareJobCheckpoint,
+  account?: SyncFence,
 ): Promise<void> {
   if (page.hasMore && (!Number.isSafeInteger(page.nextPage) || page.nextPage <= lease.nextPage)) {
     throw new Error("Cloudflare 分页游标未前进，已停止同步");
@@ -70,8 +71,9 @@ export async function commitCloudflareSyncPage(
   const progress = { completed: !page.hasMore, totalSynced: lease.totalSynced + domains.length, nextPage: page.nextPage };
   const job = planJob?.(progress), extraGuard = job?.guard;
   const guard = {
-    sql: `EXISTS (SELECT 1 FROM cf_sync_state WHERE account_id=? AND generation=? AND lease_token=? AND next_page=? AND lease_until>?)${extraGuard ? ` AND (${extraGuard.sql})` : ""}`,
-    bindings: [accountId, lease.generation, lease.token, lease.nextPage, now, ...(extraGuard?.bindings || [])],
+    sql: `EXISTS (SELECT 1 FROM cf_sync_state WHERE account_id=? AND generation=? AND lease_token=? AND next_page=? AND lease_until>?)
+      ${extraGuard ? ` AND (${extraGuard.sql})` : ""} ${account ? ` AND (${account.sql})` : ""}`,
+    bindings: [accountId, lease.generation, lease.token, lease.nextPage, now, ...(extraGuard?.bindings ?? []), ...(account?.bindings ?? [])],
   };
   const payload = JSON.stringify(domains);
   const statements = [

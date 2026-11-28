@@ -1,5 +1,6 @@
 import type { Context, Hono } from "hono";
 import type { AppEnv } from "./types";
+import { ConflictError } from "../errors";
 import type { AccountProvider, DatabaseManager } from "../db";
 import { errorRes, successRes } from "./response";
 import { AccountService } from "../services/account-service";
@@ -163,13 +164,16 @@ export function registerAccountRoutes(app: Hono<AppEnv>, deps: AccountRouteDeps)
       const apiToken = body.api_token !== undefined ? String(body.api_token).trim() : undefined;
       const apiSecret = body.api_secret !== undefined ? String(body.api_secret) : undefined;
       const account = await deps.accountService(db).update(id, alias, apiKey, apiToken ?? apiSecret);
-      const credentialsChanged = Boolean(apiToken) || Boolean(apiKey && apiSecret);
+      const credentialsChanged = Boolean((apiToken ?? apiSecret)?.trim());
       let actionId: string | undefined;
       if (credentialsChanged) actionId = await queueResync(db, [account.id], `账号 [${account.alias}] 凭据同步`, c);
       else await db.renameAccountInQuotaCache(account.id, account.alias);
       await auditService(db).write({ actor: "session", action: "update", resourceType: "account", resourceId: String(account.id), result: "success", details: { alias: account.alias, credentialsChanged } });
-      return c.json(successRes({ account, action_id: actionId, message: "账号信息已更新" }));
+      const { id: accountId, alias: accountAlias, provider, website, created_at } = account;
+      return c.json(successRes({ account: { id: accountId, alias: accountAlias, provider, website, created_at },
+        action_id: actionId, message: "账号信息已更新" }));
     } catch (e: unknown) {
+      if (e instanceof ConflictError) return c.json(errorRes(e.message, e.code), 409);
       return c.json(errorRes(e instanceof Error ? e.message : "未知错误"), 400);
     }
   });
@@ -178,11 +182,11 @@ export function registerAccountRoutes(app: Hono<AppEnv>, deps: AccountRouteDeps)
     const db = c.get("db");
     const id = parseInt(c.req.param("id"), 10);
     try {
-      await db.removeAccountFromQuotaCache(id);
       await deps.accountService(db).remove(id);
       await auditService(db).write({ actor: "session", action: "delete", resourceType: "account", resourceId: String(id), result: "success" });
       return c.json(successRes({ message: "账户解绑成功" }));
     } catch (e: unknown) {
+      if (e instanceof ConflictError) return c.json(errorRes(e.message, e.code), 409);
       return c.json(errorRes(e instanceof Error ? e.message : "未知错误"), 400);
     }
   });

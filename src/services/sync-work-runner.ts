@@ -5,7 +5,7 @@ import { DigitalPlatClient, mapDomainToUpstream } from "../digitalplat";
 import { listUpstreamDomains } from "../cron/jobs/upstream-sync";
 import { computeDnsState } from "../dns-provider";
 import { syncCloudflareSlice } from "./cloudflare-sync-service";
-import { SyncWorkQueue, credentialFingerprint, type SyncWork, type SyncCursor, type SyncFence } from "../db/dao/sync-work-dao";
+import { SyncWorkQueue, type SyncWork, type SyncCursor, type SyncFence } from "../db/dao/sync-work-dao";
 import { ConflictError, NotFoundError, UpstreamRateLimitError, ValidationError } from "../errors";
 import type { WebhookType } from "../cron/notification";
 import { notificationTargets } from "./notification-service";
@@ -30,10 +30,9 @@ export interface SyncRunOptions {
 }
 
 async function executeSlice(db: DatabaseManager, queue: SyncWorkQueue, work: SyncWork, signal: AbortSignal, options: SyncRunOptions) {
-  const auth = await db.firstRaw<{ provider: string; api_key: string; api_secret: string }>("SELECT provider,api_key,api_secret FROM accounts WHERE id=?", [work.account_id]);
-  if (!auth) throw new NotFoundError("同步账号已删除");
-  if (await credentialFingerprint(auth) !== work.fingerprint) throw new ValidationError("账号凭据已改变，请重试以重新建立同步快照");
-  const { client, provider } = await db.getClientForAccount(work.account_id);
+  const auth = await db.readSyncAccount(work.account_id);
+  await queue.bindAccount(work, auth);
+  const { client, provider } = await db.getClientForAccount(work.account_id, auth);
   client.requestSignal = signal;
   const cursor = JSON.parse(work.cursor) as SyncCursor;
   const active = () => { if (signal.aborted) throw signal.reason; };

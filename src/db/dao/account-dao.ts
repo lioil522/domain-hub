@@ -13,6 +13,9 @@ import { AlidnsClient, looksLikeAliyunAccessKeyId } from "../../alidns";
 import { HuaweiCloudClient, looksLikeHuaweiAccessKeyId } from "../../huaweicloud";
 import { VercelClient } from "../../vercel";
 import { encryptText, decryptText, sha256Hex } from "../crypto";
+import { bindingFence, credentialFingerprint, type AccountClientRow } from "../account-binding";
+import { ConflictError, NotFoundError } from "../../errors";
+import { SyncWorkQueue } from "./sync-work-dao";
 import { writeLog } from "./log-dao";
 import type { DBAccount, AccountProvider, UpstreamClient } from "../types";
 import {
@@ -237,15 +240,9 @@ export async function updateAccount(
   apiKey?: string,
   apiSecret?: string
 ): Promise<DBAccount> {
-  const existing = await db.prepare(
-    "SELECT alias, api_key, api_secret, provider FROM accounts WHERE id = ?"
-  ).bind(id).first();
-  if (!existing) {
-    throw new Error(`未找到 ID 为 ${id} 的账户`);
-  }
-  const existingRow = existing as { alias: string; api_key: string; api_secret: string; provider?: string };
+  const existingRow = await readClientRow(db, id);
 
-  const finalAlias = (alias || "").trim() || existingRow.alias;
+  const newAlias = (alias || "").trim();
   let finalApiKey = existingRow.api_key;
   let finalEncryptedSecret = existingRow.api_secret;
 
@@ -263,6 +260,13 @@ export async function updateAccount(
         throw new Error(`无法验证新 Cloudflare Token: ${message}`);
       }
       finalEncryptedSecret = await encryptText(newToken, aesKey);
+    }
+  } else if (existingRow.provider === "vercel") {
+    const token = (apiSecret || "").trim();
+    if (token) {
+      const user = await new VercelClient(token).verifyToken();
+      finalApiKey = `vercel:${user.id || (await sha256Hex(token)).slice(0, 32)}`;
+      finalEncryptedSecret = await encryptText(token, aesKey);
     }
   } else if (existingRow.provider === "digitalplat") {
     const newKey = (apiSecret || "").trim();
@@ -320,65 +324,83 @@ export async function updateAccount(
     }
   }
 
+  const projection = "id, alias, api_key, provider, website, created_at";
+  let result: DBAccount | null;
   try {
-    await db.prepare(
-      "UPDATE accounts SET alias = ?, api_key = ?, api_secret = ? WHERE id = ?"
-    ).bind(finalAlias, finalApiKey, finalEncryptedSecret, id).run();
+    if (finalApiKey === existingRow.api_key && finalEncryptedSecret === existingRow.api_secret) {
+      // A rename must never write back credentials from an earlier read.
+      result = await db.prepare(`UPDATE accounts SET alias=COALESCE(NULLIF(?,''),alias) WHERE id=? RETURNING ${projection}`)
+        .bind(newAlias, id).first<DBAccount>();
+    } else {
+      const fence = bindingFence(id, existingRow);
+      const writes = await db.batch<DBAccount>([
+        ...invalidateAccountSync(db, id, fence),
+        db.prepare(`UPDATE accounts SET alias=COALESCE(NULLIF(?,''),alias),api_key=?,api_secret=?
+          WHERE id=? AND ${fence.sql} RETURNING ${projection}`).bind(newAlias, finalApiKey, finalEncryptedSecret, id, ...fence.bindings),
+      ]);
+      result = writes.at(-1)?.results[0] ?? null;
+    }
   } catch (e: unknown) {
     const raw = e instanceof Error ? e.message : String(e);
     if (raw.includes("UNIQUE") || raw.toLowerCase().includes("unique constraint")) {
       throw new Error("该 API Key 已被其他账号绑定，请勿重复使用");
     }
-    throw new Error(`账户更新失败: ${raw}`);
+    throw new Error("账户更新失败，请重试");
   }
+  if (!result) throw new ConflictError("账户绑定已改变，请刷新后重试", "account_binding_changed");
+  await writeLog(db, "success", "operation", `账户 [${result.alias}] 信息已更新`);
+  return result;
+}
 
-  const result = await db.prepare(
-    "SELECT id, alias, api_key, provider, website, created_at FROM accounts WHERE id = ?"
-  ).bind(id).first<DBAccount>();
-
-  await writeLog(db, "success", "operation", `账户 [${finalAlias}] 信息已更新`);
-  return result as DBAccount;
+function invalidateAccountSync(db: D1Database, id: number, fence: { sql: string; bindings: (number | string)[] }) {
+  const active = "status IN ('queued','running','paused')";
+  return [
+    db.prepare(`UPDATE cache SET value=(SELECT json_group_array(json(value)) FROM json_each(cache.value)
+      WHERE CAST(json_extract(value,'$.account_id') AS INTEGER) IS NOT ?)
+      WHERE key='api_cache:quota' AND json_valid(value) AND json_type(value)='array'
+      AND NOT EXISTS(SELECT 1 FROM json_each(cache.value) WHERE type<>'object') AND ${fence.sql}`)
+      .bind(id, ...fence.bindings),
+    db.prepare(`DELETE FROM cache WHERE key IN (SELECT 'api_cache:dns:' || id FROM domains_cache WHERE account_id=?
+      UNION ALL SELECT 'api_cache:dns:' || r.domain_id FROM sync_work w JOIN sync_rows r ON r.job_id=w.id
+      WHERE w.account_id=? AND w.${active} AND r.enriched=1 AND NOT EXISTS
+        (SELECT 1 FROM domains_cache d WHERE d.id=r.domain_id AND d.account_id<>?)) AND ${fence.sql}`)
+      .bind(id, id, id, ...fence.bindings),
+    db.prepare(`UPDATE sync_work SET status='cancelled',lease_token=NULL,lease_until=0,updated_at=?,error='账号绑定已改变'
+      WHERE account_id=? AND ${active} AND ${fence.sql}`).bind(Date.now(), id, ...fence.bindings),
+    new SyncWorkQueue(db).actionRefresh({ sql: `actions.id IN(SELECT action_id FROM sync_work WHERE account_id=?) AND ${fence.sql}`,
+      bindings: [id, ...fence.bindings] }),
+    db.prepare(`DELETE FROM cf_sync_seen WHERE account_id=? AND ${fence.sql}`).bind(id, ...fence.bindings),
+    db.prepare(`DELETE FROM cf_sync_state WHERE account_id=? AND ${fence.sql}`).bind(id, ...fence.bindings),
+  ];
 }
 
 /**
  * 删除账户
  */
 export async function deleteAccount(db: D1Database, id: number): Promise<void> {
-  const account = await db.prepare("SELECT alias FROM accounts WHERE id = ?").bind(id).first();
-  const alias = account ? (account as { alias: string }).alias : `ID ${id}`;
-
-  // 级联删除前清理 DNS 记录缓存
-  try {
-    await db.prepare(
-      "DELETE FROM cache WHERE key IN (SELECT 'api_cache:dns:' || id FROM domains_cache WHERE account_id = ?)"
-    ).bind(id).run();
-  } catch (e) {
-    console.error("Failed to purge dns cache for account:", e);
-  }
-
-  await db.prepare("DELETE FROM accounts WHERE id = ?").bind(id).run();
-  await writeLog(db, "info", "operation", `解绑了账户 [${alias}]，其名下的域名缓存已被自动级联清理`);
+  const row = await db.prepare("SELECT id,alias,provider,api_key,api_secret FROM accounts WHERE id=?").bind(id).first<AccountClientRow>();
+  if (!row) return;
+  const fence = bindingFence(id, row);
+  const writes = await db.batch([...invalidateAccountSync(db, id, fence),
+    db.prepare(`DELETE FROM accounts WHERE id=? AND ${fence.sql}`).bind(id, ...fence.bindings)]);
+  if (!writes.at(-1)?.meta.changes) throw new ConflictError("账户绑定已改变，请刷新后重试", "account_binding_changed");
+  await writeLog(db, "info", "operation", `解绑了账户 [${row.alias}]，其名下的域名缓存已被自动级联清理`);
 }
 
-/**
- * 根据 ID 获取解密后的 API 客户端
- *
- * NOTE: 这是全项目唯一的凭据出口。
- */
+export async function readClientRow(db: D1Database, id: number) {
+  const row = await db.prepare("SELECT id,alias,api_key,api_secret,provider FROM accounts WHERE id=?").bind(id).first<AccountClientRow>();
+  if (!row) throw new NotFoundError(`未找到 ID 为 ${id} 的账户`);
+  return row;
+}
+
+/** Construct the client from the same stored row that authorized the slice. */
 export async function getClientForAccount(
   db: D1Database,
   aesKey: string | undefined,
-  id: number
+  id: number, snapshot?: AccountClientRow
 ): Promise<{ client: UpstreamClient; alias: string; provider: AccountProvider }> {
-  const account = await db.prepare(
-    "SELECT alias, api_key, api_secret, provider FROM accounts WHERE id = ?"
-  ).bind(id).first();
-
-  if (!account) {
-    throw new Error(`未找到 ID 为 ${id} 的账户`);
-  }
-
-  const typedAccount = account as { alias: string; api_key: string; api_secret: string; provider?: string };
+  const typedAccount = snapshot ?? await readClientRow(db, id);
+  if (typedAccount.id !== id) throw new ConflictError("账号绑定不匹配");
   const apiSecret = await decryptText(typedAccount.api_secret, aesKey);
 
   if (isLegacyHashedDualCredentialKey(typedAccount.api_key)) {
@@ -389,7 +411,7 @@ export async function getClientForAccount(
   }
   if (typedAccount.provider === "cloudflare") {
     const client = new CloudflareClient(apiSecret);
-    client.credentialFingerprint = await sha256Hex(JSON.stringify([typedAccount.provider, typedAccount.api_key, typedAccount.api_secret]));
+    client.credentialFingerprint = await credentialFingerprint(typedAccount);
     return { client, alias: typedAccount.alias, provider: "cloudflare" };
   }
   if (typedAccount.provider === "digitalplat") {
